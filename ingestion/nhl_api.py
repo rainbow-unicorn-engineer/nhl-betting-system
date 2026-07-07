@@ -27,7 +27,8 @@ client = NHLClient()
 def ingest_teams():
     """Pull all current NHL teams and upsert into raw.teams."""
     logger.info("Ingesting teams...")
-    standings = client.standings.get_standings(date="now")
+    # nhlpy 3.x renamed get_standings() -> league_standings()
+    standings = client.standings.league_standings(date="now")
     records = []
     for entry in standings.get("standings", []):
         records.append({
@@ -75,7 +76,8 @@ def ingest_schedule(start_date: str, end_date: str):
     while current <= end:
         date_str = current.strftime("%Y-%m-%d")
         try:
-            schedule = client.schedule.get_schedule(date=date_str)
+            # nhlpy 3.x renamed get_schedule() -> weekly_schedule() (returns a 7-day gameWeek)
+            schedule = client.schedule.weekly_schedule(date=date_str)
         except Exception as e:
             logger.warning(f"Schedule fetch failed for {date_str}: {e}")
             current += timedelta(days=1)
@@ -115,11 +117,17 @@ def ingest_schedule(start_date: str, end_date: str):
                 }
 
                 if state in ("FINAL", "OFF"):
-                    period = g.get("periodDescriptor", {})
-                    period_num = period.get("number", 3)
-                    period_type = period.get("periodType", "REG")
-                    record["is_ot"] = period_num > 3 or period_type == "OT"
-                    record["is_so"] = period_type == "SO"
+                    # gameOutcome.lastPeriodType is the authoritative source (REG/OT/SO);
+                    # fall back to periodDescriptor for older payloads
+                    last_period = g.get("gameOutcome", {}).get("lastPeriodType")
+                    if last_period is None:
+                        period = g.get("periodDescriptor", {})
+                        period_num = period.get("number", 3)
+                        last_period = period.get("periodType", "REG")
+                        if period_num > 3 and last_period == "REG":
+                            last_period = "OT"
+                    record["is_ot"] = last_period in ("OT", "SO")
+                    record["is_so"] = last_period == "SO"
 
                 _upsert_game(record)
                 total_inserted += 1
@@ -159,7 +167,8 @@ def ingest_boxscore(game_id: int):
     Also populates raw.players for any new player encountered.
     """
     try:
-        box = client.game_center.get_boxscore(game_id=game_id)
+        # nhlpy 3.x renamed get_boxscore() -> boxscore() and expects a string id
+        box = client.game_center.boxscore(game_id=str(game_id))
     except Exception as e:
         logger.warning(f"Boxscore fetch failed for game {game_id}: {e}")
         return False
@@ -218,7 +227,8 @@ def _upsert_skater_game(player: dict, game_id: int, team: str):
         "goals": player.get("goals", 0),
         "assists": player.get("assists", 0),
         "points": player.get("points", 0),
-        "shots": player.get("shots", 0),
+        # NHL API renamed shots -> sog (shots on goal)
+        "shots": player.get("sog", player.get("shots", 0)),
         "hits": player.get("hits", 0),
         "blocks": player.get("blockedShots", 0) or player.get("blocks", 0),
         "pim": player.get("pim", 0),
@@ -255,12 +265,20 @@ def _upsert_goalie_game(player: dict, game_id: int, team: str):
     ga = player.get("goalsAgainst", 0) or 0
     sv_pct = sv / sa if sa > 0 else None
     toi = _toi_to_seconds(player.get("toi", "0:00"))
-    is_starter = toi > 1800  # heuristic; refine with daily faceoff lineup scrape later
+    # NHL API now provides an explicit starter flag; TOI heuristic is the fallback
+    is_starter = player.get("starter")
+    if is_starter is None:
+        is_starter = toi > 1800
 
     decision_raw = player.get("decision", None)
     decision = decision_raw if decision_raw in ("W", "L", "O") else None
     if decision == "O":
         decision = "OTL"
+
+    # Strength-split shots come as "saves/shots" strings (e.g. "19/21")
+    even_sv, even_sa = _parse_saves_shots(player.get("evenStrengthShotsAgainst"))
+    pp_sv, pp_sa = _parse_saves_shots(player.get("powerPlayShotsAgainst"))
+    sh_sv, sh_sa = _parse_saves_shots(player.get("shorthandedShotsAgainst"))
 
     record = {
         "player_id": pid,
@@ -273,19 +291,22 @@ def _upsert_goalie_game(player: dict, game_id: int, team: str):
         "goals_against": ga,
         "sv_pct": sv_pct,
         "toi_seconds": toi,
-        "even_shots": player.get("evenStrengthShotsAgainst", 0) or 0,
-        "pp_shots": player.get("powerPlayShotsAgainst", 0) or 0,
-        "sh_shots": player.get("shorthandedShotsAgainst", 0) or 0,
+        "even_shots": even_sa,
+        "even_saves": even_sv,
+        "pp_shots": pp_sa,
+        "pp_saves": pp_sv,
+        "sh_shots": sh_sa,
+        "sh_saves": sh_sv,
     }
 
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO raw.goalie_games (player_id, game_id, team, decision, is_starter,
                 shots_against, saves, goals_against, sv_pct, toi_seconds,
-                even_shots, pp_shots, sh_shots)
+                even_shots, even_saves, pp_shots, pp_saves, sh_shots, sh_saves)
             VALUES (:player_id, :game_id, :team, :decision, :is_starter,
                     :shots_against, :saves, :goals_against, :sv_pct, :toi_seconds,
-                    :even_shots, :pp_shots, :sh_shots)
+                    :even_shots, :even_saves, :pp_shots, :pp_saves, :sh_shots, :sh_saves)
             ON CONFLICT (player_id, game_id) DO UPDATE SET
                 decision = EXCLUDED.decision,
                 is_starter = EXCLUDED.is_starter,
@@ -293,7 +314,13 @@ def _upsert_goalie_game(player: dict, game_id: int, team: str):
                 saves = EXCLUDED.saves,
                 goals_against = EXCLUDED.goals_against,
                 sv_pct = EXCLUDED.sv_pct,
-                toi_seconds = EXCLUDED.toi_seconds
+                toi_seconds = EXCLUDED.toi_seconds,
+                even_shots = EXCLUDED.even_shots,
+                even_saves = EXCLUDED.even_saves,
+                pp_shots = EXCLUDED.pp_shots,
+                pp_saves = EXCLUDED.pp_saves,
+                sh_shots = EXCLUDED.sh_shots,
+                sh_saves = EXCLUDED.sh_saves
         """), record)
 
 
@@ -358,6 +385,20 @@ def daily_refresh():
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
+def _parse_saves_shots(val) -> tuple:
+    """
+    Parse the NHL API's strength-split format "saves/shots" (e.g. "19/21")
+    into (saves, shots) ints. Returns (0, 0) for missing/malformed values.
+    """
+    if not val:
+        return 0, 0
+    try:
+        saves_str, shots_str = str(val).split("/")
+        return int(saves_str), int(shots_str)
+    except (ValueError, AttributeError):
+        return 0, 0
+
+
 def _toi_to_seconds(toi_str: str) -> int:
     """Convert 'MM:SS' time-on-ice string to integer seconds."""
     if not toi_str or toi_str == "--:--":
