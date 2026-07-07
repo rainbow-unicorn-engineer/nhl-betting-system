@@ -15,6 +15,15 @@ from config.settings import engine, DATA_DIR
 
 logger = logging.getLogger("nhl.ingestion.moneypuck")
 
+# MoneyPuck teamCode → NHL API abbreviation. MoneyPuck uses dotted codes for
+# four franchises; everything else already matches raw.games abbreviations.
+MONEYPUCK_TEAM_MAP = {
+    "L.A": "LAK",
+    "N.J": "NJD",
+    "S.J": "SJS",
+    "T.B": "TBL",
+}
+
 
 def download_shots_csv(season_start_year: int, force: bool = False) -> Path:
     """Download MoneyPuck shots CSV for a given season (season_start_year e.g. 2024)."""
@@ -74,7 +83,7 @@ def load_shots_to_db(season_start_year: int, csv_path: Path = None):
     out["season"] = season
     out["period"] = df["period"].fillna(0).astype(int)
     out["time_elapsed"] = df["time"].fillna(0).astype(int)  # seconds into game
-    out["team"] = df["teamCode"].astype(str)
+    out["team"] = df["teamCode"].astype(str).replace(MONEYPUCK_TEAM_MAP)
     out["shooter_id"] = df["shooterPlayerId"].astype("Int64")
     out["goalie_id"] = df["goalieIdForShot"].astype("Int64")
     out["x"] = df["arenaAdjustedXCord"]
