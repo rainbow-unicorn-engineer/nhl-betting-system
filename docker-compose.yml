@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: nhl_betting_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nhl_betting
+      POSTGRES_USER: nhl
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nhl_dev_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nhl -d nhl_betting"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

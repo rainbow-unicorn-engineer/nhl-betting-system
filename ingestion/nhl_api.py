@@ -1,0 +1,397 @@
+"""
+ingestion/nhl_api.py
+NHL data ingestion via coreyjs/nhl-api-py (RQI 4.03, our primary data dependency).
+Populates: raw.games, raw.teams, raw.players, raw.rosters, raw.skater_games, raw.goalie_games
+
+CRITICAL: the pip package "nhl-api-py" imports as `nhlpy`, NOT `nhl_api_py`.
+"""
+import time
+import logging
+from datetime import date, timedelta, datetime
+from typing import Optional
+
+import pandas as pd
+from nhlpy import NHLClient
+from sqlalchemy import text
+
+from config.settings import engine, BACKFILL_SEASONS
+
+logger = logging.getLogger("nhl.ingestion.nhl_api")
+
+client = NHLClient()
+
+
+# ─────────────────────────────────────────────
+# TEAMS
+# ─────────────────────────────────────────────
+def ingest_teams():
+    """Pull all current NHL teams and upsert into raw.teams."""
+    logger.info("Ingesting teams...")
+    standings = client.standings.get_standings(date="now")
+    records = []
+    for entry in standings.get("standings", []):
+        records.append({
+            "team_abbrev": entry.get("teamAbbrev", {}).get("default", ""),
+            "team_name": entry.get("teamName", {}).get("default", ""),
+            "conference": entry.get("conferenceName", ""),
+            "division": entry.get("divisionName", ""),
+        })
+
+    if not records:
+        logger.warning("No team data returned from standings API")
+        return 0
+
+    df = pd.DataFrame(records).drop_duplicates(subset=["team_abbrev"])
+
+    with engine.begin() as conn:
+        for _, row in df.iterrows():
+            conn.execute(text("""
+                INSERT INTO raw.teams (team_abbrev, team_name, conference, division)
+                VALUES (:team_abbrev, :team_name, :conference, :division)
+                ON CONFLICT (team_abbrev) DO UPDATE SET
+                    team_name = EXCLUDED.team_name,
+                    conference = EXCLUDED.conference,
+                    division = EXCLUDED.division,
+                    updated_at = NOW()
+            """), dict(row))
+
+    logger.info(f"Upserted {len(df)} teams")
+    return len(df)
+
+
+# ─────────────────────────────────────────────
+# SCHEDULE / GAMES
+# ─────────────────────────────────────────────
+def ingest_schedule(start_date: str, end_date: str):
+    """
+    Pull NHL schedule for a date range and upsert into raw.games.
+    Dates in YYYY-MM-DD format.
+    """
+    logger.info(f"Ingesting schedule: {start_date} to {end_date}")
+    current = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    total_inserted = 0
+
+    while current <= end:
+        date_str = current.strftime("%Y-%m-%d")
+        try:
+            schedule = client.schedule.get_schedule(date=date_str)
+        except Exception as e:
+            logger.warning(f"Schedule fetch failed for {date_str}: {e}")
+            current += timedelta(days=1)
+            continue
+
+        game_week = schedule.get("gameWeek", [])
+        for day_data in game_week:
+            day_date = day_data.get("date", date_str)
+            games = day_data.get("games", [])
+
+            for g in games:
+                game_id = g.get("id")
+                game_type = g.get("gameType", 0)
+                if game_type not in (2, 3):  # regular season and playoffs only
+                    continue
+
+                season_start = int(str(game_id)[:4])
+                season = season_start * 10000 + (season_start + 1)
+
+                home = g.get("homeTeam", {})
+                away = g.get("awayTeam", {})
+                state = g.get("gameState", "SCHEDULED")
+
+                record = {
+                    "game_id": game_id,
+                    "season": season,
+                    "game_type": game_type,
+                    "date": day_date,
+                    "home_team": home.get("abbrev", ""),
+                    "away_team": away.get("abbrev", ""),
+                    "home_score": home.get("score") if state in ("FINAL", "OFF") else None,
+                    "away_score": away.get("score") if state in ("FINAL", "OFF") else None,
+                    "game_state": state,
+                    "venue": g.get("venue", {}).get("default", ""),
+                    "is_ot": None,
+                    "is_so": None,
+                }
+
+                if state in ("FINAL", "OFF"):
+                    period = g.get("periodDescriptor", {})
+                    period_num = period.get("number", 3)
+                    period_type = period.get("periodType", "REG")
+                    record["is_ot"] = period_num > 3 or period_type == "OT"
+                    record["is_so"] = period_type == "SO"
+
+                _upsert_game(record)
+                total_inserted += 1
+
+        current += timedelta(days=7)  # schedule API returns a week at a time
+        time.sleep(0.5)  # polite rate limiting
+
+    logger.info(f"Upserted {total_inserted} games from {start_date} to {end_date}")
+    return total_inserted
+
+
+def _upsert_game(record: dict):
+    """Upsert a single game into raw.games."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO raw.games (game_id, season, game_type, date, home_team, away_team,
+                                   home_score, away_score, game_state, venue, is_ot, is_so)
+            VALUES (:game_id, :season, :game_type, :date, :home_team, :away_team,
+                    :home_score, :away_score, :game_state, :venue,
+                    COALESCE(:is_ot, FALSE), COALESCE(:is_so, FALSE))
+            ON CONFLICT (game_id) DO UPDATE SET
+                home_score = COALESCE(EXCLUDED.home_score, raw.games.home_score),
+                away_score = COALESCE(EXCLUDED.away_score, raw.games.away_score),
+                game_state = EXCLUDED.game_state,
+                is_ot = COALESCE(EXCLUDED.is_ot, raw.games.is_ot),
+                is_so = COALESCE(EXCLUDED.is_so, raw.games.is_so),
+                updated_at = NOW()
+        """), record)
+
+
+# ─────────────────────────────────────────────
+# BOXSCORES (skater + goalie game logs)
+# ─────────────────────────────────────────────
+def ingest_boxscore(game_id: int):
+    """
+    Pull boxscore for a single game and populate raw.skater_games + raw.goalie_games.
+    Also populates raw.players for any new player encountered.
+    """
+    try:
+        box = client.game_center.get_boxscore(game_id=game_id)
+    except Exception as e:
+        logger.warning(f"Boxscore fetch failed for game {game_id}: {e}")
+        return False
+
+    player_by_position = box.get("playerByGameStats", {})
+
+    for side in ("homeTeam", "awayTeam"):
+        team_data = box.get(side, {})
+        team_abbrev = team_data.get("abbrev", "")
+        side_stats = player_by_position.get(side, {})
+
+        for pos_group in ("forwards", "defense"):
+            for player in side_stats.get(pos_group, []):
+                _upsert_player_from_boxscore(player)
+                _upsert_skater_game(player, game_id, team_abbrev)
+
+        for player in side_stats.get("goalies", []):
+            _upsert_player_from_boxscore(player)
+            _upsert_goalie_game(player, game_id, team_abbrev)
+
+    return True
+
+
+def _upsert_player_from_boxscore(player: dict):
+    """Ensure player exists in raw.players."""
+    pid = player.get("playerId")
+    if not pid:
+        return
+    name_obj = player.get("name", {})
+    full_name = f"{name_obj.get('default', '')}".strip()
+    if not full_name:
+        full_name = str(pid)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO raw.players (player_id, full_name, position)
+            VALUES (:pid, :name, :pos)
+            ON CONFLICT (player_id) DO UPDATE SET
+                full_name = EXCLUDED.full_name,
+                updated_at = NOW()
+        """), {"pid": pid, "name": full_name, "pos": player.get("position", "")})
+
+
+def _upsert_skater_game(player: dict, game_id: int, team: str):
+    """Upsert a skater's game stats."""
+    pid = player.get("playerId")
+    if not pid:
+        return
+
+    record = {
+        "player_id": pid,
+        "game_id": game_id,
+        "team": team,
+        "position": player.get("position", ""),
+        "toi_seconds": _toi_to_seconds(player.get("toi", "0:00")),
+        "goals": player.get("goals", 0),
+        "assists": player.get("assists", 0),
+        "points": player.get("points", 0),
+        "shots": player.get("shots", 0),
+        "hits": player.get("hits", 0),
+        "blocks": player.get("blockedShots", 0) or player.get("blocks", 0),
+        "pim": player.get("pim", 0),
+        "plus_minus": player.get("plusMinus", 0),
+    }
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO raw.skater_games (player_id, game_id, team, position, toi_seconds,
+                goals, assists, points, shots, hits, blocks, pim, plus_minus)
+            VALUES (:player_id, :game_id, :team, :position, :toi_seconds,
+                    :goals, :assists, :points, :shots, :hits, :blocks, :pim, :plus_minus)
+            ON CONFLICT (player_id, game_id) DO UPDATE SET
+                goals = EXCLUDED.goals,
+                assists = EXCLUDED.assists,
+                points = EXCLUDED.points,
+                shots = EXCLUDED.shots,
+                hits = EXCLUDED.hits,
+                blocks = EXCLUDED.blocks,
+                pim = EXCLUDED.pim,
+                plus_minus = EXCLUDED.plus_minus,
+                toi_seconds = EXCLUDED.toi_seconds
+        """), record)
+
+
+def _upsert_goalie_game(player: dict, game_id: int, team: str):
+    """Upsert a goalie's game stats."""
+    pid = player.get("playerId")
+    if not pid:
+        return
+
+    sa = player.get("shotsAgainst", 0) or 0
+    sv = player.get("saves", 0) or 0
+    ga = player.get("goalsAgainst", 0) or 0
+    sv_pct = sv / sa if sa > 0 else None
+    toi = _toi_to_seconds(player.get("toi", "0:00"))
+    is_starter = toi > 1800  # heuristic; refine with daily faceoff lineup scrape later
+
+    decision_raw = player.get("decision", None)
+    decision = decision_raw if decision_raw in ("W", "L", "O") else None
+    if decision == "O":
+        decision = "OTL"
+
+    record = {
+        "player_id": pid,
+        "game_id": game_id,
+        "team": team,
+        "decision": decision,
+        "is_starter": is_starter,
+        "shots_against": sa,
+        "saves": sv,
+        "goals_against": ga,
+        "sv_pct": sv_pct,
+        "toi_seconds": toi,
+        "even_shots": player.get("evenStrengthShotsAgainst", 0) or 0,
+        "pp_shots": player.get("powerPlayShotsAgainst", 0) or 0,
+        "sh_shots": player.get("shorthandedShotsAgainst", 0) or 0,
+    }
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO raw.goalie_games (player_id, game_id, team, decision, is_starter,
+                shots_against, saves, goals_against, sv_pct, toi_seconds,
+                even_shots, pp_shots, sh_shots)
+            VALUES (:player_id, :game_id, :team, :decision, :is_starter,
+                    :shots_against, :saves, :goals_against, :sv_pct, :toi_seconds,
+                    :even_shots, :pp_shots, :sh_shots)
+            ON CONFLICT (player_id, game_id) DO UPDATE SET
+                decision = EXCLUDED.decision,
+                is_starter = EXCLUDED.is_starter,
+                shots_against = EXCLUDED.shots_against,
+                saves = EXCLUDED.saves,
+                goals_against = EXCLUDED.goals_against,
+                sv_pct = EXCLUDED.sv_pct,
+                toi_seconds = EXCLUDED.toi_seconds
+        """), record)
+
+
+# ─────────────────────────────────────────────
+# BATCH OPERATIONS
+# ─────────────────────────────────────────────
+def backfill_boxscores(season: Optional[int] = None):
+    """Fetch boxscores for all FINAL games missing skater_games entries."""
+    season_filter = f"AND g.season = {season}" if season else ""
+
+    with engine.connect() as conn:
+        result = conn.execute(text(f"""
+            SELECT g.game_id FROM raw.games g
+            WHERE g.game_state IN ('FINAL', 'OFF')
+            {season_filter}
+            AND NOT EXISTS (
+                SELECT 1 FROM raw.skater_games sg WHERE sg.game_id = g.game_id
+            )
+            ORDER BY g.date
+        """))
+        game_ids = [row[0] for row in result.fetchall()]
+
+    logger.info(f"Backfilling boxscores for {len(game_ids)} games...")
+    success = 0
+    for i, gid in enumerate(game_ids):
+        if ingest_boxscore(gid):
+            success += 1
+        if (i + 1) % 50 == 0:
+            logger.info(f"  ... {i+1}/{len(game_ids)} processed ({success} succeeded)")
+        time.sleep(0.3)
+
+    logger.info(f"Boxscore backfill complete: {success}/{len(game_ids)} succeeded")
+    return success
+
+
+def ingest_season(season: int):
+    """Full ingestion pipeline for a single season (e.g., 20242025)."""
+    start_year = season // 10000
+    start_date = f"{start_year}-10-01"
+    end_date = f"{start_year + 1}-06-30"
+
+    logger.info(f"=== Ingesting season {season} ({start_date} to {end_date}) ===")
+    ingest_schedule(start_date, end_date)
+    backfill_boxscores(season=season)
+    logger.info(f"=== Season {season} ingestion complete ===")
+
+
+def daily_refresh():
+    """Daily update: refresh recent schedule + backfill new boxscores. Run via cron."""
+    logger.info("=== Starting daily refresh ===")
+    ingest_teams()
+
+    today = date.today()
+    start = (today - timedelta(days=3)).strftime("%Y-%m-%d")
+    end = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+    ingest_schedule(start, end)
+
+    backfill_boxscores()
+    logger.info("=== Daily refresh complete ===")
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def _toi_to_seconds(toi_str: str) -> int:
+    """Convert 'MM:SS' time-on-ice string to integer seconds."""
+    if not toi_str or toi_str == "--:--":
+        return 0
+    try:
+        parts = str(toi_str).split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except (ValueError, IndexError):
+        return 0
+
+
+# ─────────────────────────────────────────────
+# CLI ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    import sys
+    from config.settings import check_db_connection
+
+    if not check_db_connection():
+        print("ERROR: Database not reachable. Start PostgreSQL first.")
+        sys.exit(1)
+
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == "teams":
+            ingest_teams()
+        elif cmd == "daily":
+            daily_refresh()
+        elif cmd == "season" and len(sys.argv) > 2:
+            ingest_season(int(sys.argv[2]))
+        elif cmd == "backfill-all":
+            for s in BACKFILL_SEASONS:
+                ingest_season(s)
+        else:
+            print("Usage: python -m ingestion.nhl_api [teams|daily|season <YYYYYYYY>|backfill-all]")
+    else:
+        print("Usage: python -m ingestion.nhl_api [teams|daily|season <YYYYYYYY>|backfill-all]")

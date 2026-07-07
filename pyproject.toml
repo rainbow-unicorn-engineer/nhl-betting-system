@@ -1,0 +1,43 @@
+[project]
+name = "nhl-betting-system"
+version = "0.1.0"
+description = "NHL Sports Betting Predictive System"
+requires-python = ">=3.11"
+dependencies = [
+    "nhl-api-py>=0.7.0",
+    "psycopg2-binary>=2.9.9",
+    "sqlalchemy>=2.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "lightgbm>=4.3",
+    "xgboost>=2.0",
+    "scikit-learn>=1.4",
+    "optuna>=3.6",
+]
+dashboard = [
+    "streamlit>=1.32",
+    "plotly>=5.20",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
