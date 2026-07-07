@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS raw.shots (
     game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
     season          INTEGER NOT NULL,
     period          SMALLINT NOT NULL,
-    time_elapsed    INTEGER NOT NULL,          -- seconds into period
+    time_elapsed    INTEGER NOT NULL,          -- seconds elapsed in game (MoneyPuck `time`)
     team            VARCHAR(3) NOT NULL,
     shooter_id      INTEGER,
     goalie_id       INTEGER,

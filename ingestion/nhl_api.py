@@ -360,7 +360,8 @@ def ingest_season(season: int):
     """Full ingestion pipeline for a single season (e.g., 20242025)."""
     start_year = season // 10000
     start_date = f"{start_year}-10-01"
-    end_date = f"{start_year + 1}-06-30"
+    # July 31, not June 30: the COVID-delayed 2020-21 Cup Final ran to July 7
+    end_date = f"{start_year + 1}-07-31"
 
     logger.info(f"=== Ingesting season {season} ({start_date} to {end_date}) ===")
     ingest_schedule(start_date, end_date)

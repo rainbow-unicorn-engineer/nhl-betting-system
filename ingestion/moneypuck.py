@@ -6,10 +6,10 @@ Downloads: https://moneypuck.com/data.htm
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 from sqlalchemy import text
-from tqdm import tqdm
 
 from config.settings import engine, DATA_DIR
 
@@ -48,7 +48,16 @@ def download_shots_csv(season_start_year: int, force: bool = False) -> Path:
 
 
 def load_shots_to_db(season_start_year: int, csv_path: Path = None):
-    """Parse MoneyPuck shots CSV and load into raw.shots."""
+    """
+    Parse MoneyPuck shots CSV and load into raw.shots (vectorized).
+
+    MoneyPuck format gotchas (verified against live 2024 file):
+    - `game_id` is short-form (e.g. 20001); the real NHL game_id is
+      season_start_year * 1_000_000 + short_id (e.g. 2024020001)
+    - `season` is the start year (2024); our convention is 20242025
+    - `time` is seconds elapsed in the GAME, not the period
+    - `event` values are SHOT / MISS / GOAL (blocked shots not included)
+    """
     if csv_path is None:
         csv_path = DATA_DIR / f"moneypuck_shots_{season_start_year}.csv"
 
@@ -58,81 +67,83 @@ def load_shots_to_db(season_start_year: int, csv_path: Path = None):
 
     logger.info(f"Loading MoneyPuck shots from {csv_path}...")
     df = pd.read_csv(csv_path, low_memory=False)
+    season = season_start_year * 10000 + (season_start_year + 1)
 
-    records = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing shots"):
-        home_sk = row.get("homeSkatersOnIce", 5)
-        away_sk = row.get("awaySkatersOnIce", 5)
-        is_home = row.get("isHomeTeam", 0)
-        strength = f"{int(home_sk)}v{int(away_sk)}" if is_home else f"{int(away_sk)}v{int(home_sk)}"
+    out = pd.DataFrame()
+    out["game_id"] = season_start_year * 1_000_000 + df["game_id"].astype(int)
+    out["season"] = season
+    out["period"] = df["period"].fillna(0).astype(int)
+    out["time_elapsed"] = df["time"].fillna(0).astype(int)  # seconds into game
+    out["team"] = df["teamCode"].astype(str)
+    out["shooter_id"] = df["shooterPlayerId"].astype("Int64")
+    out["goalie_id"] = df["goalieIdForShot"].astype("Int64")
+    out["x"] = df["arenaAdjustedXCord"]
+    out["y"] = df["arenaAdjustedYCord"]
+    out["shot_type"] = df["shotType"].where(df["shotType"].notna(), None)
 
-        home_goals = row.get("homeTeamGoals", 0)
-        away_goals = row.get("awayTeamGoals", 0)
-        score_state = int(home_goals) - int(away_goals)
+    event = df["event"].astype(str).str.upper()
+    out["event_type"] = event.where(event.isin(["SHOT", "GOAL", "MISS", "BLOCK"]), "SHOT")
+    out["is_goal"] = df["goal"].fillna(0).astype(bool)
+    out["xg_moneypuck"] = df["xGoal"]
 
-        event_type = str(row.get("event", "SHOT")).upper()
-        if event_type not in ("SHOT", "GOAL", "MISS", "BLOCK"):
-            event_type = "SHOT"
+    home_sk = df["homeSkatersOnIce"].fillna(5).astype(int).astype(str)
+    away_sk = df["awaySkatersOnIce"].fillna(5).astype(int).astype(str)
+    is_home = df["isHomeTeam"].fillna(0).astype(int) == 1
+    out["strength"] = np.where(is_home, home_sk + "v" + away_sk, away_sk + "v" + home_sk)
 
-        record = {
-            "game_id": int(row.get("game_id", 0)),
-            "season": int(row.get("season", season_start_year * 10000 + season_start_year + 1)),
-            "period": int(row.get("period", 0)),
-            "time_elapsed": int(row.get("time", 0)),
-            "team": str(row.get("teamCode", "")),
-            "shooter_id": _safe_int(row.get("shooterPlayerId")),
-            "goalie_id": _safe_int(row.get("goalieIdForShot")),
-            "x": _safe_float(row.get("arenaAdjustedXCord")),
-            "y": _safe_float(row.get("arenaAdjustedYCord")),
-            "shot_type": str(row.get("shotType", "")) if pd.notna(row.get("shotType")) else None,
-            "event_type": event_type,
-            "is_goal": bool(row.get("goal", 0)),
-            "xg_moneypuck": _safe_float(row.get("xGoal")),
-            "strength": strength,
-            "score_state": score_state,
-            "is_rebound": bool(row.get("shotRebound", 0)),
-            "is_rush": bool(row.get("shotRush", 0)),
-            "shot_distance": _safe_float(row.get("shotDistance")),
-            "shot_angle": _safe_float(row.get("shotAngle")),
+    out["score_state"] = (
+        df["homeTeamGoals"].fillna(0).astype(int) - df["awayTeamGoals"].fillna(0).astype(int)
+    )
+    out["is_rebound"] = df["shotRebound"].fillna(0).astype(bool)
+    out["is_rush"] = df["shotRush"].fillna(0).astype(bool)
+    out["shot_distance"] = df["shotDistance"]
+    out["shot_angle"] = df["shotAngle"]
+
+    # FK safety: raw.shots.game_id references raw.games. Drop (and report)
+    # shots for games we don't have — e.g. if the schedule backfill is
+    # incomplete for this season.
+    with engine.connect() as conn:
+        known = {
+            r[0] for r in conn.execute(
+                text("SELECT game_id FROM raw.games WHERE season = :s"), {"s": season}
+            )
         }
-        records.append(record)
+    missing_mask = ~out["game_id"].isin(known)
+    if missing_mask.any():
+        n_missing_games = out.loc[missing_mask, "game_id"].nunique()
+        logger.warning(
+            f"Dropping {int(missing_mask.sum())} shots from {n_missing_games} games "
+            f"not present in raw.games for season {season} — run the NHL API "
+            f"backfill for this season first if this number is large."
+        )
+        out = out[~missing_mask]
 
-    logger.info(f"Inserting {len(records)} shots into raw.shots...")
-    insert_df = pd.DataFrame(records)
+    logger.info(f"Inserting {len(out)} shots into raw.shots...")
     chunk_size = 10000
     inserted = 0
 
     with engine.begin() as conn:
-        season_val = insert_df["season"].iloc[0] if len(insert_df) > 0 else 0
-        conn.execute(text("DELETE FROM raw.shots WHERE season = :s"), {"s": season_val})
+        conn.execute(text("DELETE FROM raw.shots WHERE season = :s"), {"s": season})
 
-        for start in range(0, len(insert_df), chunk_size):
-            chunk = insert_df.iloc[start:start + chunk_size]
+        for start in range(0, len(out), chunk_size):
+            chunk = out.iloc[start:start + chunk_size]
             chunk.to_sql("shots", conn, schema="raw", if_exists="append", index=False, method="multi")
             inserted += len(chunk)
             if inserted % 50000 == 0:
-                logger.info(f"  ... {inserted}/{len(records)} shots inserted")
+                logger.info(f"  ... {inserted}/{len(out)} shots inserted")
 
     logger.info(f"Loaded {inserted} shots for season starting {season_start_year}")
     return inserted
 
 
-def _safe_int(val):
-    try:
-        if pd.isna(val):
-            return None
-        return int(val)
-    except (ValueError, TypeError):
-        return None
-
-
-def _safe_float(val):
-    try:
-        if pd.isna(val):
-            return None
-        return float(val)
-    except (ValueError, TypeError):
-        return None
+def ingest_season_shots(season: int, force_download: bool = False) -> int:
+    """
+    Download + load MoneyPuck shots for one season, given our season
+    convention (e.g. 20242025 -> start year 2024).
+    """
+    start_year = season // 10000
+    csv_path = download_shots_csv(start_year, force=force_download)
+    return load_shots_to_db(start_year, csv_path)
 
 
 if __name__ == "__main__":

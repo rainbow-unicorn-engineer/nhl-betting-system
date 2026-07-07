@@ -59,6 +59,7 @@ def db_status():
 def backfill():
     """Full historical backfill of all configured seasons."""
     from ingestion.nhl_api import ingest_teams, ingest_season
+    from ingestion.moneypuck import ingest_season_shots
 
     logger.info("=" * 60)
     logger.info("STARTING FULL BACKFILL")
@@ -68,6 +69,11 @@ def backfill():
     ingest_teams()
     for season in BACKFILL_SEASONS:
         ingest_season(season)
+        # MoneyPuck shots must load after the season's games exist (FK)
+        try:
+            ingest_season_shots(season)
+        except Exception as e:
+            logger.error(f"MoneyPuck shots ingestion failed for {season}: {e}")
 
     logger.info("BACKFILL COMPLETE")
     db_status()
