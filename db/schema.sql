@@ -102,6 +102,27 @@ CREATE INDEX IF NOT EXISTS idx_shots_season ON raw.shots(season);
 CREATE INDEX IF NOT EXISTS idx_shots_goalie ON raw.shots(goalie_id);
 CREATE INDEX IF NOT EXISTS idx_shots_shooter ON raw.shots(shooter_id);
 
+-- Team-level game stats from the gamecenter right-rail endpoint
+-- (PP conversions, faceoffs, hits, blocks — not available in boxscore
+-- playerByGameStats; needed for pp_pct/pk_pct/fow_pct rolling features)
+CREATE TABLE IF NOT EXISTS raw.team_games (
+    game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
+    team            VARCHAR(3) NOT NULL,
+    is_home         BOOLEAN NOT NULL,
+    sog             SMALLINT,
+    faceoff_wins    SMALLINT,
+    faceoff_total   SMALLINT,
+    pp_goals        SMALLINT,
+    pp_opps         SMALLINT,
+    pim             SMALLINT,
+    hits            SMALLINT,
+    blocked_shots   SMALLINT,
+    giveaways       SMALLINT,
+    takeaways       SMALLINT,
+    PRIMARY KEY (game_id, team)
+);
+CREATE INDEX IF NOT EXISTS idx_team_games_team ON raw.team_games(team);
+
 CREATE TABLE IF NOT EXISTS raw.skater_games (
     player_id       INTEGER NOT NULL,
     game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),

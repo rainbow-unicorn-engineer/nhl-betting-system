@@ -11,10 +11,14 @@ from datetime import date, timedelta, datetime
 from typing import Optional
 
 import pandas as pd
+import requests
 from nhlpy import NHLClient
 from sqlalchemy import text
 
 from config.settings import engine, BACKFILL_SEASONS
+
+# nhlpy 3.3.0 does not wrap the right-rail endpoint (team game stats)
+RIGHT_RAIL_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/right-rail"
 
 logger = logging.getLogger("nhl.ingestion.nhl_api")
 
@@ -325,6 +329,106 @@ def _upsert_goalie_game(player: dict, game_id: int, team: str):
 
 
 # ─────────────────────────────────────────────
+# TEAM GAME STATS (right-rail endpoint)
+# ─────────────────────────────────────────────
+def ingest_team_stats(game_id: int, home_team: str, away_team: str) -> bool:
+    """
+    Pull team-level game stats (PP conversions, faceoffs, hits, blocks...)
+    from the gamecenter right-rail endpoint into raw.team_games.
+    Only meaningful for completed games.
+    """
+    try:
+        resp = requests.get(RIGHT_RAIL_URL.format(game_id=game_id), timeout=30)
+        resp.raise_for_status()
+        tgs = resp.json().get("teamGameStats")
+    except Exception as e:
+        logger.warning(f"Right-rail fetch failed for game {game_id}: {e}")
+        return False
+
+    if not tgs:
+        logger.warning(f"No teamGameStats for game {game_id}")
+        return False
+
+    stats = {c.get("category"): (c.get("homeValue"), c.get("awayValue")) for c in tgs}
+
+    for team, is_home, idx in ((home_team, True, 0), (away_team, False, 1)):
+        pp_goals, pp_opps = _parse_saves_shots(stats.get("powerPlay", (None, None))[idx])
+        fo_wins, fo_total = _parse_saves_shots(stats.get("faceoffWins", (None, None))[idx])
+
+        def _num(cat):
+            val = stats.get(cat, (None, None))[idx]
+            return int(val) if val is not None else None
+
+        record = {
+            "game_id": game_id,
+            "team": team,
+            "is_home": is_home,
+            "sog": _num("sog"),
+            "faceoff_wins": fo_wins,
+            "faceoff_total": fo_total,
+            "pp_goals": pp_goals,
+            "pp_opps": pp_opps,
+            "pim": _num("pim"),
+            "hits": _num("hits"),
+            "blocked_shots": _num("blockedShots"),
+            "giveaways": _num("giveaways"),
+            "takeaways": _num("takeaways"),
+        }
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO raw.team_games (game_id, team, is_home, sog,
+                    faceoff_wins, faceoff_total, pp_goals, pp_opps,
+                    pim, hits, blocked_shots, giveaways, takeaways)
+                VALUES (:game_id, :team, :is_home, :sog,
+                        :faceoff_wins, :faceoff_total, :pp_goals, :pp_opps,
+                        :pim, :hits, :blocked_shots, :giveaways, :takeaways)
+                ON CONFLICT (game_id, team) DO UPDATE SET
+                    sog = EXCLUDED.sog,
+                    faceoff_wins = EXCLUDED.faceoff_wins,
+                    faceoff_total = EXCLUDED.faceoff_total,
+                    pp_goals = EXCLUDED.pp_goals,
+                    pp_opps = EXCLUDED.pp_opps,
+                    pim = EXCLUDED.pim,
+                    hits = EXCLUDED.hits,
+                    blocked_shots = EXCLUDED.blocked_shots,
+                    giveaways = EXCLUDED.giveaways,
+                    takeaways = EXCLUDED.takeaways
+            """), record)
+
+    return True
+
+
+def backfill_team_stats(season: Optional[int] = None):
+    """Fetch right-rail team stats for all FINAL games missing team_games rows."""
+    season_filter = f"AND g.season = {season}" if season else ""
+
+    with engine.connect() as conn:
+        result = conn.execute(text(f"""
+            SELECT g.game_id, g.home_team, g.away_team FROM raw.games g
+            WHERE g.game_state IN ('FINAL', 'OFF')
+            {season_filter}
+            AND NOT EXISTS (
+                SELECT 1 FROM raw.team_games tg WHERE tg.game_id = g.game_id
+            )
+            ORDER BY g.date
+        """))
+        games = result.fetchall()
+
+    logger.info(f"Backfilling team stats for {len(games)} games...")
+    success = 0
+    for i, (gid, home, away) in enumerate(games):
+        if ingest_team_stats(gid, home, away):
+            success += 1
+        if (i + 1) % 50 == 0:
+            logger.info(f"  ... {i+1}/{len(games)} processed ({success} succeeded)")
+        time.sleep(0.3)
+
+    logger.info(f"Team stats backfill complete: {success}/{len(games)} succeeded")
+    return success
+
+
+# ─────────────────────────────────────────────
 # BATCH OPERATIONS
 # ─────────────────────────────────────────────
 def backfill_boxscores(season: Optional[int] = None):
@@ -366,6 +470,7 @@ def ingest_season(season: int):
     logger.info(f"=== Ingesting season {season} ({start_date} to {end_date}) ===")
     ingest_schedule(start_date, end_date)
     backfill_boxscores(season=season)
+    backfill_team_stats(season=season)
     logger.info(f"=== Season {season} ingestion complete ===")
 
 
@@ -380,6 +485,7 @@ def daily_refresh():
     ingest_schedule(start, end)
 
     backfill_boxscores()
+    backfill_team_stats()
     logger.info("=== Daily refresh complete ===")
 
 
