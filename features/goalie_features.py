@@ -45,15 +45,15 @@ LEAGUE_SV_FALLBACK = 0.905     # long-run NHL league save percentage
 LEAGUE_GSAX60_FALLBACK = 0.0   # GSAx is zero-sum against the xG model
 
 # Buhlmann credibility constant, in units of appearances.
-# Estimated by estimate_k(20202021) via one-way random-effects ANOVA on
-# per-appearance SV% (79 goalies, 1,914 appearances; >=5 appearances and
-# >=10 shots faced per appearance): within-goalie variance of single-game
-# SV% = 0.003743 vs between-goalie variance of true talent = 0.000065,
-# giving k = 57.6. Interpretation: a goalie needs ~58 starts before their
-# own record outweighs the league prior (Z=0.5) — single-season SV% is
-# mostly noise, consistent with the goalie-analytics literature.
-# Re-run estimate_k() after loading more seasons and update if it moves.
-DEFAULT_K = 57.6
+# Estimated by estimate_k() via one-way random-effects ANOVA on
+# per-appearance SV% (>=5 appearances, >=10 shots faced per appearance).
+# Per-season estimates over the backfilled history: 57.6 (2020-21),
+# 75.1 (2021-22), 38.1 (2022-23), 65.6 (2023-24), 93.8 (2024-25) —
+# noisy, as variance-ratio estimates are, so we use the pooled mean.
+# Interpretation: a goalie needs ~66 starts before their own record
+# outweighs the league prior (Z=0.5) — single-season SV% is mostly noise,
+# consistent with the goalie-analytics literature.
+DEFAULT_K = 66.0
 
 BASE_SQL = """
 WITH shot_agg AS (
