@@ -3,10 +3,11 @@ pipeline.py
 Master orchestrator for the NHL Betting System data pipeline.
 
 Usage:
-    python pipeline.py setup             # First-time setup verification
-    python pipeline.py status            # Check database status
-    python pipeline.py backfill          # Full historical backfill (5 seasons)
-    python pipeline.py daily             # Daily refresh (run via cron)
+    python pipeline.py setup                        # First-time setup verification
+    python pipeline.py status                       # Check database status
+    python pipeline.py backfill                     # Full historical backfill (6 seasons)
+    python pipeline.py features [--season YYYYYYYY] # Build feature store (all seasons by default)
+    python pipeline.py daily                        # Daily refresh (run via cron)
 """
 import sys
 from datetime import date
@@ -79,14 +80,25 @@ def backfill():
     db_status()
 
 
+def features(season=None):
+    """Build the feature store (Layer 2) for one season or all seasons."""
+    from features.build_all import build_features
+
+    build_features(season)
+
+
 def daily():
     """Daily refresh pipeline. Call via cron."""
     from ingestion.nhl_api import daily_refresh
     from ingestion.odds_api import snapshot_odds
+    from config.settings import CURRENT_SEASON
 
     logger.info(f"DAILY REFRESH — {date.today()}")
     daily_refresh()
     snapshot_odds()
+    # Feature refresh after ingestion: current season only (Elo is always
+    # full-history inside the build)
+    features(season=CURRENT_SEASON)
     logger.info("DAILY REFRESH COMPLETE")
 
 
@@ -128,8 +140,9 @@ NHL Betting System Pipeline
 Usage:
     python pipeline.py setup       Check prerequisites
     python pipeline.py status      Database population status
-    python pipeline.py backfill    Full 5-season historical backfill
-    python pipeline.py daily       Daily refresh (schedule + boxscores + odds)
+    python pipeline.py backfill    Full 6-season historical backfill
+    python pipeline.py features    Build feature store [--season YYYYYYYY]
+    python pipeline.py daily       Daily refresh (schedule + boxscores + odds + features)
         """)
         sys.exit(0)
 
@@ -144,6 +157,18 @@ Usage:
             print("ERROR: Database not reachable. Run: docker compose up -d")
             sys.exit(1)
         backfill()
+    elif cmd == "features":
+        if not check_db_connection():
+            print("ERROR: Database not reachable. Run: docker compose up -d")
+            sys.exit(1)
+        season = None
+        if "--season" in sys.argv:
+            try:
+                season = int(sys.argv[sys.argv.index("--season") + 1])
+            except (IndexError, ValueError):
+                print("ERROR: --season requires a value like 20242025")
+                sys.exit(1)
+        features(season)
     elif cmd == "daily":
         if not check_db_connection():
             logger.error("Database not reachable")
