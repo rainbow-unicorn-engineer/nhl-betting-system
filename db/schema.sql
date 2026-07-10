@@ -191,6 +191,21 @@ CREATE TABLE IF NOT EXISTS raw.odds_snapshots (
 CREATE INDEX IF NOT EXISTS idx_odds_game ON raw.odds_snapshots(game_id);
 CREATE INDEX IF NOT EXISTS idx_odds_time ON raw.odds_snapshots(captured_at);
 
+-- Historical reference odds (one row per game) backfilled from ESPN's public
+-- summary API. Single book, near-closing line — good enough for a market
+-- feature and strategy backtests; NOT a substitute for our own multi-book
+-- time series in raw.odds_snapshots.
+CREATE TABLE IF NOT EXISTS raw.historical_odds (
+    game_id         BIGINT PRIMARY KEY REFERENCES raw.games(game_id),
+    provider        VARCHAR(40),               -- e.g. DraftKings (varies by era)
+    home_ml         INTEGER,                   -- American odds
+    away_ml         INTEGER,
+    spread          NUMERIC(4,1),              -- home puck line
+    over_under      NUMERIC(4,1),
+    details         VARCHAR(40),               -- ESPN display string, e.g. "MTL -125"
+    fetched_at      TIMESTAMP NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS raw.shifts (
     shift_id        BIGSERIAL PRIMARY KEY,
     game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
