@@ -141,7 +141,8 @@ Full column definitions in `db/schema.sql`.
 | **Phase 1** | Data foundation: schema, 3 ingestion modules, master pipeline, smoke tests | ✅ COMPLETE (6 seasons backfilled: 7,945 games, 683k shots) |
 | **Phase 2** | Feature store + baseline logistic regression model | ✅ COMPLETE — **gate passed: walk-forward log loss 0.6829 < 0.69** (see `docs/phase2_results.md`) |
 | **Phase 3 (modeling half)** | Historical odds (99.5% coverage, free — `docs/historical_odds.md`) + market feature + LightGBM boosted from the market + temperature calibration | ✅ COMPLETE — **log loss 0.6607, ECE 0.0146** (`lgbm_market v2`, see `docs/phase3_results.md`) |
-| **Phase 3 (betting half)** | Edge calculator + quarter-Kelly staking + bet log + payout backtest (DraftKings era), PMF totals, Streamlit dashboard | ⬜ NEXT |
+| **Phase 3 (betting half)** | Edge engine + quarter-Kelly staking + payout backtest + Streamlit dashboard | ✅ COMPLETE — backtest says raise edge threshold to ~5-6% (validate via paper trading); PMF totals + daily recommendation job remain | 
+| **Phase 3 (remaining)** | PMF totals model, in-season daily recommendation job, strategy-layer isotonic | ⬜ NEXT |
 | **Phase 4** | Live betting, iteration, player props, live/in-game model, cloud migration | ⬜ Pending |
 
 ### Phase 1 deliverables (done)

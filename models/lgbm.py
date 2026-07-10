@@ -223,7 +223,12 @@ def run_lgbm(register: bool = True) -> dict:
 
     if register:
         _register(pooled, meta, names, str(artifact))
-    return {"folds": fold_metrics, "pooled": pooled, "artifact": str(artifact)}
+
+    oof = meta.loc[scored, ["game_id", "season", "date"]].copy()
+    oof["prob_home"] = oof_cal[scored]
+    oof["prob_home_raw"] = oof_raw[scored]
+    return {"folds": fold_metrics, "pooled": pooled, "artifact": str(artifact),
+            "oof": oof}
 
 
 def _register(pooled: dict, meta, names: list, artifact: str) -> None:
