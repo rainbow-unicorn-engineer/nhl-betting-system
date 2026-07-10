@@ -103,6 +103,12 @@ def daily():
     logger.info(f"DAILY REFRESH — {date.today()}")
     daily_refresh()
     snapshot_odds()
+    # ESPN reference-line top-up for newly-final games (no-op when current)
+    try:
+        from ingestion.espn_odds import backfill_historical_odds
+        backfill_historical_odds(CURRENT_SEASON)
+    except Exception as e:
+        logger.error(f"ESPN odds top-up failed (non-fatal): {e}")
     # Feature refresh after ingestion: current season only (Elo is always
     # full-history inside the build)
     features(season=CURRENT_SEASON)

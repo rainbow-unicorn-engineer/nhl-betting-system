@@ -28,11 +28,13 @@ scraper in a later phase). If a game somehow has no flagged starter, the
 goalie with the most TOI is used and starter_fallback_{home,away} is set to
 1.0 in the vector. Starter ids are also written back to features.matchup.
 
-Market feature: the plan calls for the opening no-vig implied probability
-from raw.odds_snapshots. That table is empty for the whole backfill window
-(odds collection starts with the daily pipeline), so the market feature is
-deliberately NOT added yet — an all-NULL column would poison every vector.
-Add it here once snapshots exist; the baseline (Task 8) trains without it.
+Market features: market_home_prob is the no-vig home implied probability
+from raw.historical_odds (normalizing home/(home+away) — valid for both the
+2-way DraftKings era and the 3-way Unibet era, see docs/historical_odds.md).
+Games without a two-sided line (2024-25, where only a junk one-sided mirror
+survives) get 0.5 plus market_available = 0 so the model knows the market
+is silent rather than neutral. Live/opening lines from raw.odds_snapshots
+join in with the betting engine phase.
 
 Labels: home_win = home_score > away_score for FINAL games. Only FINAL
 games are materialized for now (scheduled-game vectors need confirmed
@@ -46,7 +48,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from config.settings import engine
-from features.util import WINDOWS
+from features.util import WINDOWS, american_implied_prob
 
 logger = logging.getLogger("nhl.features.vectors")
 
@@ -68,6 +70,7 @@ def feature_names() -> list:
     names += ["elo_diff", "rest_diff", "b2b_home", "b2b_away",
               "travel_diff", "tz_home", "tz_away", "game_num_diff",
               "stage_early", "stage_late"]
+    names += ["market_home_prob", "market_available"]
     return names
 
 
@@ -142,12 +145,32 @@ def _load_goalie_wide(season: Optional[int]) -> pd.DataFrame:
     return wide.reset_index()
 
 
+def _load_market(season: Optional[int]) -> pd.DataFrame:
+    """No-vig home implied probability per game from raw.historical_odds.
+    Only two-sided lines qualify; one-sided mirror rows are excluded."""
+    season_filter = "AND g.season = :season" if season else ""
+    with engine.connect() as conn:
+        odds = pd.read_sql(text(f"""
+            SELECT h.game_id, h.home_ml, h.away_ml
+            FROM raw.historical_odds h
+            JOIN raw.games g USING (game_id)
+            WHERE h.home_ml IS NOT NULL AND h.away_ml IS NOT NULL
+              {season_filter}
+        """), conn, params={"season": season} if season else {})
+    if odds.empty:
+        return pd.DataFrame(columns=["game_id", "market_home_prob"])
+    ph = odds["home_ml"].map(american_implied_prob)
+    pa = odds["away_ml"].map(american_implied_prob)
+    odds["market_home_prob"] = ph / (ph + pa)
+    return odds[["game_id", "market_home_prob"]]
+
+
 def _diff(home: pd.Series, away: pd.Series) -> pd.Series:
     """Home − away differential; a missing side means no signal -> 0.0."""
     return (home.astype(float) - away.astype(float)).fillna(0.0)
 
 
-def assemble(games, team_wide, starters, goalie_wide) -> pd.DataFrame:
+def assemble(games, team_wide, starters, goalie_wide, market=None) -> pd.DataFrame:
     """
     Pure join/derive step: one row per game with every FEATURE_NAMES column,
     plus game_id/season/date/home_win/home_goals/away_goals.
@@ -201,6 +224,15 @@ def assemble(games, team_wide, starters, goalie_wide) -> pd.DataFrame:
     feats["game_num_diff"] = _diff(df["home_game_num"], df["away_game_num"])
     feats["stage_early"] = (df["season_stage"] == "EARLY").astype(float)
     feats["stage_late"] = (df["season_stage"] == "LATE").astype(float)
+
+    # Market features: no-vig home prob; 0.5 + available=0 when no line
+    if market is None or market.empty:
+        mkt = pd.Series(np.nan, index=df.index)
+    else:
+        mkt = df.merge(market, on="game_id", how="left")["market_home_prob"]
+        mkt.index = df.index
+    feats["market_home_prob"] = mkt.fillna(0.5).astype(float)
+    feats["market_available"] = mkt.notna().astype(float)
 
     # Label
     feats["home_win"] = df["home_score"] > df["away_score"]
@@ -264,7 +296,8 @@ def build_game_vectors(season: Optional[int] = None) -> int:
         logger.warning(f"No completed games with matchup rows (season={scope}).")
         return 0
     df = assemble(games, _load_team_wide(season),
-                  _load_starters(season), _load_goalie_wide(season))
+                  _load_starters(season), _load_goalie_wide(season),
+                  market=_load_market(season))
     return write_vectors(df)
 
 

@@ -147,6 +147,14 @@ def run_baseline(register: bool = True) -> dict:
     from sklearn.preprocessing import StandardScaler
 
     X, y, meta, names = load_dataset()
+    # The baseline validates the feature store itself, so it stays
+    # market-blind: market columns (added in Phase 3) are excluded here
+    # and belong to models/lgbm.py, which handles the two market regimes.
+    market_cols = [i for i, n in enumerate(names)
+                   if n in ("market_home_prob", "market_available")]
+    if market_cols:
+        X = np.delete(X, market_cols, axis=1)
+        names = [n for i, n in enumerate(names) if i not in market_cols]
     folds = walk_forward_folds(meta)
     logger.info(f"Dataset: {X.shape[0]} games x {X.shape[1]} features, "
                 f"{len(folds)} walk-forward folds")

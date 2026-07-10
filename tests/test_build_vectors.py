@@ -79,8 +79,9 @@ class TestFeatureNames:
         names = feature_names()
         assert names == FEATURE_NAMES
         assert len(names) == len(set(names))
-        # 14 team stats x 5 windows + 2 gp x 5 + 3 goalie x 5 + 2 flags + 10
-        assert len(names) == 14 * 5 + 2 * 5 + 3 * 5 + 2 + 10
+        # 14 team stats x 5 windows + 2 gp x 5 + 3 goalie x 5 + 2 flags
+        # + 10 context + 2 market
+        assert len(names) == 14 * 5 + 2 * 5 + 3 * 5 + 2 + 10 + 2
 
 
 class TestAssemble:
@@ -116,6 +117,23 @@ class TestAssemble:
         assert v["starter_fallback_home"] == 0.0
         assert v["goalie_shrunk_sv_pct_diff_w10"] == 0.0  # imputed, not NaN
         assert np.isfinite(list(v.values())).all()
+
+    def test_market_feature_joined(self):
+        market = pd.DataFrame([{"game_id": 1, "market_home_prob": 0.58}])
+        df = assemble(synth_games(), synth_team_wide(),
+                      synth_starters(), synth_goalie_wide(), market=market)
+        v = vec_of(df)
+        assert v["market_home_prob"] == pytest.approx(0.58)
+        assert v["market_available"] == 1.0
+
+    def test_market_missing_is_neutral_and_flagged(self):
+        for market in (None, pd.DataFrame(columns=["game_id", "market_home_prob"]),
+                       pd.DataFrame([{"game_id": 999, "market_home_prob": 0.7}])):
+            df = assemble(synth_games(), synth_team_wide(),
+                          synth_starters(), synth_goalie_wide(), market=market)
+            v = vec_of(df)
+            assert v["market_home_prob"] == 0.5
+            assert v["market_available"] == 0.0
 
 
 # ─────────────────────────────────────────────
