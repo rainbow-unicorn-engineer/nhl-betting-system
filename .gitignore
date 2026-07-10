@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# Environment
+.env
+
+# Data
+data/
+*.csv
+*.parquet
+*.zip
+
+# Models
+*.pkl
+*.joblib
+mlruns/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Docker
+pgdata/
+logs/
