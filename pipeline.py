@@ -87,6 +87,13 @@ def features(season=None):
     build_features(season)
 
 
+def odds():
+    """Odds snapshot only — cheap enough to run near game time for CLV."""
+    from ingestion.odds_api import snapshot_odds
+
+    snapshot_odds()
+
+
 def daily():
     """Daily refresh pipeline. Call via cron."""
     from ingestion.nhl_api import daily_refresh
@@ -169,6 +176,11 @@ Usage:
                 print("ERROR: --season requires a value like 20242025")
                 sys.exit(1)
         features(season)
+    elif cmd == "odds":
+        if not check_db_connection():
+            logger.error("Database not reachable")
+            sys.exit(1)
+        odds()
     elif cmd == "daily":
         if not check_db_connection():
             logger.error("Database not reachable")
