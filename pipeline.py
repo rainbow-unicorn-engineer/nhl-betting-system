@@ -87,10 +87,30 @@ def features(season=None):
     build_features(season)
 
 
+def _wait_for_network(timeout_s: int = 180) -> bool:
+    """Wake-race guard: launchd fires catch-up jobs the moment the Mac
+    wakes, often seconds before Wi-Fi is back. Block until DNS resolves
+    (or time out) so the ingestion calls don't crash on a dead network."""
+    import socket
+    import time
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            socket.getaddrinfo("api-web.nhle.com", 443)
+            return True
+        except OSError:
+            time.sleep(5)
+    logger.error(f"Network unavailable after {timeout_s}s — aborting run")
+    return False
+
+
 def odds():
     """Odds snapshot only — cheap enough to run near game time for CLV."""
     from ingestion.odds_api import snapshot_odds
 
+    if not _wait_for_network():
+        return
     snapshot_odds()
 
 
@@ -101,6 +121,8 @@ def daily():
     from config.settings import CURRENT_SEASON
 
     logger.info(f"DAILY REFRESH — {date.today()}")
+    if not _wait_for_network():
+        return
     daily_refresh()
     snapshot_odds()
     # ESPN reference-line top-up for newly-final games (no-op when current)
