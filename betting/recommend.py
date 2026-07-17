@@ -106,9 +106,22 @@ def _team_wide_asof(slate: pd.DataFrame, season: int, target_date) -> pd.DataFra
 
 
 def project_starters(slate: pd.DataFrame, season: int, target_date) -> pd.DataFrame:
-    """Projected starter per (game_id, team): most starts over the team's
-    last RECENT_TEAM_GAMES completed games, ties broken by most recent
-    start. starter_fallback=1 marks the projection as unconfirmed."""
+    """Starter per (game_id, team). Daily Faceoff rows for the slate date
+    win when they resolve to a player id (starter_fallback=0 only when
+    DF says 'Confirmed'); teams without one fall back to the heuristic —
+    most starts over the team's last RECENT_TEAM_GAMES completed games,
+    ties broken by most recent start, always starter_fallback=1."""
+    from ingestion.dailyfaceoff import ensure_table
+    ensure_table()
+    with db.connect() as conn:
+        df_rows = pd.read_sql(text("""
+            SELECT team, goalie_id, confirmation FROM raw.starting_goalies
+            WHERE game_date = :d AND goalie_id IS NOT NULL
+        """), conn, params={"d": target_date})
+    confirmed = {r.team: (int(r.goalie_id),
+                          0 if r.confirmation == "Confirmed" else 1)
+                 for r in df_rows.itertuples()}
+
     teams = sorted(set(slate["home_team"]) | set(slate["away_team"]))
     with db.connect() as conn:
         starts = pd.read_sql(text("""
@@ -144,7 +157,11 @@ def project_starters(slate: pd.DataFrame, season: int, target_date) -> pd.DataFr
         slate[["game_id"]].assign(team=slate["away_team"].values),
     ], ignore_index=True)
     out = long.merge(picks, on="team", how="left")
-    out["starter_fallback"] = 1  # unconfirmed until Daily Faceoff lands
+    out["starter_fallback"] = 1
+    for i, r in out.iterrows():
+        if r["team"] in confirmed:
+            gid, fb = confirmed[r["team"]]
+            out.loc[i, ["goalie_id", "starter_fallback"]] = [gid, fb]
     return out
 
 
