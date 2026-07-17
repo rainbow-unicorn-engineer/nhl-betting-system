@@ -126,6 +126,55 @@ Constraints to model:
   to hedge a puck-line free bet; support partial hedges + residual exposure.
 - **Age/KYC**: prediction markets 18+, sportsbooks 21+, SSN KYC everywhere.
 
+## Two-bettor execution structure (Louisiana partner)
+
+Gavin's partner is resident in Louisiana through ~mid-2028, which upgrades
+the execution layer from "trip-based promo harvesting" to a standing
+two-bettor structure. This is the documented plan, and its legality rests
+on the two actors staying independent:
+
+**Bettor A (partner, Louisiana):** full online sportsbook access (FanDuel,
+DraftKings, BetMGM, Caesars, bet365, Fanatics, theScore — 55 of 64
+parishes). Accounts **in his name, funded by him, bets placed by him while
+physically in Louisiana, winnings his** (and his taxable income — LA
+withholds on gambling winnings; he files as the bettor). He runs the
+system's recommendations like any user of betting software — sharing
+software, picks, and strategy is legal.
+
+**Bettor B (Gavin, Texas):** Kalshi + Polymarket US from home, exactly as
+ranked below. His own accounts, his own funds.
+
+**The line that keeps this legal (do not cross it):** no proxy placement.
+If A's accounts are funded by B, or A places bets at B's direction with
+B's economics, that is messenger betting — illegal in Louisiana as in
+other legal states, a universal sportsbook T&C violation, and the
+specific pattern KYC/source-of-funds reviews are built to catch
+(withdrawal freezes + confiscation, before any legal question). Each
+bettor's bets are his own decisions with his own bankroll; the system is
+shared analytics, not a shared wallet.
+
+Practical notes for this structure:
+- **Promo inventory**: A can open 7-8 LA books from home, no travel —
+  the new-user promo stack that previously required Houston/Dallas trips
+  is now fully and continuously accessible, plus ongoing reload/boost
+  offers that trip-based access always missed.
+- **Hedging modes** (calculator supports both):
+  1. *Single-bettor hedge (cleanest)*: A hedges his own promo leg on
+     another LA book — one person, one bankroll, all in-state.
+  2. *Coordinated cross-venue*: A takes a promo leg in LA; B
+     independently takes the offsetting side on Kalshi/Polymarket with
+     his own funds. Each bet is legal where placed; the household-level
+     netting is their personal finance. The calculator prices each leg
+     against its own venue's cost model and reports per-bettor P&L,
+     never a pooled stake.
+- **Book risk (not legal risk)**: consistent promo-hedged play gets
+  accounts limited or promo-restricted ("bonus abuse" T&Cs). That is a
+  commercial risk input for the calculator (expected account lifetime),
+  not a legality issue.
+- **Geofence timing**: A must be in-state at placement (he lives there —
+  non-issue); B's hedge venue has no geofence. The old "batch mode for
+  trip windows" constraint drops out of the design.
+
 ## Bottom line (ranked for an NHL bettor in Texas)
 
 1. **Kalshi direct** — always-on TX-legal execution + hedge venue (maker
