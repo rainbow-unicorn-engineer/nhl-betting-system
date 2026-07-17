@@ -140,6 +140,48 @@ def predict_fold(fm: dict, X, base, available) -> np.ndarray:
     return np.where(available, p_m, p_f)
 
 
+def fit_production(cutoff_date=None) -> dict:
+    """Train the two-regime scorer (market-offset M + market-blind F) on
+    every labeled game strictly before cutoff_date, with the same time-tail
+    early stopping + temperature scaling as a walk-forward fold.
+
+    Live use passes no cutoff (all completed games are in the past);
+    simulation against a historical date passes that date so the model
+    never sees the games it is about to score.
+    """
+    import pandas as pd
+
+    X, y, meta, names = load_dataset()
+    if cutoff_date is not None:
+        mask = meta["date"] < pd.Timestamp(cutoff_date)
+    else:
+        mask = np.ones(len(y), dtype=bool)
+    train_idx = np.flatnonzero(mask)
+    if len(train_idx) < 500:
+        raise RuntimeError(
+            f"Only {len(train_idx)} labeled games before {cutoff_date} — "
+            f"not enough to train a production model")
+
+    base = market_offset(X, names)
+    fm = fit_fold(X, y, base, train_idx, meta["date"], names)
+    logger.info(f"Production fit: {len(train_idx)} games through "
+                f"{meta['date'].iloc[train_idx].max().date()}, "
+                f"iters={fm['iters']}")
+    return {"fm": fm, "names": names, "n_train": len(train_idx),
+            "trained_through": meta["date"].iloc[train_idx].max()}
+
+
+def score_production(prod: dict, X_new: np.ndarray, names_new: list) -> np.ndarray:
+    """Calibrated P(home win) for new feature vectors from fit_production.
+    Refuses to score if the feature ordering differs from training."""
+    if list(names_new) != list(prod["names"]):
+        raise ValueError("Feature names/order mismatch between production "
+                         "model and vectors to score")
+    base = market_offset(X_new, names_new)
+    avail = X_new[:, names_new.index("market_available")] == 1.0
+    return predict_fold(prod["fm"], X_new, base, avail)
+
+
 def run_lgbm(register: bool = True) -> dict:
     """Full walk-forward run of LightGBM + isotonic. Returns metrics."""
     from sklearn.metrics import (accuracy_score, brier_score_loss, log_loss,

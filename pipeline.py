@@ -105,13 +105,26 @@ def _wait_for_network(timeout_s: int = 180) -> bool:
     return False
 
 
+def recommend():
+    """Score today's slate through the betting engine and write
+    betting.recommendations (no-op when there are no games)."""
+    from betting.recommend import generate_recommendations
+
+    try:
+        generate_recommendations()
+    except Exception as e:
+        logger.error(f"Recommendation job failed (non-fatal): {e}")
+
+
 def odds():
-    """Odds snapshot only — cheap enough to run near game time for CLV."""
+    """Odds snapshot only — cheap enough to run near game time for CLV.
+    Recommendations refresh right after: this is the freshest-lines moment."""
     from ingestion.odds_api import snapshot_odds
 
     if not _wait_for_network():
         return
     snapshot_odds()
+    recommend()
 
 
 def daily():
@@ -134,6 +147,7 @@ def daily():
     # Feature refresh after ingestion: current season only (Elo is always
     # full-history inside the build)
     features(season=CURRENT_SEASON)
+    recommend()
     logger.info("DAILY REFRESH COMPLETE")
 
 
@@ -177,7 +191,9 @@ Usage:
     python pipeline.py status      Database population status
     python pipeline.py backfill    Full 6-season historical backfill
     python pipeline.py features    Build feature store [--season YYYYYYYY]
-    python pipeline.py daily       Daily refresh (schedule + boxscores + odds + features)
+    python pipeline.py daily       Daily refresh (schedule + boxscores + odds + features + recs)
+    python pipeline.py odds        Odds snapshot + recommendation refresh
+    python pipeline.py recommend   Score today's slate -> betting.recommendations
         """)
         sys.exit(0)
 
@@ -209,6 +225,11 @@ Usage:
             logger.error("Database not reachable")
             sys.exit(1)
         odds()
+    elif cmd == "recommend":
+        if not check_db_connection():
+            logger.error("Database not reachable")
+            sys.exit(1)
+        recommend()
     elif cmd == "daily":
         if not check_db_connection():
             logger.error("Database not reachable")
