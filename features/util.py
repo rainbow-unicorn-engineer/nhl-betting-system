@@ -54,3 +54,16 @@ def season_stage(game_num: int) -> str:
     if game_num <= MID_MAX:
         return "MID"
     return "LATE"
+
+
+def american_implied_prob(ml: Optional[float]) -> Optional[float]:
+    """
+    Convert American odds to the (vig-inclusive) implied probability.
+
+    american_implied_prob(-150) -> 0.6, american_implied_prob(+130) -> ~0.435
+    None/zero returns None. Normalize across outcomes to strip the vig.
+    """
+    if ml is None or ml == 0:
+        return None
+    ml = float(ml)
+    return -ml / (-ml + 100.0) if ml < 0 else 100.0 / (ml + 100.0)

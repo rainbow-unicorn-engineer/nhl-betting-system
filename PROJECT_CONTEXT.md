@@ -140,7 +140,9 @@ Full column definitions in `db/schema.sql`.
 | **Track A (Docs)** | File 1 (T2 analyses), File 2 (Catalog), File 3 (Design Proposal) | ✅ COMPLETE |
 | **Phase 1** | Data foundation: schema, 3 ingestion modules, master pipeline, smoke tests | ✅ COMPLETE (6 seasons backfilled: 7,945 games, 683k shots) |
 | **Phase 2** | Feature store + baseline logistic regression model | ✅ COMPLETE — **gate passed: walk-forward log loss 0.6829 < 0.69** (see `docs/phase2_results.md`) |
-| **Phase 3** | Production LightGBM + PMF totals + betting engine + Streamlit dashboard | ⬜ NEXT |
+| **Phase 3 (modeling half)** | Historical odds (99.5% coverage, free — `docs/historical_odds.md`) + market feature + LightGBM boosted from the market + temperature calibration | ✅ COMPLETE — **log loss 0.6607, ECE 0.0146** (`lgbm_market v2`, see `docs/phase3_results.md`) |
+| **Phase 3 (betting half)** | Edge engine + quarter-Kelly staking + payout backtest + Streamlit dashboard | ✅ COMPLETE — backtest says raise edge threshold to ~5-6% (validate via paper trading); PMF totals + daily recommendation job remain | 
+| **Phase 3 (remaining)** | PMF totals model, in-season daily recommendation job, strategy-layer isotonic | ⬜ NEXT |
 | **Phase 4** | Live betting, iteration, player props, live/in-game model, cloud migration | ⬜ Pending |
 
 ### Phase 1 deliverables (done)
@@ -176,6 +178,11 @@ Full column definitions in `db/schema.sql`.
 - **Goalie SV% is mostly noise:** empirical Buhlmann k ≈ 66 starts to reach Z = 0.5. Shrunk ratings (never NULL) are what go in the vectors, not raw rolling SV%.
 - **psycopg2 can't adapt `np.float64`** — cast numpy scalars to Python `float` before executemany, or the array literal parses as a schema reference.
 - **Elo extremes are real, not bugs:** 2023-24 Sharks bottom ~1274, 2022-23 Bruins peak ~1720. Sanity bounds: [1250, 1750].
+- **Historical odds are free:** ESPN's public summary API (pickcenter) serves both MLs for most seasons; Kaggle mirror `jonathanncoletti/nhl-historical-game-data` fills 2024-25 (which ESPN deleted; favorite side only, ML value is a junk constant −105). Unibet-era rows are 3-WAY regulation lines (implied sums ≈ 0.83) — fine normalized as a feature, never for payout simulation. See `docs/historical_odds.md`.
+- **The market beats us on average (LL 0.6529 vs our 0.6607)** — expected. Boost FROM it (`init_score = logit(market)`), don't feed it as a feature (trees can't fully recover it); route no-line games to a market-blind fallback trained/calibrated on its own regime only.
+- **Isotonic overfits small calibration tails** (~150-1,000 games; +0.02 LL measured). Temperature scaling per fold; isotonic only on pooled predictions (1000s).
+- **Small model-market disagreements are noise:** backtest flat ROI by claimed edge: 2.5-4% → −16.8%, 4-6% → −1.6%, 6-9% → +26.6% (n=46). Raise ML edge threshold to ~5-6%, but VALIDATE via 2026-27 paper trading — do not lock a threshold tuned on the season it was measured on.
+- **Ops:** scheduling is launchd (`~/Library/LaunchAgents/com.nhlbetting.{daily,odds}.plist`), NOT cron — crontab is empty, don't re-add. `gh` CLI is installed and authenticated. Odds API key is valid in `.env` (gitignored).
 
 ---
 
