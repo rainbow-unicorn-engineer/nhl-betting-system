@@ -48,7 +48,17 @@ Evaluation (walk-forward, expanding season folds, purge gap):
   must add value beyond knowing how much the league is scoring lately.
 - STATUS (2026-07): GATE FAILED, honestly. Pooled OOF NLL 2.1867 vs
   baseline 2.1815; over/under log loss at the DraftKings line 0.7053 vs
-  0.693 naive. Public pre-game team features add essentially nothing to
+  0.693 naive. Audited for leakage/join bugs on challenge (2026-07-17):
+  feature NaN rates are 0.0% (goalie) / 1.2% (team, thin early windows),
+  goalie features have real variance (std 0.40 normalized), and an
+  ablation shows removing goalie features slightly IMPROVES OOF NLL
+  (2.1834 vs 2.1867) while removing team features worsens it (2.1881) —
+  i.e. the shrunk historical-form goalie features are net noise for
+  totals (Buhlmann k=66: most goalies sit near league average most of
+  the time), and the only incremental totals info is team-level and
+  tiny (OOF Spearman of predicted vs actual total: 0.03-0.04). The
+  goalie signal that genuinely moves totals is WHICH goalie starts —
+  confirmed-starter data we don't have until Daily Faceoff (Phase 4). Public pre-game team features add essentially nothing to
   totals beyond the scoring environment (they only win on the one fold
   with a stable cross-season environment), and the model does NOT beat
   the market total. Consequences: the model registers as inactive, the
