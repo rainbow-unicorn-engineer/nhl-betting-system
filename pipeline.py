@@ -118,13 +118,19 @@ def recommend():
 
 def odds():
     """Odds snapshot only — cheap enough to run near game time for CLV.
-    Recommendations refresh right after: this is the freshest-lines moment."""
+    Recommendations + arb/middle alerts refresh right after: this is the
+    freshest-lines moment."""
     from ingestion.odds_api import snapshot_odds
 
     if not _wait_for_network():
         return
     snapshot_odds()
     recommend()
+    try:
+        from betting.alerts import run_alerts
+        run_alerts()
+    except Exception as e:
+        logger.error(f"Alert scan failed (non-fatal): {e}")
 
 
 def daily():
