@@ -179,5 +179,6 @@ class TestEndToEnd:
                         WHERE game_id = ANY(:ids)"""), {"ids": game_ids})
                     conn.execute(text("""
                         DELETE FROM models.predictions
-                        WHERE game_id = ANY(:ids) AND market_type = 'ml'
+                        WHERE game_id = ANY(:ids)
+                          AND market_type IN ('ml', 'total')
                     """), {"ids": game_ids})

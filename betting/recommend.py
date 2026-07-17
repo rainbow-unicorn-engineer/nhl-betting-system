@@ -67,7 +67,7 @@ def load_slate(target_date, simulate: bool = False) -> pd.DataFrame:
     with db.connect() as conn:
         return pd.read_sql(text(f"""
             SELECT g.game_id, g.season, g.date, g.home_team, g.away_team,
-                   g.home_score, g.away_score,
+                   g.game_type, g.home_score, g.away_score,
                    m.home_rest_days, m.away_rest_days, m.home_b2b, m.away_b2b,
                    m.home_travel_km, m.away_travel_km,
                    m.home_tz_shift, m.away_tz_shift,
@@ -281,17 +281,115 @@ def score_slate(slate_vectors: pd.DataFrame, cutoff_date=None) -> pd.DataFrame:
     return out
 
 
+# ── Totals PMFs (predictions only — no recommendations) ───────────
+#
+# The totals model has NOT passed its walk-forward gate (it neither beats
+# its environment baseline nor the market line; models/totals.py STATUS).
+# PMFs are still scored and persisted per slate for dashboard visibility
+# and future props work, but no totals bet is ever recommended until the
+# gate passes with live O/U prices.
+
+def score_totals(slate: pd.DataFrame, target_date,
+                 cutoff_date=None) -> pd.DataFrame:
+    """Total-goals PMFs for the slate via the attack-row totals model."""
+    from models import totals as T
+
+    season = int(slate["season"].iloc[0])
+    starters = project_starters(slate, season, target_date)
+    st = starters.set_index(["game_id", "team"])["goalie_id"]
+    games = slate.copy()
+    games["home_starter_id"] = [
+        st.get((g, t)) for g, t in zip(games["game_id"], games["home_team"])]
+    games["away_starter_id"] = [
+        st.get((g, t)) for g, t in zip(games["game_id"], games["away_team"])]
+
+    team_wide = _team_wide_asof(slate, season, target_date)
+    goalie_wide = _goalie_wide_asof(starters, season, target_date)
+    Xh, Xa = T.build_attack_matrix(games, team_wide, goalie_wide)
+
+    prod = T.fit_production(cutoff_date)
+    out = T.score_production(prod, Xh, Xa, T.ATTACK_FEATURES)
+
+    res = slate[["game_id"]].copy()
+    res["expected_total"] = out["expected_total"]
+    res["pmf_home"] = list(out["pmf_home"])
+    res["pmf_away"] = list(out["pmf_away"])
+    res["pmf_total"] = list(out["pmf_total"])
+    return res
+
+
+def write_total_predictions(scored: pd.DataFrame, lines: pd.DataFrame) -> int:
+    """Upsert one 'total' prediction row per game: PMFs + P(over) at the
+    consensus line when one exists."""
+    from models.totals import MODEL_NAME as T_NAME, MODEL_VERSION as T_VER
+    from models.totals import prob_over
+
+    line_map = dict(zip(lines["game_id"], lines["line"])) if not lines.empty \
+        else {}
+    with db.begin() as conn:
+        model_id = _model_id(conn, T_NAME, T_VER,
+                             hint="python -m models.totals")
+        for r in scored.itertuples():
+            line = line_map.get(r.game_id)
+            p_over = None
+            if line is not None:
+                tp = np.asarray(r.pmf_total)[None, :]
+                p_over = round(float(prob_over(tp, [line])[0][0]), 4)
+            conn.execute(text("""
+                INSERT INTO models.predictions
+                    (game_id, model_id, market_type, total_over_prob,
+                     total_line, home_goals_pmf, away_goals_pmf)
+                VALUES (:g, :m, 'total', :po, :line, :ph, :pa)
+                ON CONFLICT (game_id, model_id, market_type) DO UPDATE SET
+                    total_over_prob = EXCLUDED.total_over_prob,
+                    total_line = EXCLUDED.total_line,
+                    home_goals_pmf = EXCLUDED.home_goals_pmf,
+                    away_goals_pmf = EXCLUDED.away_goals_pmf,
+                    created_at = NOW()
+            """), {"g": int(r.game_id), "m": model_id,
+                   "po": p_over,
+                   "line": float(line) if line is not None else None,
+                   "ph": [float(x) for x in r.pmf_home],
+                   "pa": [float(x) for x in r.pmf_away]})
+    return len(scored)
+
+
+def load_total_lines(game_ids: list, asof: Optional[datetime] = None,
+                     max_age_hours: float = MAX_ODDS_AGE_HOURS) -> pd.DataFrame:
+    """Consensus (median) total line per game from fresh snapshots."""
+    asof = asof or datetime.utcnow()
+    cutoff = asof - timedelta(hours=max_age_hours)
+    with db.connect() as conn:
+        snaps = pd.read_sql(text("""
+            SELECT DISTINCT ON (game_id, book_name)
+                   game_id, book_name, line
+            FROM raw.odds_snapshots
+            WHERE market_type = 'total' AND game_id = ANY(:ids)
+              AND line IS NOT NULL
+              AND captured_at BETWEEN :cutoff AND :asof
+            ORDER BY game_id, book_name, captured_at DESC
+        """), conn, params={"ids": list(map(int, game_ids)),
+                            "cutoff": cutoff, "asof": asof})
+    if snaps.empty:
+        return pd.DataFrame(columns=["game_id", "line"])
+    return (snaps.groupby("game_id")["line"].median()
+            .reset_index())
+
+
 # ── Persistence ────────────────────────────────────────────────────
 
-def _model_id(conn) -> int:
-    from models.lgbm import MODEL_NAME, MODEL_VERSION
+def _model_id(conn, name: str = None, version: str = None,
+              hint: str = "python -m models.lgbm") -> int:
+    if name is None:
+        from models.lgbm import MODEL_NAME, MODEL_VERSION
+        name, version = MODEL_NAME, MODEL_VERSION
     row = conn.execute(text("""
         SELECT model_id FROM models.model_registry
         WHERE model_name = :n AND version = :v
-    """), {"n": MODEL_NAME, "v": MODEL_VERSION}).fetchone()
+    """), {"n": name, "v": version}).fetchone()
     if row is None:
-        raise RuntimeError(f"{MODEL_NAME} {MODEL_VERSION} not in registry — "
-                           f"run `python -m models.lgbm` first")
+        raise RuntimeError(f"{name} {version} not in registry — "
+                           f"run `{hint}` first")
     return row[0]
 
 
@@ -427,6 +525,21 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
                    for r in recs]
         n = write_recommendations(payload, slate["game_id"].tolist())
         logger.info(f"Wrote {len(pred_ids)} predictions, {n} recommendations")
+
+    # Totals PMFs: predictions only, never recommendations — the totals
+    # model has not passed its gate (see models/totals.py STATUS)
+    try:
+        t_scored = score_totals(slate, target_date,
+                                cutoff_date=target_date if simulate else None)
+        logger.info("Expected totals: "
+                    + ", ".join(f"{g}:{t:.2f}" for g, t in
+                                zip(t_scored['game_id'],
+                                    t_scored['expected_total'])))
+        if not dry_run:
+            t_lines = load_total_lines(slate["game_id"].tolist(), asof=asof)
+            write_total_predictions(t_scored, t_lines)
+    except Exception as e:
+        logger.error(f"Totals scoring failed (non-fatal): {e}")
 
     return pd.DataFrame(recs)
 
