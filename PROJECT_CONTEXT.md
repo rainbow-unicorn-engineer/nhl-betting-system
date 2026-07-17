@@ -2,7 +2,7 @@
 
 > **Purpose:** This file is the single source of truth for the NHL Sports Betting Predictive System. It captures locked architectural decisions, the technology stack, current phase status, and hard-won learnings so that any developer — or any AI assistant (e.g., Claude Code) — can pick up the project with full context. Keep this file updated as decisions change.
 
-**Last updated:** July 9, 2026
+**Last updated:** July 17, 2026
 **Project owner:** Gavin
 **Assistant role convention:** Chief Data Scientist / Chief Software AI Developer
 
@@ -142,8 +142,9 @@ Full column definitions in `db/schema.sql`.
 | **Phase 2** | Feature store + baseline logistic regression model | ✅ COMPLETE — **gate passed: walk-forward log loss 0.6829 < 0.69** (see `docs/phase2_results.md`) |
 | **Phase 3 (modeling half)** | Historical odds (99.5% coverage, free — `docs/historical_odds.md`) + market feature + LightGBM boosted from the market + temperature calibration | ✅ COMPLETE — **log loss 0.6607, ECE 0.0146** (`lgbm_market v2`, see `docs/phase3_results.md`) |
 | **Phase 3 (betting half)** | Edge engine + quarter-Kelly staking + payout backtest + Streamlit dashboard | ✅ COMPLETE — backtest says raise edge threshold to ~5-6% (validate via paper trading); PMF totals + daily recommendation job remain | 
-| **Phase 3 (remaining)** | PMF totals model, in-season daily recommendation job, strategy-layer isotonic | ⬜ NEXT |
-| **Phase 4** | Live betting, iteration, player props, live/in-game model, cloud migration | ⬜ Pending |
+| **Phase 3 (remaining)** | Daily recommendation job, PMF totals model, bet checker + parlay evaluator, arb/middle alerts | ✅ COMPLETE (2026-07-17) — recs job simulated + verified vs stored vectors; **totals gate FAILED honestly** (predictions-only, betting off; see `models/totals.py` STATUS); strategy-layer isotonic deferred until pooled live predictions exist |
+| **Phase 4** | Live-season ops: **paper trading first** (validate the 5-6% edge threshold), cloud migration, Daily Faceoff confirmed starters, player props | ⬜ NEXT (2026-27 season) |
+| **Phase 5** | Multi-sport expansion (NBA/CBB first), correlated same-game parlays via a joint model | ⬜ Pending |
 
 ### Phase 1 deliverables (done)
 - `docker-compose.yml`, `db/schema.sql` (4 schemas, 15 tables)
@@ -183,6 +184,12 @@ Full column definitions in `db/schema.sql`.
 - **Isotonic overfits small calibration tails** (~150-1,000 games; +0.02 LL measured). Temperature scaling per fold; isotonic only on pooled predictions (1000s).
 - **Small model-market disagreements are noise:** backtest flat ROI by claimed edge: 2.5-4% → −16.8%, 4-6% → −1.6%, 6-9% → +26.6% (n=46). Raise ML edge threshold to ~5-6%, but VALIDATE via 2026-27 paper trading — do not lock a threshold tuned on the season it was measured on.
 - **Ops:** scheduling is launchd (`~/Library/LaunchAgents/com.nhlbetting.{daily,odds}.plist`), NOT cron — crontab is empty, don't re-add. `gh` CLI is installed and authenticated. Odds API key is valid in `.env` (gitignored).
+- **Diff features destroy totals information.** The shared game_vector stores home−away differentials — right for win probability, wrong for totals (high-vs-high and low-vs-low matchups both diff to ~0). Totals need per-side LEVEL features (attack rows: off_*/def_*/goalie_*).
+- **The scoring environment owns totals; public features add ~nothing.** Walk-forward: attack-row Poisson NLL 2.1867 vs trailing-environment baseline 2.1815; over/under log loss at the DK line 0.7053 vs 0.693 naive. GATE FAILED and recorded as such — totals betting stays OFF until confirmed starters + live O/U prices + boost-from-market-total (2026-27) get it through. Season-level scoring shifts are the dominant error and are not knowable ex ante from public stats.
+- **The calibration tail is the playoffs.** Any time-ordered tail of a training window that ends a season is playoff-heavy — a different scoring regime. Mean-scale corrections fit there swing ±0.4 goals/game; measured net-harmful even playoff-filtered (helps long-train folds, wrecks short ones).
+- **Slate vectors == historical vectors, provably.** The daily job builds pre-game vectors by appending stats-less rows to the shift-then-roll builders; verified equal to the stored historical vectors within DB NUMERIC rounding (tests/test_recommend.py). Starter projection (most starts in last 10 team games) hit only ~40% on the test slate — Daily Faceoff integration (Phase 4) is the fix.
+- **Checker edges are conservative by design:** measured vs the offered vig-inclusive price (one side of one book visible), vs the daily job's consensus no-vig. The same bet can read +1.7% in the checker and +4.0% in the job.
+- **Texas execution (researched 2026-07-17, `docs/texas_execution_options.md`):** no legal TX sportsbook before 2028+. Live execution = Kalshi (official NHL partner, TX-unchallenged, maker orders cheap) + Polymarket US (cheaper taker), promo harvesting via physically-present trips to Louisiana / Arkansas. Re-verify fee schedules + OK ballot measure before Oct 2026.
 
 ---
 
