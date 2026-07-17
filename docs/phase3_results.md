@@ -88,11 +88,46 @@ is curve-fitting): validate via 2026-27 paper trading before real stakes,
 and note the test season was also the model's weakest fold, betting into
 near-closing prices with no line shopping.
 
-## Remaining Phase 3 scope
+## Remaining Phase 3 scope — COMPLETE (2026-07-17)
 
-- PMF totals model (over/under markets) — not started
-- Daily recommendation job writing betting.recommendations in-season
-- Isotonic pass at the strategy layer once pooled live predictions exist
+1. **Daily recommendation job** (`betting/recommend.py`, `pipeline.py
+   recommend`, wired into the daily + odds launchd chains). Scores the
+   slate with a production fit of `lgbm_market`, decides through the
+   engine (consensus no-vig fair prob, best-price line shopping, daily
+   exposure cap), writes `models.predictions` for every scored game and
+   `betting.recommendations` for edges. Pre-game slate vectors reuse the
+   historical shift-then-roll builders via appended stats-less rows —
+   verified identical to stored vectors within DB NUMERIC rounding.
+   Simulation mode (`--date <past> --simulate`) trains with that date as
+   cutoff: the leak-free dress rehearsal used for verification.
+2. **PMF totals model** (`models/totals.py`) — built, validated, and the
+   gate **FAILED honestly**: pooled OOF NLL 2.1867 vs the trailing-
+   environment baseline 2.1815; over/under log loss at the DraftKings
+   line 0.7053 vs 0.693 naive (n=1,015). What the walk-forward evidence
+   established on the way: diff features destroy totals information
+   (attack-row level features required); the scoring environment
+   dominates and public features add ~nothing beyond it; the calibration
+   tail of a season-ending train window is playoff-poisoned. The daily
+   job persists total PMFs (`models.predictions` 'total' rows) for the
+   dashboard and future props work; **no totals recommendations** until
+   the gate passes with confirmed starters + live O/U prices +
+   boost-from-market-total on 2026-27 snapshot lines.
+3. **Bet checker + parlay evaluator** (`betting/checker.py`). Slip
+   evaluation against stored predictions: per-leg EV/edge/verdict,
+   push-aware integer lines priced from PMFs at any line, parlay math
+   with industry push settlement, boosted-price scaling, same-game
+   correlation warnings (verdict withheld until the Phase 5 joint
+   model). Checker edges are conservative: vs the offered vig-inclusive
+   price, not consensus no-vig.
+4. **Arb + middling alerts** (`betting/alerts.py`, odds chain).
+   Two-way arbs (ml/pl/total, line-matched, cross-book best prices,
+   locked-profit stakes) and totals middles with exact model EV from
+   stored PMFs (or conservative breakeven without). 30-minute freshness
+   window; WARNING logs + optional macOS notification.
+
+Still deferred: strategy-layer isotonic (needs pooled live predictions),
+totals/props betting (gate), Daily Faceoff starters (Phase 4).
+Test suite: 150 green.
 
 ## Reproduce
 
