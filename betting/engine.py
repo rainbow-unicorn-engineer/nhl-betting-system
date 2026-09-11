@@ -56,16 +56,19 @@ class BetDecision:
     stake_pct: float          # of bankroll, after quarter-Kelly + cap
 
 
-def evaluate_moneyline(model_home_prob: float,
-                       home_ml: float, away_ml: float,
-                       edge_min: float = EDGE_MIN_ML) -> Optional[BetDecision]:
-    """The one decision function: given our probability and a two-sided
-    line, return the bet to make (at most one side) or None."""
-    mkt_home, mkt_away = no_vig_probs(home_ml, away_ml)
-    for side, p_model, p_mkt, price in (
-            ("HOME", model_home_prob, mkt_home, home_ml),
-            ("AWAY", 1.0 - model_home_prob, mkt_away, away_ml)):
-        edge = p_model - p_mkt
+def evaluate_market(model_home_prob: float, fair_home_prob: float,
+                    home_price: Optional[float], away_price: Optional[float],
+                    edge_min: float = EDGE_MIN_ML) -> Optional[BetDecision]:
+    """The one decision function, line-shopping form: edge is measured
+    against a fair (no-vig) probability that may come from a consensus of
+    books, while each side is priced at the best available price (possibly
+    from different books). A side with no price is not bettable."""
+    for side, p_model, p_fair, price in (
+            ("HOME", model_home_prob, fair_home_prob, home_price),
+            ("AWAY", 1.0 - model_home_prob, 1.0 - fair_home_prob, away_price)):
+        if price is None:
+            continue
+        edge = p_model - p_fair
         if edge < edge_min:
             continue
         kelly = kelly_fraction(p_model, price)
@@ -73,9 +76,19 @@ def evaluate_moneyline(model_home_prob: float,
             continue
         stake_pct = min(kelly * KELLY_FRACTION, MAX_STAKE_PCT)
         return BetDecision(side=side, price=int(price),
-                           model_prob=p_model, market_prob=p_mkt,
+                           model_prob=p_model, market_prob=p_fair,
                            edge=edge, kelly=kelly, stake_pct=stake_pct)
     return None
+
+
+def evaluate_moneyline(model_home_prob: float,
+                       home_ml: float, away_ml: float,
+                       edge_min: float = EDGE_MIN_ML) -> Optional[BetDecision]:
+    """Single-book form: fair probability and prices from one two-sided
+    line. The backtest uses this; the daily job uses evaluate_market."""
+    fair_home, _ = no_vig_probs(home_ml, away_ml)
+    return evaluate_market(model_home_prob, fair_home, home_ml, away_ml,
+                           edge_min)
 
 
 def settle(decision: BetDecision, home_won: bool, stake: float) -> float:
