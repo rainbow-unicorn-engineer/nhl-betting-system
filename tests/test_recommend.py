@@ -101,12 +101,22 @@ class TestSlateVectors:
                                        err_msg=f"game {r.game_id}")
 
     def test_starters_projected_with_fallback_flag(self, slate):
+        from sqlalchemy import text
+        from config.settings import engine as db_engine
         from betting.recommend import project_starters
         st = project_starters(slate, SIM_SEASON, SIM_DATE)
         assert len(st) == 2 * len(slate)
-        assert (st["starter_fallback"] == 1).all()
         # mid-season: every team has a start history to project from
         assert st["goalie_id"].notna().all()
+        # fallback=0 is allowed ONLY where a Daily Faceoff row confirms
+        with db_engine.connect() as conn:
+            confirmed = {r[0] for r in conn.execute(text("""
+                SELECT team FROM raw.starting_goalies
+                WHERE game_date = :d AND goalie_id IS NOT NULL
+                  AND confirmation = 'Confirmed'
+            """), {"d": SIM_DATE})}
+        heuristic = st[~st["team"].isin(confirmed)]
+        assert (heuristic["starter_fallback"] == 1).all()
 
 
 @requires_db

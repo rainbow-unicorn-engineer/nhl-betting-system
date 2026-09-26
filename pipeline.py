@@ -105,6 +105,24 @@ def _wait_for_network(timeout_s: int = 180) -> bool:
     return False
 
 
+def starters():
+    """Confirmed starting goalies from Daily Faceoff (non-fatal)."""
+    try:
+        from ingestion.dailyfaceoff import ingest_starting_goalies
+        ingest_starting_goalies()
+    except Exception as e:
+        logger.error(f"Daily Faceoff ingestion failed (non-fatal): {e}")
+
+
+def settle():
+    """Settle finished paper bets + rebuild the bankroll/CLV ledger."""
+    try:
+        from betting.settle import settle_paper
+        settle_paper()
+    except Exception as e:
+        logger.error(f"Paper settlement failed (non-fatal): {e}")
+
+
 def recommend():
     """Score today's slate through the betting engine and write
     betting.recommendations (no-op when there are no games)."""
@@ -125,6 +143,7 @@ def odds():
     if not _wait_for_network():
         return
     snapshot_odds()
+    starters()      # confirmations roll in through gameday
     recommend()
     try:
         from betting.alerts import run_alerts
@@ -153,6 +172,8 @@ def daily():
     # Feature refresh after ingestion: current season only (Elo is always
     # full-history inside the build)
     features(season=CURRENT_SEASON)
+    settle()        # yesterday's finals + closing snapshots are in
+    starters()
     recommend()
     logger.info("DAILY REFRESH COMPLETE")
 
@@ -198,8 +219,10 @@ Usage:
     python pipeline.py backfill    Full 6-season historical backfill
     python pipeline.py features    Build feature store [--season YYYYYYYY]
     python pipeline.py daily       Daily refresh (schedule + boxscores + odds + features + recs)
-    python pipeline.py odds        Odds snapshot + recommendation refresh
+    python pipeline.py odds        Odds snapshot + starters + recommendation refresh
     python pipeline.py recommend   Score today's slate -> betting.recommendations
+    python pipeline.py starters    Ingest Daily Faceoff confirmed goalies
+    python pipeline.py settle      Settle paper bets + rebuild bankroll/CLV ledger
         """)
         sys.exit(0)
 
@@ -236,6 +259,16 @@ Usage:
             logger.error("Database not reachable")
             sys.exit(1)
         recommend()
+    elif cmd == "starters":
+        if not check_db_connection():
+            logger.error("Database not reachable")
+            sys.exit(1)
+        starters()
+    elif cmd == "settle":
+        if not check_db_connection():
+            logger.error("Database not reachable")
+            sys.exit(1)
+        settle()
     elif cmd == "daily":
         if not check_db_connection():
             logger.error("Database not reachable")

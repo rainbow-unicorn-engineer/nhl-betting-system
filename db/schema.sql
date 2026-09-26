@@ -206,6 +206,19 @@ CREATE TABLE IF NOT EXISTS raw.historical_odds (
     fetched_at      TIMESTAMP NOT NULL DEFAULT now()
 );
 
+-- Confirmed starting goalies scraped from Daily Faceoff (Phase 4).
+-- One row per (game_date, team), upserted as confirmations roll in.
+CREATE TABLE IF NOT EXISTS raw.starting_goalies (
+    game_date       DATE NOT NULL,
+    team            VARCHAR(3) NOT NULL,
+    goalie_name     VARCHAR(80) NOT NULL,
+    goalie_id       INTEGER,                   -- resolved raw.players id (NULL if unmatched)
+    confirmation    VARCHAR(20),               -- Confirmed / Likely / ... / NULL
+    source          VARCHAR(20) NOT NULL DEFAULT 'dailyfaceoff',
+    fetched_at      TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (game_date, team)
+);
+
 CREATE TABLE IF NOT EXISTS raw.shifts (
     shift_id        BIGSERIAL PRIMARY KEY,
     game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
@@ -370,7 +383,8 @@ CREATE TABLE IF NOT EXISTS betting.placed_bets (
     pnl                 NUMERIC(10,2),
     closing_line        INTEGER,
     clv                 NUMERIC(5,3),           -- implied(closing) - implied(placed)
-    settled_at          TIMESTAMP
+    settled_at          TIMESTAMP,
+    is_paper            BOOLEAN NOT NULL DEFAULT TRUE   -- paper trail until a human records a real bet
 );
 
 CREATE TABLE IF NOT EXISTS betting.bankroll_log (
