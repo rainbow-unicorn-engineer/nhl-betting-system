@@ -23,11 +23,28 @@ is unconfirmed.
 
 Odds: the fair (no-vig) probability is the MEDIAN across the freshest
 snapshot of each book (raw.odds_snapshots, at most MAX_ODDS_AGE_HOURS old);
-each side is then priced at the best available price across those books
-(line shopping). When no snapshot exists (e.g. simulation against history)
-the single reference line in raw.historical_odds is used for both. Games
-with no line anywhere are scored by the market-blind fallback model and
-never bet (an edge claimed against no market is untestable).
+each side is then priced at the best available price across the books you
+can bet (BETTABLE_BOOKS; unset = every book) — line shopping. When no
+snapshot exists (e.g. simulation against history) the single reference
+line in raw.historical_odds is used for both. Games with no line anywhere
+are scored by the market-blind fallback model and never bet (an edge
+claimed against no market is untestable).
+
+Frozen picks: a pick is issued ONCE per game, at the price of the
+snapshot it came from (priced_at). Later runs never re-price or delete it;
+they only add picks for games that have none, within what is left of the
+day's exposure budget. The pre-game `pipeline.py close` snapshot then
+grades it (betting/settle.py: CLV against the last pre-puck-drop quote).
+A pick settled VOID (postponed game) no longer counts as the game's pick,
+so the game can get a new one when it is played on its new date. Each
+pick stores the game's start time as written (scheduled_start), which
+settlement compares with the actual start to spot a moved game.
+
+Daily cap: cap_daily_exposure() is the one (pure) allocation rule. It runs
+once when deciding, then again inside write_recommendations under the
+writers' advisory lock, against the committed stake re-read there, so
+overlapping daily/odds runs can't together exceed MAX_DAILY_PCT. Voided
+picks (postponed or cancelled games) commit nothing.
 
 Simulation: --date <past date> --simulate treats that day's completed
 games as an upcoming slate. fit_production gets the same date as cutoff,
@@ -38,7 +55,7 @@ import argparse
 import logging
 import os
 from datetime import date as date_cls
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -47,13 +64,19 @@ from sqlalchemy import text
 
 from betting.engine import (MAX_DAILY_PCT, decimal_odds, evaluate_market,
                             EDGE_MIN_ML)
-from config.settings import engine as db
+from config.migrate import ensure_schema
+from config.settings import engine as db, local_today
 
 logger = logging.getLogger("nhl.betting.recommend")
 
 BANKROLL = float(os.getenv("BANKROLL", "1000"))
 MAX_ODDS_AGE_HOURS = float(os.getenv("MAX_ODDS_AGE_HOURS", "18"))
 RECENT_TEAM_GAMES = 10          # starter projection window
+# Odds API bookmaker keys you can actually bet, e.g. "draftkings,fanduel".
+# The fair price still uses every book; only the best price is restricted.
+BETTABLE_BOOKS = frozenset(b.strip().lower() for b in
+                           os.getenv("BETTABLE_BOOKS", "").split(",")
+                           if b.strip())
 
 
 # ── Slate ──────────────────────────────────────────────────────────
@@ -61,9 +84,12 @@ RECENT_TEAM_GAMES = 10          # starter projection window
 def load_slate(target_date, simulate: bool = False) -> pd.DataFrame:
     """Games on target_date joined with their matchup rows (schedule/Elo
     features are built for scheduled games by the daily feature build).
-    Live mode takes only not-yet-final games; simulate takes the whole day."""
-    state_filter = "" if simulate else \
-        "AND g.game_state NOT IN ('FINAL', 'OFF')"
+    Live mode takes only games that have not started and are not
+    postponed, suspended or cancelled; simulate takes the whole day."""
+    state_filter = "" if simulate else """
+        AND g.game_state NOT IN ('FINAL', 'OFF', 'LIVE', 'CRIT')
+        AND COALESCE(g.schedule_state, 'OK') NOT IN ('PPD', 'SUSP', 'CNCL')
+        AND (g.start_time_utc IS NULL OR g.start_time_utc > NOW())"""
     with db.connect() as conn:
         return pd.read_sql(text(f"""
             SELECT g.game_id, g.season, g.date, g.home_team, g.away_team,
@@ -202,13 +228,20 @@ def _goalie_wide_asof(starters: pd.DataFrame, season: int, target_date) -> pd.Da
 # ── Odds ───────────────────────────────────────────────────────────
 
 def load_market(game_ids: list, asof: Optional[datetime] = None,
-                max_age_hours: float = MAX_ODDS_AGE_HOURS) -> pd.DataFrame:
+                max_age_hours: float = MAX_ODDS_AGE_HOURS,
+                books: Optional[frozenset] = None) -> pd.DataFrame:
     """One row per game with a line: consensus fair prob + best price per
-    side. Snapshots first (multi-book, line-shopped), historical_odds as
-    the single-book fallback. Games with no line are absent from the result."""
-    from features.util import american_implied_prob
+    side, plus the captured_at of the snapshot each best price came from
+    (home_priced_at / away_priced_at; None for the historical line).
+    Snapshots first (multi-book, line-shopped), historical_odds as the
+    single-book fallback. Games with no line are absent from the result.
 
-    asof = asof or datetime.utcnow()
+    books (default BETTABLE_BOOKS; empty = all): the fair probability is
+    the median over EVERY book, but best prices come only from these. A
+    game no allowed book prices gets None prices, so it can't be bet. The
+    historical reference line (simulation) is not filtered."""
+    books = BETTABLE_BOOKS if books is None else books
+    asof = asof or datetime.now(timezone.utc).replace(tzinfo=None)   # naive UTC
     cutoff = asof - timedelta(hours=max_age_hours)
     with db.connect() as conn:
         snaps = pd.read_sql(text("""
@@ -230,29 +263,56 @@ def load_market(game_ids: list, asof: Optional[datetime] = None,
         """), conn, params={"ids": list(map(int, game_ids))})
 
     hist = hist[~hist["game_id"].isin(snaps["game_id"])]
-    lines = pd.concat([snaps, hist], ignore_index=True)
-    if lines.empty:
+    return summarize_market(snaps, hist, books)
+
+
+def summarize_market(snaps: pd.DataFrame, hist: pd.DataFrame,
+                     books: frozenset = frozenset()) -> pd.DataFrame:
+    """load_market's pure half (see there). snaps: game_id, book_name,
+    captured_at, home_price, away_price; hist: the same minus captured_at."""
+    from features.util import american_implied_prob
+
+    snaps = snaps.assign(bettable=(snaps["book_name"].str.lower()
+                                   .isin(sorted(books)) if books else True))
+    hist = hist.assign(bettable=True)
+    parts = [f for f in (snaps, hist) if not f.empty]
+    if not parts:
         return pd.DataFrame(columns=[
             "game_id", "fair_home_prob", "n_books",
-            "home_price", "home_book", "away_price", "away_book"])
+            "home_price", "home_book", "home_priced_at",
+            "away_price", "away_book", "away_priced_at"])
+    lines = pd.concat(parts, ignore_index=True)
+    if "captured_at" not in lines:
+        lines["captured_at"] = None       # historical line only: no snapshot
 
     ph = lines["home_price"].map(american_implied_prob)
     pa = lines["away_price"].map(american_implied_prob)
     lines["novig_home"] = ph / (ph + pa)
 
+    def _when(best):
+        t = best["captured_at"]
+        return None if t is None or pd.isna(t) else pd.Timestamp(t).to_pydatetime()
+
     rows = []
     for gid, g in lines.groupby("game_id"):
-        best_h = g.loc[g["home_price"].map(decimal_odds).idxmax()]
-        best_a = g.loc[g["away_price"].map(decimal_odds).idxmax()]
-        rows.append({
-            "game_id": gid,
-            "fair_home_prob": float(g["novig_home"].median()),
-            "n_books": len(g),
-            "home_price": int(best_h["home_price"]),
-            "home_book": best_h["book_name"],
-            "away_price": int(best_a["away_price"]),
-            "away_book": best_a["book_name"],
-        })
+        row = {"game_id": gid,
+               "fair_home_prob": float(g["novig_home"].median()),
+               "n_books": len(g),
+               "home_price": None, "home_book": None, "home_priced_at": None,
+               "away_price": None, "away_book": None, "away_priced_at": None}
+        shop = g[g["bettable"].astype(bool)]
+        if not shop.empty:
+            best_h = shop.loc[shop["home_price"].map(decimal_odds).idxmax()]
+            best_a = shop.loc[shop["away_price"].map(decimal_odds).idxmax()]
+            row.update({
+                "home_price": int(best_h["home_price"]),
+                "home_book": best_h["book_name"],
+                "home_priced_at": _when(best_h),
+                "away_price": int(best_a["away_price"]),
+                "away_book": best_a["book_name"],
+                "away_priced_at": _when(best_a),
+            })
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -374,7 +434,7 @@ def write_total_predictions(scored: pd.DataFrame, lines: pd.DataFrame) -> int:
 def load_total_lines(game_ids: list, asof: Optional[datetime] = None,
                      max_age_hours: float = MAX_ODDS_AGE_HOURS) -> pd.DataFrame:
     """Consensus (median) total line per game from fresh snapshots."""
-    asof = asof or datetime.utcnow()
+    asof = asof or datetime.now(timezone.utc).replace(tzinfo=None)   # naive UTC
     cutoff = asof - timedelta(hours=max_age_hours)
     with db.connect() as conn:
         snaps = pd.read_sql(text("""
@@ -432,32 +492,126 @@ def write_predictions(scored: pd.DataFrame) -> dict:
     return ids
 
 
-def write_recommendations(recs: list, slate_game_ids: list) -> int:
-    """Replace PENDING ml recommendations for the slate. Rows already
-    APPROVED/PLACED/SKIPPED are the user's decisions — left untouched, and
-    their games are not re-recommended."""
+_ISSUED_SQL = """
+    SELECT r.game_id, r.status, r.recommended_stake,
+           EXISTS (SELECT 1 FROM betting.placed_bets p
+                   WHERE p.rec_id = r.rec_id AND p.result = 'VOID') AS voided
+    FROM betting.recommendations r
+    JOIN raw.games g USING (game_id)
+    WHERE g.date = :d AND r.market_type = 'ml'
+"""
+
+
+def load_issued_picks(target_date, conn=None) -> pd.DataFrame:
+    """Moneyline picks already issued for games on target_date (any
+    status), including games that have since started — they still count
+    against the day's exposure budget. voided = settled as VOID
+    (postponed or cancelled game). conn: read inside that connection's
+    transaction (write_recommendations, under its lock)."""
+    if conn is not None:
+        return pd.read_sql(text(_ISSUED_SQL), conn, params={"d": target_date})
+    with db.connect() as c:
+        return pd.read_sql(text(_ISSUED_SQL), c, params={"d": target_date})
+
+
+def frozen_games(issued: pd.DataFrame) -> set:
+    """Games that already have their pick (load_issued_picks rows) and so
+    are never re-decided: every issued pick, SKIPPED included, except
+    picks settled VOID. A voided pick's game (postponed, then played on a
+    new date) is open for a new pick."""
+    if issued.empty:
+        return set()
+    live = issued[~issued["voided"].eq(True)]          # None/NaN = not voided
+    return set(live["game_id"].astype(int))
+
+
+def committed_stake(issued: pd.DataFrame) -> float:
+    """Stake already committed for the day (load_issued_picks rows): every
+    issued pick except SKIPPED ones (released by hand) and voided ones
+    (the book returned the stake)."""
+    if issued.empty:
+        return 0.0
+    live = issued[(issued["status"] != "SKIPPED")
+                  & ~issued["voided"].fillna(False).astype(bool)]
+    return float(live["recommended_stake"].astype(float).sum())
+
+
+def cap_daily_exposure(recs: list, committed: float, bankroll: float,
+                       picked=frozenset(),
+                       max_daily_pct: float = MAX_DAILY_PCT) -> list:
+    """The daily exposure cap, pure. recs: dicts with game_id, edge_pct
+    and recommended_stake. Returns the recs to issue, strongest edge
+    first: games in `picked` already have a pick and are never re-decided;
+    the rest are taken while committed + their stakes stay within
+    bankroll * max_daily_pct. A stake that doesn't fit is skipped, and a
+    smaller one after it can still fit."""
+    budget = bankroll * max_daily_pct
+    spent = float(committed)
+    kept = []
+    for r in sorted(recs, key=lambda r: -float(r["edge_pct"])):
+        if int(r["game_id"]) in picked:
+            continue
+        stake = float(r["recommended_stake"])
+        if spent + stake > budget + 1e-9:        # 1e-9: float noise only
+            continue
+        spent += stake
+        kept.append(r)
+    return kept
+
+
+def write_recommendations(recs: list, slate_game_ids: list, slate_date=None,
+                          bankroll: float = BANKROLL) -> int:
+    """Insert ml recommendations for slate games that have none yet,
+    within the day's exposure budget.
+    Picks are frozen: a game with ANY ml recommendation (any status) keeps
+    it unchanged at its issued price; nothing is ever deleted or re-priced
+    (re-pricing every run is what made same-book CLV read 0). The one
+    exception is a pick settled VOID: it no longer blocks a new pick.
+    Each row stores the game's start_time_utc as scheduled_start.
+    The cap is applied again here, under the writers' lock, against the
+    committed stake re-read for slate_date (default: the slate games'
+    date), so a run that decided before another run's picks landed is
+    trimmed instead of pushing the day past MAX_DAILY_PCT."""
+    ids = list(map(int, slate_game_ids))
     with db.begin() as conn:
-        decided = {r[0] for r in conn.execute(text("""
-            SELECT DISTINCT game_id FROM betting.recommendations
-            WHERE game_id = ANY(:ids) AND market_type = 'ml'
-              AND status <> 'PENDING'
-        """), {"ids": list(map(int, slate_game_ids))})}
-        conn.execute(text("""
-            DELETE FROM betting.recommendations
-            WHERE game_id = ANY(:ids) AND market_type = 'ml'
-              AND status = 'PENDING'
-        """), {"ids": list(map(int, slate_game_ids))})
-        to_insert = [r for r in recs if r["game_id"] not in decided]
+        # Serialize writers (launchd can fire daily + odds together on wake)
+        # so two runs can't both issue a pick for the same game, or both
+        # spend the same remaining budget
+        conn.execute(text("SELECT pg_advisory_xact_lock(20260928)"))
+        picked = {r[0] for r in conn.execute(text("""
+            SELECT DISTINCT r.game_id FROM betting.recommendations r
+            WHERE r.game_id = ANY(:ids) AND r.market_type = 'ml'
+              AND NOT EXISTS (SELECT 1 FROM betting.placed_bets p
+                              WHERE p.rec_id = r.rec_id AND p.result = 'VOID')
+        """), {"ids": ids})}
+        if slate_date is None:
+            slate_date = conn.execute(text("""
+                SELECT MIN(date) FROM raw.games WHERE game_id = ANY(:ids)
+            """), {"ids": ids}).scalar()
+        issued = load_issued_picks(slate_date, conn=conn)
+        picked |= frozen_games(issued)
+        allowed = cap_daily_exposure(recs, committed_stake(issued), bankroll,
+                                     picked)
+        trimmed = [r for r in recs if r["game_id"] not in picked
+                   and not any(r is a for a in allowed)]
+        if trimmed:
+            logger.info(f"Daily cap re-checked under the lock: {len(trimmed)} "
+                        f"pick(s) dropped, because less of {slate_date}'s "
+                        f"budget is left than when they were decided")
+        to_insert = [dict(r, priced_at=r.get("priced_at")) for r in allowed]
         if to_insert:
             conn.execute(text("""
                 INSERT INTO betting.recommendations
                     (game_id, prediction_id, market_type, side, model_prob,
                      best_book, best_price, implied_prob_novig, edge_pct,
-                     kelly_fraction, recommended_stake, status)
+                     kelly_fraction, recommended_stake, status, priced_at,
+                     scheduled_start)
                 VALUES (:game_id, :prediction_id, 'ml', :side, :model_prob,
                         :best_book, :best_price, :implied_prob_novig,
                         :edge_pct, :kelly_fraction, :recommended_stake,
-                        'PENDING')
+                        'PENDING', :priced_at,
+                        (SELECT start_time_utc FROM raw.games
+                         WHERE game_id = :game_id))
             """), to_insert)
     return len(to_insert)
 
@@ -468,8 +622,10 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
                              edge_min: float = None, dry_run: bool = False,
                              simulate: bool = False) -> pd.DataFrame:
     """Score the slate, decide bets through the engine, persist. Returns
-    the recommendation frame (possibly empty)."""
-    target_date = target_date or date_cls.today()
+    the frame of NEW recommendations (possibly empty); games that already
+    have a pick keep it and are not re-decided."""
+    ensure_schema()
+    target_date = target_date or local_today()
     if edge_min is None:
         edge_min = float(os.getenv("EDGE_MIN_ML", EDGE_MIN_ML))
 
@@ -489,49 +645,71 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
 
     # Bettable prices: fresh snapshots (or the reference line in simulation)
     market = load_market(slate["game_id"].tolist(), asof=asof)
+    logger.info("Best prices from BETTABLE_BOOKS: " + ", ".join(sorted(BETTABLE_BOOKS))
+                + " (fair odds still use every book)" if BETTABLE_BOOKS
+                else "Best prices from every book (BETTABLE_BOOKS unset)")
 
     merged = scored.merge(market, on="game_id", how="left").merge(
         slate[["game_id", "home_team", "away_team"]], on="game_id")
+
+    # Frozen picks: games that already have one are not re-decided (a
+    # voided pick doesn't count), and their stakes (except SKIPPED and
+    # voided) come out of the day's budget
+    issued = load_issued_picks(target_date)
+    picked = frozen_games(issued)
+    committed = committed_stake(issued)
+    if picked:
+        logger.info(f"{len(picked)} game(s) on {target_date} already have a "
+                    f"pick (kept at its issued price); {committed:.2f} "
+                    f"already committed")
+
+    def _price(p):
+        return None if p is None or pd.isna(p) else p
 
     candidates = []
     for g in merged.itertuples():
         if pd.isna(g.fair_home_prob):
             continue                      # no line -> never bet
         d = evaluate_market(g.prob_home, g.fair_home_prob,
-                            g.home_price, g.away_price, edge_min)
+                            _price(g.home_price), _price(g.away_price),
+                            edge_min)
         if d is None:
             continue
-        book = g.home_book if d.side == "HOME" else g.away_book
-        candidates.append((g, d, book))
-
-    # Daily exposure cap: strongest edges first
-    candidates.sort(key=lambda c: -c[1].edge)
-    day_budget = bankroll * MAX_DAILY_PCT
-    recs, spent = [], 0.0
-    for g, d, book in candidates:
-        stake = round(bankroll * d.stake_pct, 2)
-        if spent + stake > day_budget:
-            logger.info(f"  daily cap: skipping {g.away_team}@{g.home_team} "
-                        f"({d.side} {d.price:+d}, edge {d.edge:.1%})")
-            continue
-        spent += stake
+        if d.side == "HOME":
+            book, priced_at = g.home_book, _price(g.home_priced_at)
+        else:
+            book, priced_at = g.away_book, _price(g.away_priced_at)
         # float() casts: psycopg2 cannot adapt numpy scalars
-        recs.append({
+        candidates.append({
             "game_id": int(g.game_id), "prediction_id": None,
             "side": d.side, "model_prob": round(float(d.model_prob), 4),
             "best_book": book, "best_price": int(d.price),
+            # the SIDE's no-vig fair probability (d.market_prob); consensus
+            # CLV in betting/settle.py compares the close against it
             "implied_prob_novig": round(float(d.market_prob), 4),
             "edge_pct": round(float(d.edge), 4),
             "kelly_fraction": round(float(d.kelly), 4),
-            "recommended_stake": float(stake),
+            "recommended_stake": float(round(bankroll * d.stake_pct, 2)),
+            "priced_at": (pd.Timestamp(priced_at).to_pydatetime()
+                          if priced_at is not None else None),
             "matchup": f"{g.away_team} @ {g.home_team}",
         })
+
+    # Daily exposure cap, strongest edges first; games issued earlier are
+    # frozen and never re-decided (checked again under the write lock)
+    day_budget = bankroll * MAX_DAILY_PCT
+    recs = cap_daily_exposure(candidates, committed, bankroll, picked)
+    for r in candidates:
+        if r["game_id"] not in picked and not any(r is k for k in recs):
+            logger.info(f"  daily cap: skipping {r['matchup']} ({r['side']} "
+                        f"{r['best_price']:+d}, edge {r['edge_pct']:.1%})")
+    spent = committed + sum(r["recommended_stake"] for r in recs)
 
     for r in recs:
         logger.info(f"  BET {r['matchup']}: {r['side']} {r['best_price']:+d} "
                     f"({r['best_book']}) edge {r['edge_pct']:.1%} "
                     f"stake {r['recommended_stake']:.2f}")
-    logger.info(f"{len(recs)} recommendation(s) from {len(slate)} games, "
+    logger.info(f"{len(recs)} new recommendation(s) from {len(slate)} games, "
                 f"{spent:.2f} staked of {day_budget:.2f} daily budget")
 
     if not dry_run:
@@ -540,7 +718,8 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
             r["prediction_id"] = pred_ids.get(r["game_id"])
         payload = [{k: v for k, v in r.items() if k != "matchup"}
                    for r in recs]
-        n = write_recommendations(payload, slate["game_id"].tolist())
+        n = write_recommendations(payload, slate["game_id"].tolist(),
+                                  slate_date=target_date, bankroll=bankroll)
         logger.info(f"Wrote {len(pred_ids)} predictions, {n} recommendations")
 
     # Totals PMFs: predictions only, never recommendations — the totals
@@ -566,7 +745,7 @@ if __name__ == "__main__":
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="Daily betting recommendations")
     parser.add_argument("--date", type=date_cls.fromisoformat, default=None,
-                        help="Slate date YYYY-MM-DD (default today)")
+                        help="Slate date YYYY-MM-DD (default: today, local time)")
     parser.add_argument("--simulate", action="store_true",
                         help="Treat a past date's games as an upcoming slate "
                              "(training cutoff = that date)")
