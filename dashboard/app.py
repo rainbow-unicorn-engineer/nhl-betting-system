@@ -15,7 +15,8 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
-from config.settings import engine
+from config.migrate import ensure_schema
+from config.settings import engine, local_today, to_local
 
 st.set_page_config(page_title="NHL Betting System", page_icon="🏒",
                    layout="wide")
@@ -23,11 +24,23 @@ st.title("🏒 NHL Betting System")
 
 ARTIFACTS = Path(__file__).parent.parent / "models" / "artifacts"
 
+try:
+    ensure_schema()     # the Today tab reads raw.games.start_time_utc
+except Exception as e:
+    st.warning(f"Schema upgrade check failed: {e}")
+
 
 @st.cache_data(ttl=300)
-def q(sql: str) -> pd.DataFrame:
+def q(sql: str, params: dict = None) -> pd.DataFrame:
     with engine.connect() as conn:
-        return pd.read_sql(text(sql), conn)
+        return pd.read_sql(text(sql), conn, params=params or {})
+
+
+def local_start(ts) -> str:
+    """Puck drop in the user's local zone (LOCAL_TIMEZONE)."""
+    if ts is None or pd.isna(ts):
+        return "TBD"
+    return to_local(pd.Timestamp(ts).to_pydatetime()).strftime("%a %I:%M %p %Z")
 
 
 tab_today, tab_model, tab_backtest, tab_bankroll = st.tabs(
@@ -36,7 +49,7 @@ tab_today, tab_model, tab_backtest, tab_bankroll = st.tabs(
 with tab_today:
     st.subheader("Pending recommendations")
     recs = q("""
-        SELECT r.created_at::date AS date, g.away_team || ' @ ' || g.home_team AS game,
+        SELECT g.date, g.start_time_utc, g.away_team || ' @ ' || g.home_team AS game,
                r.side, r.best_price AS price, r.model_prob, r.implied_prob_novig,
                r.edge_pct, r.recommended_stake, r.status
         FROM betting.recommendations r JOIN raw.games g USING (game_id)
@@ -45,14 +58,21 @@ with tab_today:
         st.info("No pending recommendations — either the slate is empty "
                 "(off-season) or no game cleared the edge threshold.")
     else:
+        recs.insert(1, "start (local)", recs.pop("start_time_utc").map(local_start))
         st.dataframe(recs, use_container_width=True)
 
     st.subheader("Upcoming games")
+    # "Today" is the user's local date (the DB clock is UTC); the NHL API
+    # marks upcoming games FUT/PRE, never SCHEDULED
     slate = q("""
-        SELECT date, away_team, home_team FROM raw.games
-        WHERE game_state = 'SCHEDULED' AND date <= CURRENT_DATE + 2
-        ORDER BY date LIMIT 30""")
-    st.dataframe(slate, use_container_width=True) if not slate.empty else \
+        SELECT date, start_time_utc, away_team, home_team FROM raw.games
+        WHERE game_state NOT IN ('FINAL', 'OFF')
+          AND date BETWEEN :today AND :today + 2
+        ORDER BY date, start_time_utc LIMIT 30""", {"today": local_today()})
+    if not slate.empty:
+        slate.insert(1, "start (local)", slate.pop("start_time_utc").map(local_start))
+        st.dataframe(slate, use_container_width=True)
+    else:
         st.caption("No games in the next 48h.")
 
 with tab_model:
