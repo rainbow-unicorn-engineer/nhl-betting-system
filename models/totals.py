@@ -88,6 +88,10 @@ logger = logging.getLogger("nhl.models.totals")
 
 MODEL_NAME = "poisson_totals"
 MODEL_VERSION = "v1"
+# The walk-forward gate verdict (STATUS above). The single switch for
+# totals betting: the bet checker and the daily recommendation job both
+# read it, so flipping it is the one change when a rebuild passes.
+GATE_PASSED = False
 CAL_FRAC = 0.15
 MAX_GOALS = 12                 # per-side PMF support 0..12 (P(13+) ~ 1e-6)
 LAMBDA_CLIP = (0.4, 8.0)

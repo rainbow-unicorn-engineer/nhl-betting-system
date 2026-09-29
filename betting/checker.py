@@ -32,9 +32,13 @@ Semantics locked here:
 - Legs sharing a game are CORRELATED and independence is wrong there;
   the report says so and withholds a verdict (the joint same-game model
   is Phase 5 scope).
-- The totals model has not passed its validation gate (models/totals.py
-  STATUS): totals-leg EVs are reported with a warning and never earn a
-  "BET" verdict on their own.
+- While the totals model has not passed its validation gate
+  (models.totals.GATE_PASSED, see its STATUS): totals-leg EVs are reported
+  with a warning and never earn a "BET" verdict on their own.
+- Notes are written for the person reading the slip (CLI or dashboard):
+  plain English, no phase numbers or file paths.
+- "Next matchup" (no --date) starts from the user's local date
+  (config.settings.local_today), not the database server's clock.
 
 Verdicts: BET (edge >= per-market minimum), THIN (positive EV below
 threshold), PASS (-EV), NO-MODEL (no stored prediction).
@@ -52,6 +56,7 @@ from sqlalchemy import text
 from betting.engine import (EDGE_MIN_ML, KELLY_FRACTION, MAX_STAKE_PCT,
                             decimal_odds)
 from config.settings import engine as db
+from config.settings import local_today
 from features.util import american_implied_prob
 
 logger = logging.getLogger("nhl.betting.checker")
@@ -110,9 +115,9 @@ def _resolve_game(conn, leg: Leg) -> Optional[int]:
     else:
         row = conn.execute(text("""
             SELECT game_id FROM raw.games
-            WHERE home_team = :h AND away_team = :a AND date >= CURRENT_DATE
+            WHERE home_team = :h AND away_team = :a AND date >= :today
             ORDER BY date LIMIT 1
-        """), {"h": leg.home, "a": leg.away}).fetchone()
+        """), {"h": leg.home, "a": leg.away, "today": local_today()}).fetchone()
     return row[0] if row else None
 
 
@@ -164,8 +169,8 @@ def evaluate_leg(leg: Leg) -> Leg:
         probs = _model_probability(conn, leg)
 
     if probs is None:
-        leg.notes.append("no stored prediction — run the daily "
-                         "recommendation job for this slate first")
+        leg.notes.append("no model prediction saved for this game yet. Run "
+                         "`python pipeline.py recommend` for its date first")
         return leg
 
     leg.p_win, leg.p_push = probs
@@ -184,10 +189,13 @@ def evaluate_leg(leg: Leg) -> Leg:
     else:
         leg.verdict = "THIN"
     if leg.market == "total":
-        leg.notes.append("totals model has NOT passed its gate — treat "
-                         "this EV as unvalidated (models/totals.py)")
-        if leg.verdict == "BET":
-            leg.verdict = "THIN"
+        from models.totals import GATE_PASSED
+        if not GATE_PASSED:
+            leg.notes.append("the over/under model has not passed its "
+                             "accuracy test yet, so this EV is unproven and "
+                             "the leg can't get a BET verdict")
+            if leg.verdict == "BET":
+                leg.verdict = "THIN"
     return leg
 
 
@@ -200,23 +208,28 @@ def evaluate_parlay(legs: List[Leg],
               "notes": []}
 
     if any(l.p_win is None for l in legs):
-        report["notes"].append("one or more legs lack a stored model "
-                               "prediction — no combined EV computed")
+        report["notes"].append("at least one leg has no model prediction, "
+                               "so there is no combined EV")
         return report
 
     game_ids = [l.game_id for l in legs]
     if len(set(game_ids)) < len(game_ids):
+        # No combined EV or stake either: both would come from the
+        # independence math this case breaks
         report["correlated"] = True
         report["notes"].append(
-            "legs share a game: independence math is WRONG for same-game "
-            "parlays; verdict withheld (joint model is Phase 5)")
+            "two or more legs are in the same game, so their results are "
+            "linked and the same-game parlay math here would be wrong. "
+            "No combined EV, stake, or verdict given")
+        return report
 
     decs = [decimal_odds(l.price) for l in legs]
     fair_dec = prod(decs)
     dec_offered = decimal_odds(combined_price) if combined_price else fair_dec
     if combined_price and any(l.p_push > 0 for l in legs):
-        report["notes"].append("custom combined price with pushable legs: "
-                               "push handling is a proportional approximation")
+        report["notes"].append("boosted price with a leg that can push (land "
+                               "exactly on the line): the EV is an "
+                               "approximation")
 
     p_all_win = prod(l.p_win for l in legs)
     exp_multiplier = (dec_offered / fair_dec) \
@@ -236,8 +249,6 @@ def evaluate_parlay(legs: List[Leg],
         "kelly": kelly,
         "stake_pct": stake_pct if ev > 0 else 0.0,
     })
-    if report["correlated"]:
-        return report
 
     if ev <= 0:
         report["verdict"] = "PASS"
