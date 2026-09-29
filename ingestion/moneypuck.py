@@ -4,6 +4,7 @@ MoneyPuck CSV data loader — free shot-level NHL data with pre-computed xG back
 Downloads: https://moneypuck.com/data.htm
 """
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,10 @@ MONEYPUCK_TEAM_MAP = {
     "S.J": "SJS",
     "T.B": "TBL",
 }
+
+# First key of pg_advisory_xact_lock(key, season): one season's reload at a
+# time, so overlapping refreshes can't both insert and duplicate its shots
+SHOTS_LOCK_KEY = 20260929
 
 
 def download_shots_csv(season_start_year: int, force: bool = False) -> Path:
@@ -132,6 +137,10 @@ def load_shots_to_db(season_start_year: int, csv_path: Path = None):
     inserted = 0
 
     with engine.begin() as conn:
+        # Held until commit: a second reload of this season waits here, then
+        # deletes what the first one inserted instead of adding to it
+        conn.execute(text("SELECT pg_advisory_xact_lock(:k, :s)"),
+                     {"k": SHOTS_LOCK_KEY, "s": season})
         conn.execute(text("DELETE FROM raw.shots WHERE season = :s"), {"s": season})
 
         for start in range(0, len(out), chunk_size):
@@ -152,6 +161,37 @@ def ingest_season_shots(season: int, force_download: bool = False) -> int:
     """
     start_year = season // 10000
     csv_path = download_shots_csv(start_year, force=force_download)
+    return load_shots_to_db(start_year, csv_path)
+
+
+def refresh_season(season: int, max_age_hours: float = 20) -> int:
+    """
+    In-season refresh for the daily chain: re-download the season's shots
+    CSV only when the cached copy is missing or older than max_age_hours,
+    then reload it. A reload is safe to repeat: load_shots_to_db deletes
+    the season's shots and inserts the new file in ONE transaction, under a
+    per-season advisory lock, so even overlapping reloads never duplicate
+    shots. Skips (returns 0) until the season has a
+    completed game — there is nothing to download before opening night.
+    """
+    start_year = season // 10000
+    with engine.connect() as conn:
+        finals = conn.execute(text("""
+            SELECT COUNT(*) FROM raw.games
+            WHERE season = :s AND game_state IN ('FINAL', 'OFF')
+        """), {"s": season}).scalar()
+    if not finals:
+        logger.info(f"MoneyPuck refresh: no completed {season} games yet — skipping")
+        return 0
+
+    csv_path = DATA_DIR / f"moneypuck_shots_{start_year}.csv"
+    age_h = ((time.time() - csv_path.stat().st_mtime) / 3600
+             if csv_path.exists() else None)
+    if age_h is None or age_h > max_age_hours:
+        download_shots_csv(start_year, force=True)
+    else:
+        logger.info(f"MoneyPuck shots for {start_year} are {age_h:.1f}h old "
+                    f"(< {max_age_hours}h) — reloading the cached file")
     return load_shots_to_db(start_year, csv_path)
 
 
