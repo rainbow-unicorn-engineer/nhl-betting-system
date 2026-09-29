@@ -12,6 +12,7 @@ for opening lines and CLV going forward.
 Idempotent and resumable: games already present in raw.historical_odds are
 skipped, so an interrupted backfill can simply be re-run.
 """
+import argparse
 import logging
 import time
 from typing import Optional
@@ -139,9 +140,18 @@ def backfill_historical_odds(season: Optional[int] = None) -> int:
     return inserted
 
 
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m ingestion.espn_odds",
+        description="Backfill ESPN reference lines (free, no key) for completed "
+                    "games missing from raw.historical_odds. Resumable.")
+    parser.add_argument("season", nargs="?", type=int, default=None,
+                        help="one season such as 20252026 (default: every season)")
+    args = parser.parse_args(argv)
+    return backfill_historical_odds(args.season)
+
+
 if __name__ == "__main__":
-    import sys
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    season_arg = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    backfill_historical_odds(season_arg)
+    main()

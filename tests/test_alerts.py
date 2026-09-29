@@ -118,3 +118,13 @@ class TestLoad:
         from betting.alerts import run_alerts
         out = run_alerts()
         assert set(out) == {"arbs", "middles"}
+
+
+def test_help_runs_nothing(monkeypatch, capsys):
+    from betting import alerts
+    monkeypatch.setattr(alerts, "run_alerts",
+                        lambda: pytest.fail("--help ran the scan"))
+    with pytest.raises(SystemExit) as exc:
+        alerts.main(["--help"])
+    assert exc.value.code == 0
+    assert "usage:" in capsys.readouterr().out

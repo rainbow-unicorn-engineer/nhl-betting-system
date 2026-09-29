@@ -61,3 +61,23 @@ class TestParsePickcenter:
     def test_missing_fields_become_none(self):
         row = parse_pickcenter({"homeTeamOdds": None, "awayTeamOdds": None})
         assert all(v is None for v in row.values())
+
+
+class TestCommandLine:
+    def test_help_runs_nothing(self, monkeypatch, capsys):
+        from ingestion import espn_odds
+        monkeypatch.setattr(espn_odds, "backfill_historical_odds",
+                            lambda season: pytest.fail("--help ran the backfill"))
+        with pytest.raises(SystemExit) as exc:
+            espn_odds.main(["--help"])
+        assert exc.value.code == 0
+        assert "season" in capsys.readouterr().out
+
+    def test_optional_season(self, monkeypatch):
+        from ingestion import espn_odds
+        calls = []
+        monkeypatch.setattr(espn_odds, "backfill_historical_odds",
+                            lambda season: calls.append(season) or 0)
+        espn_odds.main([])
+        espn_odds.main(["20252026"])
+        assert calls == [None, 20252026]

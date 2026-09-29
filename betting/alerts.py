@@ -26,10 +26,11 @@ Alerts are logged (WARNING for arbs — they are perishable) and returned
 as DataFrames for the dashboard. Set ALERTS_NOTIFY=1 for a macOS
 notification on arb hits.
 """
+import argparse
 import logging
 import os
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -51,7 +52,8 @@ MIN_MIDDLE_EV = 0.0            # report any +EV middle when a PMF exists
 def load_latest_lines(asof: Optional[datetime] = None,
                       max_age_minutes: float = MAX_AGE_MINUTES) -> pd.DataFrame:
     """Freshest quote per (game, book, market, line) for upcoming games."""
-    asof = asof or datetime.utcnow()
+    # naive UTC, like captured_at (datetime.utcnow() is deprecated in 3.12)
+    asof = asof or datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = asof - timedelta(minutes=max_age_minutes)
     with db.connect() as conn:
         return pd.read_sql(text("""
@@ -264,7 +266,15 @@ def run_alerts(asof: Optional[datetime] = None) -> dict:
     return {"arbs": arbs, "middles": middles}
 
 
+def main(argv=None) -> dict:
+    argparse.ArgumentParser(
+        prog="python -m betting.alerts",
+        description="Scan the freshest odds snapshots for arbitrage and "
+                    "middles; results go to the log.").parse_args(argv)
+    return run_alerts()
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_alerts()
+    main()
