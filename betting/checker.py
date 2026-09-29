@@ -41,7 +41,8 @@ Semantics locked here:
   (config.settings.local_today), not the database server's clock.
 
 Verdicts: BET (edge >= per-market minimum), THIN (positive EV below
-threshold), PASS (-EV), NO-MODEL (no stored prediction).
+threshold), PASS (-EV), NO-MODEL (no stored prediction), WITHHELD
+(same-game legs).
 """
 import argparse
 import logging
@@ -217,6 +218,7 @@ def evaluate_parlay(legs: List[Leg],
         # No combined EV or stake either: both would come from the
         # independence math this case breaks
         report["correlated"] = True
+        report["verdict"] = "WITHHELD"
         report["notes"].append(
             "two or more legs are in the same game, so their results are "
             "linked and the same-game parlay math here would be wrong. "

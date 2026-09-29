@@ -2,6 +2,7 @@
 Tests for betting/checker.py — hand-computed EVs, push semantics, parlay
 math, and a DB round-trip against synthetic prediction rows.
 """
+import contextlib
 import datetime as dt
 
 import numpy as np
@@ -9,11 +10,24 @@ import pytest
 from sqlalchemy import text
 
 import betting.checker as checker
+import models.totals
 from betting.checker import (Leg, evaluate_leg, evaluate_parlay, parse_leg)
 from config.settings import check_db_connection, engine
 
 requires_db = pytest.mark.skipif(not check_db_connection(),
                                  reason="database not reachable")
+
+
+class _NoDB:
+    """Stands in for checker.db: evaluate_leg opens a connection before its
+    (patched) lookups, so the math tests would otherwise need Postgres."""
+    def connect(self):
+        return contextlib.nullcontext(None)
+
+
+@pytest.fixture
+def no_db(monkeypatch):
+    monkeypatch.setattr(checker, "db", _NoDB())
 
 
 class TestParse:
@@ -34,6 +48,7 @@ class TestParse:
             parse_leg("BOS@TOR spread home -110")   # unknown market
 
 
+@pytest.mark.usefixtures("no_db")
 class TestLegMath:
     @pytest.fixture
     def patched(self, monkeypatch):
@@ -69,14 +84,24 @@ class TestLegMath:
         # conditional-on-action probability vs implied 0.5
         assert l.edge == pytest.approx(0.40 / 0.85 - 0.5)
 
-    def test_totals_never_earn_full_bet_verdict(self, patched):
+    def test_totals_never_earn_full_bet_verdict(self, patched, monkeypatch):
         # totals gate not passed: even a huge edge stays THIN
+        monkeypatch.setattr(models.totals, "GATE_PASSED", False)
         patched["p"] = (0.60, 0.0)
         l = evaluate_leg(parse_leg("A@B total over 6.5 +100"))
         assert l.edge > checker.EDGE_MIN_TOTAL
         assert l.verdict == "THIN"
+        assert any("accuracy test" in n for n in l.notes)
+
+    def test_totals_earn_bet_verdict_once_gate_passes(self, patched,
+                                                      monkeypatch):
+        monkeypatch.setattr(models.totals, "GATE_PASSED", True)
+        patched["p"] = (0.60, 0.0)
+        l = evaluate_leg(parse_leg("A@B total over 6.5 +100"))
+        assert l.verdict == "BET" and l.notes == []
 
 
+@pytest.mark.usefixtures("no_db")
 class TestParlayMath:
     @pytest.fixture
     def patched(self, monkeypatch):
@@ -124,8 +149,10 @@ class TestParlayMath:
         r = evaluate_parlay([parse_leg("A@B ml home +100"),
                              parse_leg("A@B total over 6.5 +100")])
         assert r["correlated"] is True
-        assert r["verdict"] == "NO-MODEL"   # withheld
+        assert r["verdict"] == "WITHHELD"
         assert any("same-game" in n for n in r["notes"])
+        # no combined numbers from math the note says is wrong
+        assert "ev_per_unit" not in r and "stake_pct" not in r
 
 
 @requires_db
