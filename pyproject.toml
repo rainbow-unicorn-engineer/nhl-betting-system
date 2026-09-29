@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "NHL Sports Betting Predictive System"
 requires-python = ">=3.11"
 dependencies = [
-    "nhl-api-py>=0.7.0",
-    "psycopg2-binary>=2.9.9",
+    "nhl-api-py>=3.2.0",          # nhlpy 3.x method names; 3.2.0+ is Apache-2.0
+    "psycopg2-binary>=2.9.9",     # DATABASE_URL names the driver: postgresql+psycopg2://
     "sqlalchemy>=2.0",
     "pandas>=2.2",
     "numpy>=1.26",
@@ -13,14 +13,16 @@ dependencies = [
     "python-dotenv>=1.0",
     "tqdm>=4.66",
     "pyyaml>=6.0",
+    "tzdata>=2024.1",             # IANA zones for zoneinfo on Windows (LOCAL_TIMEZONE)
 ]
 
 [project.optional-dependencies]
 ml = [
-    "lightgbm>=4.3",
+    "lightgbm>=4.3,<5",           # 4.7 already warns that eval_set is deprecated
     "xgboost>=2.0",
     "scikit-learn>=1.4",
     "optuna>=3.6",
+    "matplotlib>=3.8",            # calibration_plot in models/baseline.py (reached from lgbm + backtest)
 ]
 dashboard = [
     "streamlit>=1.32",
