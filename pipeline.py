@@ -5,27 +5,38 @@ Master orchestrator for the NHL Betting System data pipeline.
 Usage:
     python pipeline.py setup                        # First-time setup verification
     python pipeline.py status                       # Check database status
-    python pipeline.py backfill                     # Full historical backfill (6 seasons)
+    python pipeline.py backfill                     # Full historical backfill (BACKFILL_SEASONS)
     python pipeline.py features [--season YYYYYYYY] # Build feature store (all seasons by default)
-    python pipeline.py daily                        # Daily refresh (run via cron)
+    python pipeline.py daily                        # Daily refresh, run via launchd (ops/launchd/)
+    python pipeline.py close [--due]                # Pre-puck-drop moneyline snapshot (2 credits)
 """
 import sys
-from datetime import date
 
-from config.settings import check_db_connection, engine, BACKFILL_SEASONS, logger
+from config.settings import (check_db_connection, engine, BACKFILL_SEASONS,
+                             local_today, logger)
 from sqlalchemy import text
+
+
+def db_ready() -> bool:
+    """check_db_connection() + the idempotent schema upgrade (config/migrate)."""
+    if not check_db_connection():
+        return False
+    from config.migrate import ensure_schema
+    ensure_schema()
+    return True
 
 
 def db_status():
     """Print current database population status."""
-    if not check_db_connection():
+    if not db_ready():
         return
 
     queries = {
         "Teams": "SELECT COUNT(*) FROM raw.teams",
         "Games": "SELECT COUNT(*) FROM raw.games",
         "Games (FINAL)": "SELECT COUNT(*) FROM raw.games WHERE game_state IN ('FINAL', 'OFF')",
-        "Games (SCHEDULED)": "SELECT COUNT(*) FROM raw.games WHERE game_state = 'SCHEDULED'",
+        # The NHL API marks upcoming games FUT or PRE, never SCHEDULED
+        "Games (upcoming)": "SELECT COUNT(*) FROM raw.games WHERE game_state NOT IN ('FINAL', 'OFF')",
         "Shots": "SELECT COUNT(*) FROM raw.shots",
         "Skater game logs": "SELECT COUNT(*) FROM raw.skater_games",
         "Goalie game logs": "SELECT COUNT(*) FROM raw.goalie_games",
@@ -135,9 +146,10 @@ def recommend():
 
 
 def odds():
-    """Odds snapshot only — cheap enough to run near game time for CLV.
-    Recommendations + arb/middle alerts refresh right after: this is the
-    freshest-lines moment."""
+    """Full odds snapshot (6 credits) + starters, then recommendations for
+    games that have no pick yet (issued picks stay frozen) + arb/middle
+    alerts: this is the freshest-lines moment. For the closing line
+    alone, `close` is cheaper (2 credits)."""
     from ingestion.odds_api import snapshot_odds
 
     if not _wait_for_network():
@@ -152,13 +164,36 @@ def odds():
         logger.error(f"Alert scan failed (non-fatal): {e}")
 
 
+def close(due: bool = False):
+    """Closing-line snapshot: moneyline only (markets=h2h, 2 credits), no
+    recommendations, no alerts. It becomes the close that settlement
+    grades each pick against.
+
+    due=True (`close --due`, the scheduled job every 15 minutes): snapshot
+    only when some game starts within CLOSE_LEAD_MINUTES (default 16) and
+    no moneyline snapshot was taken in the last CLOSE_MIN_GAP_MINUTES
+    (default 16); otherwise log why and return. Plain `close` always
+    snapshots (while any game starts within 24 hours)."""
+    from ingestion import odds_api
+
+    if due:
+        is_due, why = odds_api.close_is_due()
+        if not is_due:
+            logger.info(f"close --due: no snapshot, {why}")
+            return
+        logger.info(f"close --due: taking the closing snapshot, {why}")
+    if not _wait_for_network():
+        return
+    odds_api.snapshot_odds(markets="h2h")
+
+
 def daily():
-    """Daily refresh pipeline. Call via cron."""
+    """Daily refresh pipeline. Run via launchd (ops/launchd/)."""
     from ingestion.nhl_api import daily_refresh
     from ingestion.odds_api import snapshot_odds
     from config.settings import CURRENT_SEASON
 
-    logger.info(f"DAILY REFRESH — {date.today()}")
+    logger.info(f"DAILY REFRESH — {local_today()} (season {CURRENT_SEASON})")
     if not _wait_for_network():
         return
     daily_refresh()
@@ -169,6 +204,13 @@ def daily():
         backfill_historical_odds(CURRENT_SEASON)
     except Exception as e:
         logger.error(f"ESPN odds top-up failed (non-fatal): {e}")
+    # MoneyPuck shots (xG) for the season so far — shot-based features go
+    # stale in season without this
+    try:
+        from ingestion.moneypuck import refresh_season
+        refresh_season(CURRENT_SEASON)
+    except Exception as e:
+        logger.error(f"MoneyPuck refresh failed (non-fatal): {e}")
     # Feature refresh after ingestion: current season only (Elo is always
     # full-history inside the build)
     features(season=CURRENT_SEASON)
@@ -178,16 +220,33 @@ def daily():
     logger.info("DAILY REFRESH COMPLETE")
 
 
+def seed_venues_if_missing() -> str:
+    """Apply db/seed_venues.sql when raw.teams has no arena coordinates
+    (a fresh database); returns a status word for the setup check."""
+    from config.migrate import seed_venues, venues_missing
+    try:
+        if not venues_missing():
+            return "OK"
+        seed_venues()
+        return "SEEDED (db/seed_venues.sql applied)"
+    except Exception as e:
+        logger.error(f"Venue seed failed: {e}")
+        return "FAIL (run: python -m config.migrate --seed-venues)"
+
+
 def setup_check():
     """Verify all prerequisites for first-time setup."""
-    from config.settings import ODDS_API_KEY, DATA_DIR
+    from config.settings import (ODDS_API_KEY, DATA_DIR, CURRENT_SEASON,
+                                 local_tz_name)
 
     print("\n" + "=" * 50)
     print("  NHL BETTING SYSTEM — SETUP CHECK")
     print("=" * 50)
 
-    db_ok = check_db_connection()
+    db_ok = db_ready()
     print(f"  Database connection ........ {'OK' if db_ok else 'FAIL'}")
+    if db_ok:
+        print(f"  Venue coordinates .......... {seed_venues_if_missing()}")
 
     try:
         from nhlpy import NHLClient
@@ -198,6 +257,9 @@ def setup_check():
 
     has_key = bool(ODDS_API_KEY and ODDS_API_KEY != "your_key_here")
     print(f"  Odds API key ............... {'OK' if has_key else 'NOT SET (optional for now)'}")
+    print(f"  Season ..................... {CURRENT_SEASON}")
+    print(f"  Local time zone ............ {local_tz_name()}")
+    print(f"  Today (local) .............. {local_today()}")
     print(f"  Data directory .............. {DATA_DIR}")
     print("=" * 50)
 
@@ -216,10 +278,12 @@ NHL Betting System Pipeline
 Usage:
     python pipeline.py setup       Check prerequisites
     python pipeline.py status      Database population status
-    python pipeline.py backfill    Full 6-season historical backfill
+    python pipeline.py backfill    Full historical backfill (BACKFILL_FIRST_SEASON..current)
     python pipeline.py features    Build feature store [--season YYYYYYYY]
-    python pipeline.py daily       Daily refresh (schedule + boxscores + odds + features + recs)
+    python pipeline.py daily       Daily refresh (schedule + boxscores + odds + shots + features + recs)
     python pipeline.py odds        Odds snapshot + starters + recommendation refresh
+    python pipeline.py close       Closing-line snapshot before puck drop (moneyline only, 2 credits)
+                                   [--due: only if a game starts soon and no recent snapshot]
     python pipeline.py recommend   Score today's slate -> betting.recommendations
     python pipeline.py starters    Ingest Daily Faceoff confirmed goalies
     python pipeline.py settle      Settle paper bets + rebuild bankroll/CLV ledger
@@ -233,12 +297,12 @@ Usage:
     elif cmd == "status":
         db_status()
     elif cmd == "backfill":
-        if not check_db_connection():
+        if not db_ready():
             print("ERROR: Database not reachable. Run: docker compose up -d")
             sys.exit(1)
         backfill()
     elif cmd == "features":
-        if not check_db_connection():
+        if not db_ready():
             print("ERROR: Database not reachable. Run: docker compose up -d")
             sys.exit(1)
         season = None
@@ -250,27 +314,32 @@ Usage:
                 sys.exit(1)
         features(season)
     elif cmd == "odds":
-        if not check_db_connection():
+        if not db_ready():
             logger.error("Database not reachable")
             sys.exit(1)
         odds()
+    elif cmd == "close":
+        if not db_ready():
+            logger.error("Database not reachable")
+            sys.exit(1)
+        close(due="--due" in sys.argv[2:])
     elif cmd == "recommend":
-        if not check_db_connection():
+        if not db_ready():
             logger.error("Database not reachable")
             sys.exit(1)
         recommend()
     elif cmd == "starters":
-        if not check_db_connection():
+        if not db_ready():
             logger.error("Database not reachable")
             sys.exit(1)
         starters()
     elif cmd == "settle":
-        if not check_db_connection():
+        if not db_ready():
             logger.error("Database not reachable")
             sys.exit(1)
         settle()
     elif cmd == "daily":
-        if not check_db_connection():
+        if not db_ready():
             logger.error("Database not reachable")
             sys.exit(1)
         daily()
