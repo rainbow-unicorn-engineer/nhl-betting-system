@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: nhl
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nhl_dev_2026}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"   # this machine only, not the whole network
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
