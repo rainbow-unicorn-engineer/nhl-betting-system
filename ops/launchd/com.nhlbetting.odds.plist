@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE (optional job): the midday run, `python pipeline.py odds` (full
+  6-credit odds snapshot, confirmed starting goalies, picks for games that
+  still have none, arbitrage and middle alerts). It never changes a pick
+  already issued. Skip this job if the monthly credits run short.
+
+  Replace __REPO__ with the repo's absolute path and __PYTHON__ with the
+  virtual environment's Python (usually __REPO__/.venv/bin/python), then
+  install it as ops/launchd/README.md describes. Nothing installs this file
+  automatically, and the live Mac's existing
+  ~/Library/LaunchAgents/com.nhlbetting.odds.plist is NOT replaced.
+
+  The time is this Mac's local time: 13:00 suits a Mac on Central time,
+  after most starting goalies are confirmed. Adjust it to your zone.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nhlbetting.odds</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/pipeline.py</string>
+        <string>odds</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>13</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- The logs/ folder must exist before the job first runs; git ignores it -->
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/odds.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/odds.log</string>
+</dict>
+</plist>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE: the closing-line snapshot, `python pipeline.py close` with its
+  due flag (see ProgramArguments), every 15 minutes. XML comments cannot
+  hold a double hyphen, so the flag is not spelled out here.
+  Settlement grades each pick against the same book's
+  last snapshot before that game's puck drop. A run takes the 2-credit
+  moneyline snapshot (no picks, no alerts) only when some game starts
+  within 16 minutes and no moneyline snapshot is under 16 minutes old;
+  every other run logs one line and exits, at no cost. So each start time
+  gets one close, in the last run before puck drop, early afternoon games
+  included, with no times to adjust for the slate or your time zone. At
+  those defaults the daily run plus this job stay under the free plan's
+  500 credits a month (at most about 456 on the 2026-27 schedule).
+
+  Replace __REPO__ with the repo's absolute path and __PYTHON__ with the
+  virtual environment's Python (usually __REPO__/.venv/bin/python), then
+  install it as ops/launchd/README.md describes. Nothing installs this file
+  automatically; on the live Mac it replaces any fixed-time close job.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nhlbetting.close</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/pipeline.py</string>
+        <string>close</string>
+        <string>--due</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- Every 900 seconds (15 minutes) while the Mac is awake -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- The logs/ folder must exist before the job first runs; git ignores it -->
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/close.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/close.log</string>
+</dict>
+</plist>
