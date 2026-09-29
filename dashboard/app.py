@@ -3,8 +3,9 @@ dashboard/app.py — Streamlit control room (Phase 3).
 
 Run:  .venv/bin/streamlit run dashboard/app.py
 
-Four tabs:
+Five tabs:
 - Today: pending recommendations + upcoming slate (live during the season)
+- Check a bet: a bet or parlay you enter, run through betting/checker.py
 - Model: registry, walk-forward metrics, calibration plots
 - Backtest: strategy simulation on true-price (DraftKings-era) games
 - Bankroll: placed bets, PnL curve, CLV once live betting starts
@@ -15,14 +16,33 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
+from betting.checker import EDGE_MIN_TOTAL, Leg, evaluate_parlay
+from betting.engine import EDGE_MIN_ML
 from config.migrate import ensure_schema
 from config.settings import engine, local_today, to_local
+from features.util import american_implied_prob
 
 st.set_page_config(page_title="NHL Betting System", page_icon="🏒",
                    layout="wide")
 st.title("🏒 NHL Betting System")
 
 ARTIFACTS = Path(__file__).parent.parent / "models" / "artifacts"
+
+# Check-a-bet rows -> checker (market, side)
+BET_TYPES = {"Home win": ("ml", "HOME"), "Away win": ("ml", "AWAY"),
+             "Over": ("total", "OVER"), "Under": ("total", "UNDER")}
+
+# Checker verdict -> (banner, what it means in plain English)
+VERDICTS = {
+    "BET": (st.success, "BET: the model's edge clears the minimum "
+            f"({EDGE_MIN_ML:.1%} for win bets, {EDGE_MIN_TOTAL:.1%} for "
+            "over/unders)."),
+    "THIN": (st.warning, "THIN: expected to make a little money, but the "
+             "edge is below the minimum, so the system would not bet it."),
+    "PASS": (st.error, "PASS: expected to lose money at these odds."),
+    "NO-MODEL": (st.info, "NO VERDICT: see the note below."),
+    "WITHHELD": (st.info, "NO VERDICT: see the note below."),
+}
 
 try:
     ensure_schema()     # the Today tab reads raw.games.start_time_utc
@@ -43,8 +63,37 @@ def local_start(ts) -> str:
     return to_local(pd.Timestamp(ts).to_pydatetime()).strftime("%a %I:%M %p %Z")
 
 
-tab_today, tab_model, tab_backtest, tab_bankroll = st.tabs(
-    ["📅 Today", "🧠 Model", "🧪 Backtest", "💰 Bankroll"])
+def pct(x) -> str:
+    return "—" if x is None else f"{x:.1%}"
+
+
+def slip_legs(slip: pd.DataFrame, games: dict) -> tuple:
+    """Check-a-bet editor rows -> (checker Legs, row problems in plain
+    English). games maps each dropdown label to its raw.games row."""
+    legs, problems = [], []
+    for i, row in enumerate(slip.itertuples(), start=1):
+        if row.Game not in games or row.Bet not in BET_TYPES \
+                or pd.isna(row.Odds):
+            problems.append(f"Row {i}: pick a game, a bet, and the odds.")
+            continue
+        if abs(row.Odds) < 100:
+            problems.append(f"Row {i}: American odds are -100 or lower, "
+                            "or +100 or higher.")
+            continue
+        market, side = BET_TYPES[row.Bet]
+        if market == "total" and pd.isna(row.Line):
+            problems.append(f"Row {i}: an over/under needs a line, e.g. 6.5.")
+            continue
+        g = games[row.Game]
+        legs.append(Leg(away=g.away_team, home=g.home_team, market=market,
+                        side=side, price=int(row.Odds),
+                        line=float(row.Line) if market == "total" else None,
+                        date=pd.Timestamp(g.date).date()))
+    return legs, problems
+
+
+tab_today, tab_check, tab_model, tab_backtest, tab_bankroll = st.tabs(
+    ["📅 Today", "🔍 Check a bet", "🧠 Model", "🧪 Backtest", "💰 Bankroll"])
 
 with tab_today:
     st.subheader("Pending recommendations")
@@ -75,6 +124,86 @@ with tab_today:
     else:
         st.caption("No games in the next 48h.")
 
+with tab_check:
+    st.subheader("Check a bet or parlay")
+    st.caption("One row is a single bet; add rows for a parlay. The model's "
+               "chances come from the latest `recommend` run, so a game shows "
+               "NO VERDICT until that run has scored it.")
+    upcoming = q("""
+        SELECT date, away_team, home_team FROM raw.games
+        WHERE game_state NOT IN ('FINAL', 'OFF') AND game_type IN (2, 3)
+          AND date BETWEEN :today AND :today + 7
+        ORDER BY date, start_time_utc""", {"today": local_today()})
+    if upcoming.empty:
+        st.info("No upcoming games in the next week.")
+    else:
+        games = {f"{pd.Timestamp(g.date):%a %b %d}  {g.away_team} @ {g.home_team}": g
+                 for g in upcoming.itertuples()}
+        slip = st.data_editor(
+            pd.DataFrame({"Game": [next(iter(games))], "Bet": ["Home win"],
+                          "Line": pd.Series([None], dtype="float"),
+                          "Odds": [-110]}),
+            column_config={
+                "Game": st.column_config.SelectboxColumn(
+                    options=list(games), required=True, width="large"),
+                "Bet": st.column_config.SelectboxColumn(
+                    options=list(BET_TYPES), required=True),
+                "Line": st.column_config.NumberColumn(
+                    help="Over/under only, e.g. 6.5", min_value=0.5, step=0.5),
+                "Odds": st.column_config.NumberColumn(
+                    help="American odds, e.g. -130 or +120", step=1,
+                    required=True),
+            },
+            num_rows="dynamic", hide_index=True, key="slip")
+        c1, c2 = st.columns(2)
+        boost = c1.number_input("Boosted parlay odds (optional)", value=None,
+                                step=1, help="Only if the book offers a "
+                                "special combined price, e.g. +450")
+        bankroll = c2.number_input("Bankroll in $ (optional)", value=None,
+                                   min_value=0.0, step=50.0)
+
+        if st.button("Check", type="primary", key="check"):
+            legs, problems = slip_legs(slip, games)
+            if boost is not None and abs(boost) < 100:
+                problems.append("Boosted odds are -100 or lower, or +100 or "
+                                "higher.")
+            for p in problems:
+                st.error(p)
+
+            if legs and not problems:
+                r = evaluate_parlay(legs, int(boost) if boost else None)
+                st.dataframe(pd.DataFrame([{
+                    "Bet": f"{l.away} @ {l.home}: "
+                           + {"HOME": f"{l.home} win", "AWAY": f"{l.away} win",
+                              "OVER": f"Over {l.line}",
+                              "UNDER": f"Under {l.line}"}[l.side],
+                    "Odds": f"{l.price:+d}",
+                    "Model chance": pct(l.p_win),
+                    "Break-even chance": pct(american_implied_prob(l.price)),
+                    "Edge": "—" if l.edge is None else f"{l.edge:+.1%}",
+                    "Expected profit per $1": "—" if l.ev is None else f"{l.ev:+.3f}",
+                    "Verdict": l.verdict,
+                    "Notes": "; ".join(l.notes),
+                } for l in r["legs"]]), use_container_width=True, hide_index=True)
+
+                if "ev_per_unit" in r:
+                    c = st.columns(4)
+                    c[0].metric("Chance every leg wins", pct(r["p_win_all"]))
+                    c[1].metric("Payout per $1 (decimal odds)",
+                                f"{r['decimal_offered']:.2f}")
+                    c[2].metric("Expected profit per $1",
+                                f"{r['ev_per_unit']:+.3f}")
+                    stake = r["stake_pct"]
+                    c[3].metric("Suggested stake",
+                                f"${stake * bankroll:,.2f}" if bankroll
+                                else f"{stake:.2%} of bankroll",
+                                help="A quarter of the Kelly-formula bet "
+                                     "size, capped at 2% of bankroll")
+                banner, meaning = VERDICTS[r["verdict"]]
+                banner(meaning)
+                for n in r["notes"]:
+                    st.warning(n)
+
 with tab_model:
     st.subheader("Model registry")
     st.dataframe(q("""
@@ -97,7 +226,7 @@ with tab_backtest:
     st.caption("Walk-forward OOF probabilities → edge threshold → "
                "quarter-Kelly, settled at actual DraftKings prices "
                "(near-closing, no line shopping — conservative). "
-               "See docs/phase3_results.md for the honest read.")
+               "See docs/phase3_results.md for the full results.")
     if st.button("Run backtest (~1 min)"):
         with st.spinner("Running walk-forward + simulation..."):
             from betting.backtest import run_backtest
@@ -123,11 +252,13 @@ with tab_bankroll:
 
     st.subheader("Placed bets")
     bets = q("""
-        SELECT b.placed_at::date AS date, g.away_team || ' @ ' || g.home_team AS game,
+        SELECT g.date, g.away_team || ' @ ' || g.home_team AS game,
                r.side, b.placed_price, b.stake_amount, b.result, b.pnl, b.clv
         FROM betting.placed_bets b
         JOIN betting.recommendations r USING (rec_id)
         JOIN raw.games g ON g.game_id = r.game_id
-        ORDER BY b.placed_at DESC LIMIT 100""")
-    st.dataframe(bets, use_container_width=True) if not bets.empty else \
+        ORDER BY g.date DESC, b.placed_at DESC LIMIT 100""")
+    if not bets.empty:
+        st.dataframe(bets, use_container_width=True)
+    else:
         st.caption("No placed bets yet.")
