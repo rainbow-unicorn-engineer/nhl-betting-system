@@ -7,7 +7,7 @@ CRITICAL: the pip package "nhl-api-py" imports as `nhlpy`, NOT `nhl_api_py`.
 """
 import time
 import logging
-from datetime import date, timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -15,7 +15,8 @@ import requests
 from nhlpy import NHLClient
 from sqlalchemy import text
 
-from config.settings import engine, BACKFILL_SEASONS
+from config.migrate import ensure_schema
+from config.settings import engine, BACKFILL_SEASONS, local_today
 
 # nhlpy 3.3.0 does not wrap the right-rail endpoint (team game stats)
 RIGHT_RAIL_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/right-rail"
@@ -67,15 +68,27 @@ def ingest_teams():
 # ─────────────────────────────────────────────
 # SCHEDULE / GAMES
 # ─────────────────────────────────────────────
-def ingest_schedule(start_date: str, end_date: str):
+def ingest_schedule(start_date: str, end_date: str, season: Optional[int] = None):
     """
     Pull NHL schedule for a date range and upsert into raw.games.
     Dates in YYYY-MM-DD format.
+
+    season (e.g. 20202021): keep only that season's games, judged by the
+    game id, whose first four digits are the season's start year. Season
+    windows overlap (Sept 1 to Sept 30 of the next year), so a window can
+    hold another season's games: the 2020-21 window opens while the
+    2019-20 playoffs were still being played (a bubble, Aug 1 to Sept 28,
+    2020; ids 2019030xxx). Those are 2019-20 playoff games, stored by the
+    2019-20 load and skipped by the 2020-21 one. None keeps every season
+    (the daily refresh).
     """
-    logger.info(f"Ingesting schedule: {start_date} to {end_date}")
+    ensure_schema()
+    logger.info(f"Ingesting schedule: {start_date} to {end_date}"
+                + (f" (season {season} only)" if season else ""))
     current = datetime.strptime(start_date, "%Y-%m-%d").date()
     end = datetime.strptime(end_date, "%Y-%m-%d").date()
     total_inserted = 0
+    other_season = 0
 
     while current <= end:
         date_str = current.strftime("%Y-%m-%d")
@@ -99,7 +112,10 @@ def ingest_schedule(start_date: str, end_date: str):
                     continue
 
                 season_start = int(str(game_id)[:4])
-                season = season_start * 10000 + (season_start + 1)
+                if season is not None and season_start != season // 10000:
+                    other_season += 1
+                    continue
+                game_season = season_start * 10000 + (season_start + 1)
 
                 home = g.get("homeTeam", {})
                 away = g.get("awayTeam", {})
@@ -107,14 +123,17 @@ def ingest_schedule(start_date: str, end_date: str):
 
                 record = {
                     "game_id": game_id,
-                    "season": season,
+                    "season": game_season,
                     "game_type": game_type,
                     "date": day_date,
+                    "start_time_utc": _parse_start_time(g.get("startTimeUTC")),
                     "home_team": home.get("abbrev", ""),
                     "away_team": away.get("abbrev", ""),
                     "home_score": home.get("score") if state in ("FINAL", "OFF") else None,
                     "away_score": away.get("score") if state in ("FINAL", "OFF") else None,
                     "game_state": state,
+                    # OK, or PPD (postponed), SUSP (suspended), CNCL (cancelled)
+                    "schedule_state": g.get("gameScheduleState"),
                     "venue": g.get("venue", {}).get("default", ""),
                     "is_ot": None,
                     "is_so": None,
@@ -139,23 +158,34 @@ def ingest_schedule(start_date: str, end_date: str):
         current += timedelta(days=7)  # schedule API returns a week at a time
         time.sleep(0.5)  # polite rate limiting
 
+    if other_season:
+        logger.info(f"Skipped {other_season} game(s) from other seasons in that window")
     logger.info(f"Upserted {total_inserted} games from {start_date} to {end_date}")
     return total_inserted
 
 
 def _upsert_game(record: dict):
-    """Upsert a single game into raw.games."""
+    """Upsert a single game into raw.games. date follows the schedule on
+    conflict (postponed games move to a new day); a missing start time or
+    schedule state never erases a known one."""
+    record = {"schedule_state": None, **record}
     with engine.begin() as conn:
         conn.execute(text("""
-            INSERT INTO raw.games (game_id, season, game_type, date, home_team, away_team,
-                                   home_score, away_score, game_state, venue, is_ot, is_so)
-            VALUES (:game_id, :season, :game_type, :date, :home_team, :away_team,
-                    :home_score, :away_score, :game_state, :venue,
+            INSERT INTO raw.games (game_id, season, game_type, date, start_time_utc,
+                                   home_team, away_team,
+                                   home_score, away_score, game_state, schedule_state,
+                                   venue, is_ot, is_so)
+            VALUES (:game_id, :season, :game_type, :date, :start_time_utc,
+                    :home_team, :away_team,
+                    :home_score, :away_score, :game_state, :schedule_state, :venue,
                     COALESCE(:is_ot, FALSE), COALESCE(:is_so, FALSE))
             ON CONFLICT (game_id) DO UPDATE SET
+                date = EXCLUDED.date,
+                start_time_utc = COALESCE(EXCLUDED.start_time_utc, raw.games.start_time_utc),
                 home_score = COALESCE(EXCLUDED.home_score, raw.games.home_score),
                 away_score = COALESCE(EXCLUDED.away_score, raw.games.away_score),
                 game_state = EXCLUDED.game_state,
+                schedule_state = COALESCE(EXCLUDED.schedule_state, raw.games.schedule_state),
                 is_ot = COALESCE(EXCLUDED.is_ot, raw.games.is_ot),
                 is_so = COALESCE(EXCLUDED.is_so, raw.games.is_so),
                 updated_at = NOW()
@@ -463,23 +493,31 @@ def backfill_boxscores(season: Optional[int] = None):
 def ingest_season(season: int):
     """Full ingestion pipeline for a single season (e.g., 20242025)."""
     start_year = season // 10000
-    start_date = f"{start_year}-10-01"
-    # July 31, not June 30: the COVID-delayed 2020-21 Cup Final ran to July 7
-    end_date = f"{start_year + 1}-07-31"
+    # Sept 1, not Oct 1: 2026-27 opened Sept 29. ingest_schedule keeps only
+    # gameType 2/3 of this season, so the extra September weeks add no
+    # preseason rows and no late playoff games from the season before.
+    start_date = f"{start_year}-09-01"
+    # Sept 30 of the second year, not June 30: the COVID-delayed 2019-20
+    # playoffs ran Aug 1 to Sept 28, 2020, and the 2020-21 Final to July 7,
+    # 2021. The overlap with the next season's window is harmless, because
+    # season= keeps only this season's games (by game id).
+    end_date = f"{start_year + 1}-09-30"
 
     logger.info(f"=== Ingesting season {season} ({start_date} to {end_date}) ===")
-    ingest_schedule(start_date, end_date)
+    ingest_schedule(start_date, end_date, season=season)
     backfill_boxscores(season=season)
     backfill_team_stats(season=season)
     logger.info(f"=== Season {season} ingestion complete ===")
 
 
 def daily_refresh():
-    """Daily update: refresh recent schedule + backfill new boxscores. Run via cron."""
+    """Daily update: refresh recent schedule + backfill new boxscores. Run via
+    launchd (ops/launchd/). The window can span two seasons, so every
+    season's games are kept."""
     logger.info("=== Starting daily refresh ===")
     ingest_teams()
 
-    today = date.today()
+    today = local_today()
     start = (today - timedelta(days=3)).strftime("%Y-%m-%d")
     end = (today + timedelta(days=7)).strftime("%Y-%m-%d")
     ingest_schedule(start, end)
@@ -492,6 +530,20 @@ def daily_refresh():
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
+def _parse_start_time(val) -> Optional[datetime]:
+    """NHL startTimeUTC ("2026-01-16T00:00:00Z") -> aware UTC datetime;
+    None when missing or malformed."""
+    if not val:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _parse_saves_shots(val) -> tuple:
     """
     Parse the NHL API's strength-split format "saves/shots" (e.g. "19/21")
