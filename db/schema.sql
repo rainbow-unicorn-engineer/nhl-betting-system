@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS raw.games (
     game_id         BIGINT PRIMARY KEY,
     season          INTEGER NOT NULL,          -- e.g. 20252026
     game_type       SMALLINT NOT NULL,         -- 1=preseason, 2=regular, 3=playoff
-    date            DATE NOT NULL,
+    date            DATE NOT NULL,             -- league (Eastern) schedule date
+    start_time_utc  TIMESTAMPTZ,               -- puck drop (NHL startTimeUTC)
     home_team       VARCHAR(3) NOT NULL,
     away_team       VARCHAR(3) NOT NULL,
     home_score      SMALLINT,
@@ -27,7 +28,8 @@ CREATE TABLE IF NOT EXISTS raw.games (
     is_ot           BOOLEAN DEFAULT FALSE,
     is_so           BOOLEAN DEFAULT FALSE,
     venue           VARCHAR(100),
-    game_state      VARCHAR(20) DEFAULT 'SCHEDULED',  -- SCHEDULED, LIVE, FINAL
+    game_state      VARCHAR(20) DEFAULT 'SCHEDULED',  -- NHL gameState: FUT, PRE, LIVE, CRIT, FINAL, OFF
+    schedule_state  VARCHAR(10),               -- NHL gameScheduleState: OK, PPD (postponed), SUSP (suspended), CNCL (cancelled)
     home_coach      VARCHAR(80),
     away_coach      VARCHAR(80),
     attendance      INTEGER,
@@ -365,7 +367,9 @@ CREATE TABLE IF NOT EXISTS betting.recommendations (
     edge_pct            NUMERIC(5,3),
     kelly_fraction      NUMERIC(5,4),
     recommended_stake   NUMERIC(8,2),
-    status              VARCHAR(10) DEFAULT 'PENDING',  -- PENDING, APPROVED, PLACED, SKIPPED
+    status              VARCHAR(10) DEFAULT 'PENDING',  -- PENDING, APPROVED, PLACED, SKIPPED, SETTLED
+    priced_at           TIMESTAMP,              -- captured_at (UTC) of the snapshot best_price came from
+    scheduled_start     TIMESTAMPTZ,            -- the game's start_time_utc when the pick was written; a start >3h from it voids the pick
     created_at          TIMESTAMP DEFAULT NOW(),
     decided_at          TIMESTAMP
 );
@@ -379,7 +383,7 @@ CREATE TABLE IF NOT EXISTS betting.placed_bets (
     placed_price        INTEGER NOT NULL,
     stake_amount        NUMERIC(8,2) NOT NULL,
     placed_at           TIMESTAMP NOT NULL,
-    result              VARCHAR(5),             -- WIN, LOSS, PUSH, VOID
+    result              VARCHAR(5),             -- WIN, LOSS, PUSH, VOID (postponed/cancelled, or moved >3h from recommendations.scheduled_start: stake returned, not a bet)
     pnl                 NUMERIC(10,2),
     closing_line        INTEGER,
     clv                 NUMERIC(5,3),           -- implied(closing) - implied(placed)
