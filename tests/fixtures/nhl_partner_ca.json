@@ -1,0 +1,145 @@
+{
+ "currentOddsDate": "2026-09-29",
+ "lastUpdatedUTC": "2026-09-19T12:30:00Z",
+ "bettingPartner": {
+  "partnerId": 7,
+  "country": "CAN",
+  "name": "FanDuel"
+ },
+ "games": [
+  {
+   "gameId": 2026020001,
+   "gameType": 2,
+   "startTimeUTC": "2026-09-29T21:00:00Z",
+   "homeTeam": {
+    "id": 12,
+    "abbrev": "CAR",
+    "odds": [
+     {
+      "description": "MONEY_LINE_2_WAY",
+      "value": -125.0,
+      "qualifier": ""
+     },
+     {
+      "description": "PUCK_LINE",
+      "value": 184.0,
+      "qualifier": "-1.5"
+     },
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 125.0,
+      "qualifier": ""
+     },
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 340.0,
+      "qualifier": "Draw"
+     },
+     {
+      "description": "OVER_UNDER",
+      "value": 114.0,
+      "qualifier": "O6.5"
+     }
+    ]
+   },
+   "awayTeam": {
+    "id": 13,
+    "abbrev": "FLA",
+    "odds": [
+     {
+      "description": "MONEY_LINE_2_WAY",
+      "value": 104.0,
+      "qualifier": ""
+     },
+     {
+      "description": "PUCK_LINE",
+      "value": -230.0,
+      "qualifier": "+1.5"
+     },
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 155.0,
+      "qualifier": ""
+     },
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 340.0,
+      "qualifier": "Draw"
+     },
+     {
+      "description": "OVER_UNDER",
+      "value": -140.0,
+      "qualifier": "U6.5"
+     }
+    ]
+   }
+  },
+  {
+   "gameId": 2026020002,
+   "gameType": 2,
+   "startTimeUTC": "2026-09-29T23:00:00Z",
+   "homeTeam": {
+    "id": 10,
+    "abbrev": "TOR",
+    "odds": [
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 330.0,
+      "qualifier": "Draw"
+     },
+     {
+      "description": "MONEY_LINE_2_WAY",
+      "value": -118.0,
+      "qualifier": ""
+     },
+     {
+      "description": "OVER_UNDER",
+      "value": 110.0,
+      "qualifier": "O6.5"
+     },
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 135.0,
+      "qualifier": ""
+     },
+     {
+      "description": "PUCK_LINE",
+      "value": 198.0,
+      "qualifier": "-1.5"
+     }
+    ]
+   },
+   "awayTeam": {
+    "id": 8,
+    "abbrev": "MTL",
+    "odds": [
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 330.0,
+      "qualifier": "Draw"
+     },
+     {
+      "description": "MONEY_LINE_2_WAY",
+      "value": -102.0,
+      "qualifier": ""
+     },
+     {
+      "description": "OVER_UNDER",
+      "value": -134.0,
+      "qualifier": "U6.5"
+     },
+     {
+      "description": "MONEY_LINE_3_WAY",
+      "value": 145.0,
+      "qualifier": ""
+     },
+     {
+      "description": "PUCK_LINE",
+      "value": -250.0,
+      "qualifier": "+1.5"
+     }
+    ]
+   }
+  }
+ ]
+}
