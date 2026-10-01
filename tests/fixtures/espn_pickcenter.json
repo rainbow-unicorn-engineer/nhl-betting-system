@@ -1,0 +1,217 @@
+{
+ "_source": "ESPN site summary API, pickcenter[0]; links, logos and disclaimers removed",
+ "draftkings_2025021229": {
+  "espn_event": "401803580",
+  "game": "TB@BUF 2026-04-06",
+  "block": {
+   "provider": {
+    "id": "100",
+    "name": "DraftKings"
+   },
+   "details": "TB -122",
+   "overUnder": 6.5,
+   "spread": 1.5,
+   "overOdds": -115.0,
+   "underOdds": -105.0,
+   "awayTeamOdds": {
+    "favorite": true,
+    "underdog": false,
+    "moneyLine": -122,
+    "spreadOdds": 205.0,
+    "teamId": "20",
+    "favoriteAtOpen": true
+   },
+   "homeTeamOdds": {
+    "favorite": false,
+    "underdog": true,
+    "moneyLine": 102,
+    "spreadOdds": -250.0,
+    "teamId": "2",
+    "favoriteAtOpen": false
+   },
+   "moneyline": {
+    "displayName": "Moneyline",
+    "shortDisplayName": "ML",
+    "home": {
+     "close": {
+      "odds": "+102"
+     },
+     "open": {
+      "odds": "-105"
+     }
+    },
+    "away": {
+     "close": {
+      "odds": "-122"
+     },
+     "open": {
+      "odds": "-115"
+     }
+    }
+   },
+   "pointSpread": {
+    "displayName": "Spread",
+    "shortDisplayName": "Spread",
+    "home": {
+     "close": {
+      "line": "+1.5",
+      "odds": "-250"
+     },
+     "open": {
+      "line": "+1.5",
+      "odds": "-265"
+     }
+    },
+    "away": {
+     "close": {
+      "line": "-1.5",
+      "odds": "+205"
+     },
+     "open": {
+      "line": "-1.5",
+      "odds": "+215"
+     }
+    }
+   },
+   "total": {
+    "displayName": "Total",
+    "shortDisplayName": "Total",
+    "over": {
+     "close": {
+      "line": "o6.5",
+      "odds": "-115"
+     },
+     "open": {
+      "line": "o6.5",
+      "odds": "+110"
+     }
+    },
+    "under": {
+     "close": {
+      "line": "u6.5",
+      "odds": "-105"
+     },
+     "open": {
+      "line": "u6.5",
+      "odds": "-130"
+     }
+    }
+   }
+  }
+ },
+ "unibet_2023021303": {
+  "espn_event": "401560531",
+  "game": "PIT@NYI 2024-04-17 (the current prices were captured in play)",
+  "block": {
+   "provider": {
+    "id": "36",
+    "name": "Unibet"
+   },
+   "details": "NYI -500",
+   "overUnder": 10.5,
+   "spread": -1.5,
+   "overOdds": 300.0,
+   "underOdds": -526.0,
+   "awayTeamOdds": {
+    "favorite": false,
+    "underdog": true,
+    "moneyLine": 4500,
+    "spreadOdds": -167.0,
+    "open": {
+     "favorite": true,
+     "pointSpread": {
+      "american": "-1.5"
+     },
+     "spread": {
+      "american": "+215"
+     },
+     "moneyLine": {
+      "american": "+145"
+     }
+    },
+    "current": {
+     "pointSpread": {
+      "american": "+1.5"
+     },
+     "spread": {
+      "american": "-167"
+     },
+     "moneyLine": {
+      "american": "+4500"
+     }
+    },
+    "teamId": "16"
+   },
+   "homeTeamOdds": {
+    "favorite": true,
+    "underdog": false,
+    "moneyLine": -500,
+    "spreadOdds": 128.0,
+    "open": {
+     "favorite": false,
+     "pointSpread": {
+      "american": "+1.5"
+     },
+     "spread": {
+      "american": "-278"
+     },
+     "moneyLine": {
+      "american": "+143"
+     }
+    },
+    "current": {
+     "pointSpread": {
+      "american": "-1.5"
+     },
+     "spread": {
+      "american": "+128"
+     },
+     "moneyLine": {
+      "american": "-500"
+     }
+    },
+    "teamId": "12"
+   },
+   "open": {
+    "over": {
+     "american": "-127"
+    },
+    "under": {
+     "american": "+105"
+    },
+    "total": {
+     "american": "5.5"
+    }
+   },
+   "current": {
+    "over": {
+     "american": "+300"
+    },
+    "under": {
+     "american": "-526"
+    },
+    "total": {
+     "american": "10.5"
+    }
+   },
+   "moneyline": {
+    "displayName": "Moneyline",
+    "shortDisplayName": "ML",
+    "home": {},
+    "away": {}
+   },
+   "pointSpread": {
+    "displayName": "Spread",
+    "shortDisplayName": "Spread",
+    "home": {},
+    "away": {}
+   },
+   "total": {
+    "displayName": "Total",
+    "shortDisplayName": "Total",
+    "over": {},
+    "under": {}
+   }
+  }
+ }
+}
