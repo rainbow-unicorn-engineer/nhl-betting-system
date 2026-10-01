@@ -1,7 +1,8 @@
 """
 Tests for ingestion/odds_api.py — event matching (pure), the in-play skip,
-and the guarantee that the API key never reaches the logs. No network:
-requests.get is mocked; no database: snapshot_odds runs on a fake engine.
+the named-bookmaker request and its credit cost, and the guarantee that
+the API key never reaches the logs. No network: requests.get is mocked;
+no database: snapshot_odds runs on a fake engine.
 """
 import datetime as dt
 import json
@@ -515,3 +516,168 @@ class TestRedaction:
         assert caplog.records
         assert FAKE_KEY not in _logged(caplog)
         assert "apiKey=***" in caplog.text
+
+
+# ── Named bookmakers instead of regions ────────────────────────────
+
+class TestBookSelection:
+    """bookmakers= (ten books = one region) replaces regions=us,us2 (two
+    regions), halving the cost and adding Kalshi and Polymarket."""
+
+    @pytest.fixture()
+    def sent(self, monkeypatch, fake_key):
+        """Params of every request fetch_current_odds makes."""
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append({"url": url, **params})
+            return _response(200, "OK", "[]", {"x-requests-last": "3"})
+        monkeypatch.setattr(odds_api.requests, "get", fake_get)
+        monkeypatch.delenv("ODDS_BOOKMAKERS", raising=False)
+        monkeypatch.delenv("ODDS_REGIONS", raising=False)
+        return calls
+
+    def test_default_request_names_ten_books_not_regions(self, sent):
+        assert odds_api.fetch_current_odds() == []
+        (params,) = sent
+        assert "regions" not in params
+        books = params["bookmakers"].split(",")
+        assert books == list(odds_api.DEFAULT_BOOKMAKERS)
+        assert len(books) == 10 and books[:2] == ["kalshi", "polymarket"]
+        assert {"pinnacle", "draftkings", "fanduel", "novig"} <= set(books)
+        assert params["url"] == f"{odds_api.BASE_URL}/sports/icehockey_nhl/odds"
+        assert params["oddsFormat"] == "american"
+
+    def test_empty_setting_falls_back_to_regions(self, sent, monkeypatch):
+        monkeypatch.setenv("ODDS_BOOKMAKERS", "")
+        odds_api.fetch_current_odds(markets="h2h")
+        monkeypatch.setenv("ODDS_BOOKMAKERS", "  ")
+        monkeypatch.setenv("ODDS_REGIONS", "us")
+        odds_api.fetch_current_odds(markets="h2h")
+        assert [p.get("regions") for p in sent] == ["us,us2", "us"]
+        assert not any("bookmakers" in p for p in sent)
+
+    def test_own_list_is_trimmed_lowercased_and_deduplicated(self, sent, monkeypatch):
+        monkeypatch.setenv("ODDS_BOOKMAKERS", " Kalshi , polymarket,kalshi,, ")
+        odds_api.fetch_current_odds()
+        assert sent[0]["bookmakers"] == "kalshi,polymarket"
+        assert "regions" not in sent[0]
+
+    def test_malformed_keys_dropped_with_an_error(self, sent, monkeypatch, caplog):
+        monkeypatch.setenv("ODDS_BOOKMAKERS", "kalshi,draft kings&x=1")
+        with caplog.at_level(logging.ERROR, logger="nhl.ingestion.odds_api"):
+            odds_api.fetch_current_odds()
+        assert sent[0]["bookmakers"] == "kalshi"
+        assert "not an Odds API bookmaker key" in caplog.text
+        # nothing usable at all: regions, and the error says so
+        monkeypatch.setenv("ODDS_BOOKMAKERS", "???")
+        with caplog.at_level(logging.ERROR, logger="nhl.ingestion.odds_api"):
+            odds_api.fetch_current_odds()
+        assert sent[1]["regions"] == "us,us2"
+        assert "names no usable bookmaker" in caplog.text
+
+    def test_more_than_ten_books_warns_that_the_cost_doubles(
+            self, sent, monkeypatch, caplog):
+        eleven = ",".join(odds_api.DEFAULT_BOOKMAKERS + ("bovada",))
+        monkeypatch.setenv("ODDS_BOOKMAKERS", eleven)
+        with caplog.at_level(logging.WARNING, logger="nhl.ingestion.odds_api"):
+            odds_api.fetch_current_odds()
+        assert len(sent[0]["bookmakers"].split(",")) == 11
+        assert "names 11 bookmakers" in caplog.text
+        assert "each market costs 2 credits instead of 1" in caplog.text
+
+    def test_exactly_ten_books_do_not_warn(self, sent, monkeypatch, caplog):
+        monkeypatch.setenv("ODDS_BOOKMAKERS", ",".join(odds_api.DEFAULT_BOOKMAKERS))
+        with caplog.at_level(logging.WARNING, logger="nhl.ingestion.odds_api"):
+            odds_api.fetch_current_odds()
+        assert "bookmakers." not in caplog.text and not caplog.records
+
+    def test_expected_cost_is_logged(self, sent, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO, logger="nhl.ingestion.odds_api"):
+            odds_api.fetch_current_odds()
+            odds_api.fetch_current_odds(markets="h2h")
+            monkeypatch.setenv("ODDS_BOOKMAKERS", "")
+            odds_api.fetch_current_odds()
+        text = caplog.text
+        assert "10 bookmakers: kalshi,polymarket" in text
+        assert "expected cost 3 credit(s)" in text        # 3 markets x 1
+        assert "expected cost 1 credit(s)" in text        # h2h x 1
+        assert "regions us,us2; expected cost 6 credit(s)" in text
+
+
+class TestCreditMath:
+    def test_region_units(self):
+        units = odds_api.region_units
+        assert units({"bookmakers": "a"}) == 1
+        assert units({"bookmakers": ",".join(f"b{i}" for i in range(10))}) == 1
+        assert units({"bookmakers": ",".join(f"b{i}" for i in range(11))}) == 2
+        assert units({"bookmakers": ",".join(f"b{i}" for i in range(20))}) == 2
+        assert units({"bookmakers": ",".join(f"b{i}" for i in range(21))}) == 3
+        assert units({"regions": "us,us2"}) == 2
+        assert units({"regions": "us,us2,us_ex"}) == 3
+
+    def test_expected_cost(self):
+        default = odds_api.book_selection({})
+        assert odds_api.expected_cost("h2h,spreads,totals", default) == 3
+        assert odds_api.expected_cost("h2h", default) == 1
+        regions = odds_api.book_selection({"ODDS_BOOKMAKERS": ""})
+        assert regions == {"regions": "us,us2"}
+        assert odds_api.expected_cost("h2h,spreads,totals", regions) == 6
+        assert odds_api.expected_cost("h2h", regions) == 2
+
+    def test_selection_reads_the_environment_given(self):
+        assert odds_api.book_selection({}) == {
+            "bookmakers": ",".join(odds_api.DEFAULT_BOOKMAKERS)}
+        assert odds_api.book_selection(
+            {"ODDS_BOOKMAKERS": "", "ODDS_REGIONS": " US , us_ex "}) == {
+            "regions": "us,us_ex"}
+        assert odds_api.book_selection(
+            {"ODDS_BOOKMAKERS": "", "ODDS_REGIONS": ""}) == {"regions": "us,us2"}
+
+
+class TestSharedGet:
+    """_get is the one place a request is made: other modules (the props
+    collector) call it for other endpoints and get the same key handling."""
+
+    def test_adds_the_key_and_returns_body_and_headers(self, monkeypatch, fake_key):
+        seen = []
+
+        def fake_get(url, params=None, timeout=None):
+            seen.append((url, params, timeout))
+            return _response(200, "OK", '[{"id": "e1"}]',
+                             {"x-requests-remaining": "497"})
+        monkeypatch.setattr(odds_api.requests, "get", fake_get)
+        body, headers = odds_api._get("sports/icehockey_nhl/events", {"x": "1"})
+        assert body == [{"id": "e1"}]
+        assert headers["x-requests-remaining"] == "497"
+        url, params, timeout = seen[0]
+        assert url == f"{odds_api.BASE_URL}/sports/icehockey_nhl/events"
+        assert params == {"apiKey": FAKE_KEY, "x": "1"}
+        assert timeout == odds_api.TIMEOUT_S
+
+    def test_failure_returns_none_and_never_logs_the_key(
+            self, monkeypatch, caplog, fake_key):
+        monkeypatch.setattr(odds_api.requests, "get",
+                            lambda *a, **k: _response(429, "Too Many Requests",
+                                                      f"slow down {FAKE_KEY}"))
+        with caplog.at_level(logging.DEBUG):
+            assert odds_api._get("/sports/icehockey_nhl/events/x/odds", {}) == (None, {})
+        text = _logged(caplog)
+        assert FAKE_KEY not in text
+        assert "Odds API request failed: HTTP 429 Too Many Requests" in text
+
+    def test_no_key_no_request(self, monkeypatch, caplog):
+        monkeypatch.setattr(odds_api, "ODDS_API_KEY", "")
+        monkeypatch.setattr(odds_api.requests, "get",
+                            lambda *a, **k: pytest.fail("request made"))
+        with caplog.at_level(logging.ERROR):
+            assert odds_api._get("/sports", {}) == (None, {})
+        assert "ODDS_API_KEY is not set" in caplog.text
+
+    def test_a_non_list_odds_body_is_an_error_not_a_crash(
+            self, monkeypatch, caplog, fake_key):
+        monkeypatch.setattr(odds_api.requests, "get",
+                            lambda *a, **k: _response(200, "OK", '{"message": "odd"}'))
+        with caplog.at_level(logging.ERROR):
+            assert odds_api.fetch_current_odds() == []
+        assert "expected a list of games, got dict" in caplog.text
