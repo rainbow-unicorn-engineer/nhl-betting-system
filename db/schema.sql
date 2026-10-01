@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS raw.skater_games (
     sh_toi_seconds  INTEGER DEFAULT 0,
     pp_goals        SMALLINT DEFAULT 0,
     pp_assists      SMALLINT DEFAULT 0,
+    stats_filled_at TIMESTAMP,                 -- when ingestion/nhl_stats filled pp/sh/fo columns (UTC); NULL = never, zeros are defaults
     PRIMARY KEY (player_id, game_id)
 );
 CREATE INDEX IF NOT EXISTS idx_skater_games_game ON raw.skater_games(game_id);
@@ -196,7 +197,10 @@ CREATE INDEX IF NOT EXISTS idx_odds_time ON raw.odds_snapshots(captured_at);
 -- Historical reference odds (one row per game) backfilled from ESPN's public
 -- summary API. Single book, near-closing line — good enough for a market
 -- feature and strategy backtests; NOT a substitute for our own multi-book
--- time series in raw.odds_snapshots.
+-- time series in raw.odds_snapshots. Opening values and the over/under and
+-- puck-line prices exist for some eras only (NULL otherwise); a backtest
+-- should use provider = 'DraftKings' rows (2025-26), whose capture times
+-- are pre-game.
 CREATE TABLE IF NOT EXISTS raw.historical_odds (
     game_id         BIGINT PRIMARY KEY REFERENCES raw.games(game_id),
     provider        VARCHAR(40),               -- e.g. DraftKings (varies by era)
@@ -205,8 +209,120 @@ CREATE TABLE IF NOT EXISTS raw.historical_odds (
     spread          NUMERIC(4,1),              -- home puck line
     over_under      NUMERIC(4,1),
     details         VARCHAR(40),               -- ESPN display string, e.g. "MTL -125"
-    fetched_at      TIMESTAMP NOT NULL DEFAULT now()
+    fetched_at      TIMESTAMP NOT NULL DEFAULT now(),
+    home_ml_open    INTEGER,                   -- opening moneylines
+    away_ml_open    INTEGER,
+    total_open      NUMERIC(4,1),              -- opening total line
+    over_price      INTEGER,                   -- closing over/under prices, at over_under
+    under_price     INTEGER,
+    over_price_open INTEGER,                   -- opening over/under prices, at total_open
+    under_price_open INTEGER,
+    spread_home_price INTEGER,                 -- closing puck-line prices, at spread
+    spread_away_price INTEGER,
+    spread_open     NUMERIC(4,1),              -- opening home puck line
+    spread_home_price_open INTEGER,
+    spread_away_price_open INTEGER,
+    espn_event_id   VARCHAR(12),               -- ESPN's id for the game
+    prices_fetched_at TIMESTAMP                -- when the price columns were parsed; NULL = never (espn_odds --refresh fills these)
 );
+
+-- The NHL's own free odds feed (api-web.nhle.com partner-game US/CA and the
+-- schedule's partner books), one row per source, book and market per
+-- snapshot. Kept apart from raw.odds_snapshots so the two can be compared
+-- (python pipeline.py compare-feeds). The feed keeps no history: a game's
+-- prices are gone once it is played.
+CREATE TABLE IF NOT EXISTS raw.nhl_feed_snapshots (
+    id                BIGSERIAL PRIMARY KEY,
+    captured_at       TIMESTAMP NOT NULL,       -- naive UTC, like raw.odds_snapshots
+    game_id           BIGINT NOT NULL REFERENCES raw.games(game_id),
+    source            VARCHAR(12) NOT NULL,     -- partner-US, partner-CA, schedule
+    book              VARCHAR(40) NOT NULL,     -- draftkings, fanduel, tipsport, ...
+    market            VARCHAR(6) NOT NULL,      -- ml, pl, total, ml3
+    home_price        INTEGER,                  -- American odds, e.g. -125, +105
+    away_price        INTEGER,
+    over_price        INTEGER,
+    under_price       INTEGER,
+    draw_price        INTEGER,                  -- ml3 only: a regulation tie
+    line              NUMERIC(4,1),             -- pl: home handicap (-1.5); total: 6.5
+    feed_updated_utc  TIMESTAMP                 -- the feed's lastUpdatedUTC (naive UTC); NULL for schedule; not a price timestamp
+);
+CREATE INDEX IF NOT EXISTS idx_nhl_feed_game ON raw.nhl_feed_snapshots(game_id);
+CREATE INDEX IF NOT EXISTS idx_nhl_feed_time ON raw.nhl_feed_snapshots(captured_at);
+
+-- ESPN's injury list (ingestion/espn_injuries.py). ESPN serves only the
+-- current list, so one snapshot is kept per day; a re-run replaces the day.
+CREATE TABLE IF NOT EXISTS raw.injuries (
+    snapshot_date    DATE NOT NULL,            -- local date the list was saved
+    espn_athlete_id  BIGINT NOT NULL,
+    player_name      VARCHAR(80) NOT NULL,     -- as ESPN publishes it
+    team_abbrev      VARCHAR(3),               -- NHL abbreviation (LAK, not LA)
+    position         VARCHAR(2),               -- C, L, R, D, G
+    status           VARCHAR(30),              -- Day-To-Day, Out, Injured Reserve, Suspension
+    injury_type      VARCHAR(60),              -- e.g. Upper Body, Hip
+    injury_detail    VARCHAR(60),              -- e.g. Surgery, Strain; often NULL
+    return_date      DATE,                     -- ESPN's expected return
+    short_comment    TEXT,
+    long_comment     TEXT,
+    reported_at      TIMESTAMPTZ,              -- ESPN's date on the entry
+    player_id        INTEGER,                  -- raw.players id; NULL when unresolved
+    fetched_at       TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (snapshot_date, espn_athlete_id)
+);
+CREATE INDEX IF NOT EXISTS idx_injuries_player ON raw.injuries(player_id, snapshot_date);
+
+-- Past player-prop prices from ESPN's core API (ingestion/espn_props.py):
+-- DraftKings on some 2025-26 dates and the playoffs, ESPN BET (opening
+-- prices only) in October-November 2025. A price updated after puck drop
+-- is dropped; the opening price is kept only at the stored line.
+CREATE TABLE IF NOT EXISTS raw.prop_odds_hist (
+    game_id          BIGINT NOT NULL REFERENCES raw.games(game_id),
+    espn_event_id    VARCHAR(12) NOT NULL,
+    book             VARCHAR(40) NOT NULL,     -- ESPN's provider name: DraftKings, ESPN BET
+    market           VARCHAR(40) NOT NULL,     -- Odds API style key, e.g. player_shots_on_goal
+    player_name      VARCHAR(80),              -- as ESPN publishes it
+    espn_athlete_id  BIGINT NOT NULL,
+    player_id        INTEGER,                  -- raw.players id; NULL when unresolved
+    line             NUMERIC(4,1) NOT NULL,
+    over_price       INTEGER,                  -- last pre-game price; NULL if updated in play
+    under_price      INTEGER,
+    over_price_open  INTEGER,                  -- opening price at this line
+    under_price_open INTEGER,
+    last_updated     TIMESTAMPTZ,              -- ESPN's last update of the line
+    event_start      TIMESTAMPTZ,              -- scheduled puck drop (ESPN)
+    fetched_at       TIMESTAMP NOT NULL DEFAULT now(),
+    UNIQUE (game_id, book, market, espn_athlete_id, line)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_odds_hist_player ON raw.prop_odds_hist(player_id, market);
+
+-- The games the ESPN props backfill has fetched (with or without props),
+-- so a re-run resumes where the last one stopped
+CREATE TABLE IF NOT EXISTS raw.prop_odds_fetches (
+    game_id        BIGINT PRIMARY KEY REFERENCES raw.games(game_id),
+    espn_event_id  VARCHAR(12),                -- NULL: not on ESPN's scoreboard
+    books          VARCHAR(120),               -- books that had props, comma-separated
+    n_rows         INTEGER NOT NULL DEFAULT 0,
+    fetched_at     TIMESTAMP NOT NULL DEFAULT now()
+);
+
+-- Live player-prop lines from The Odds API (ingestion/props_odds.py, the
+-- props machine's job): a morning snapshot and one just before puck drop
+CREATE TABLE IF NOT EXISTS raw.prop_snapshots (
+    snapshot_id     BIGSERIAL PRIMARY KEY,
+    captured_at     TIMESTAMP NOT NULL,            -- naive UTC, when the request returned
+    game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
+    event_id        VARCHAR(64) NOT NULL,          -- The Odds API event id
+    book            VARCHAR(40) NOT NULL,          -- Odds API bookmaker key
+    market          VARCHAR(60) NOT NULL,          -- e.g. player_shots_on_goal
+    player_name     VARCHAR(80) NOT NULL,          -- as the book publishes it
+    player_id       INTEGER,                       -- raw.players id; NULL when unresolved
+    line            NUMERIC(5,1),                  -- NULL for yes/no markets
+    over_price      INTEGER,                       -- American odds; Yes for yes/no markets
+    under_price     INTEGER,                       -- No for yes/no markets
+    book_updated_at TIMESTAMP                      -- the market's last_update, naive UTC
+);
+CREATE INDEX IF NOT EXISTS idx_prop_snapshots_game ON raw.prop_snapshots(game_id);
+CREATE INDEX IF NOT EXISTS idx_prop_snapshots_event ON raw.prop_snapshots(event_id, captured_at);
+CREATE INDEX IF NOT EXISTS idx_prop_snapshots_player ON raw.prop_snapshots(player_id, market);
 
 -- Confirmed starting goalies scraped from Daily Faceoff (Phase 4).
 -- One row per (game_date, team), upserted as confirmations roll in.

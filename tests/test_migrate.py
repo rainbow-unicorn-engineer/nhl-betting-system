@@ -99,3 +99,169 @@ def test_every_upgrade_column_is_in_schema_sql():
 def test_recommendations_store_the_scheduled_start():
     assert ("betting", "recommendations", "scheduled_start",
             "TIMESTAMPTZ") in migrate.COLUMNS
+
+
+# ── New tables (TABLES) ────────────────────────────────────────────
+
+import re  # noqa: E402
+
+_SCHEMA_SQL = (migrate.PROJECT_ROOT / "db" / "schema.sql").read_text(encoding="utf-8")
+
+
+def _table_body(sql: str, schema: str, table: str) -> str:
+    """The text between the parentheses of one CREATE TABLE statement."""
+    m = re.search(rf"CREATE TABLE IF NOT EXISTS {schema}\.{table} \((.*?)\n\s*\)\s*(;|$)",
+                  sql, re.S)
+    assert m, f"no CREATE TABLE for {schema}.{table}"
+    return m.group(1)
+
+
+def _definitions(body: str) -> dict:
+    """{column: definition} plus {'constraints': [...]}, comments removed and
+    spaces collapsed, so two copies compare on what they declare."""
+    cols, constraints = {}, []
+    for raw in body.splitlines():
+        line = re.sub(r"--.*$", "", raw).strip().rstrip(",").strip()
+        if not line:
+            continue
+        line = " ".join(line.split())
+        if line.upper().startswith(("PRIMARY KEY (", "UNIQUE (")):
+            constraints.append(line)
+        else:
+            name, _, definition = line.partition(" ")
+            cols[name] = definition
+    return {"columns": cols, "constraints": constraints}
+
+
+def _create_table(statements) -> str:
+    (stmt,) = [s for s in statements if "CREATE TABLE" in s]
+    return stmt
+
+
+def _indexes(statements) -> list:
+    return [" ".join(s.split()) for s in statements if "CREATE INDEX" in s]
+
+
+def test_tables_hold_only_new_tables_with_their_ddl():
+    names = [(s, t) for s, t, _ in migrate.TABLES]
+    assert names == [("raw", "nhl_feed_snapshots"), ("raw", "injuries"),
+                     ("raw", "prop_odds_hist"), ("raw", "prop_odds_fetches"),
+                     ("raw", "prop_snapshots")]
+    for schema, table, statements in migrate.TABLES:
+        create = _create_table(statements)
+        assert f"CREATE TABLE IF NOT EXISTS {schema}.{table} (" in create
+        for idx in _indexes(statements):
+            assert idx.startswith("CREATE INDEX IF NOT EXISTS ")
+            assert f" ON {schema}.{table}(" in idx
+
+
+def test_every_new_table_is_in_schema_sql_with_the_same_columns():
+    """A fresh database (schema.sql) and an upgraded one (TABLES) must end
+    up with the same tables, column for column."""
+    for schema, table, statements in migrate.TABLES:
+        mine = _definitions(_table_body(_create_table(statements), schema, table))
+        declared = _definitions(_table_body(_SCHEMA_SQL, schema, table))
+        assert mine == declared, f"{schema}.{table} differs from db/schema.sql"
+
+
+def test_every_new_index_is_in_schema_sql():
+    flat = " ".join(_SCHEMA_SQL.split())
+    for schema, table, statements in migrate.TABLES:
+        for idx in _indexes(statements):
+            assert idx + ";" in flat, f"{idx} not in db/schema.sql"
+
+
+def test_module_ddl_matches_migrate():
+    """Each module applies its own copy of the DDL on first use; it must
+    declare exactly what migrate and schema.sql declare."""
+    from ingestion import espn_injuries, espn_odds, espn_props, nhl_odds, nhl_stats, props_odds
+    by_table = {t: s for _, t, s in migrate.TABLES}
+    for module_ddl in (nhl_odds.DDL, espn_injuries.DDL, espn_props.DDL, props_odds.DDL):
+        for stmt in module_ddl:
+            if "CREATE TABLE" in stmt:
+                table = re.search(r"CREATE TABLE IF NOT EXISTS raw\.(\w+)", stmt).group(1)
+                assert (_definitions(_table_body(stmt, "raw", table))
+                        == _definitions(_table_body(_create_table(by_table[table]),
+                                                    "raw", table))), table
+            else:
+                table = re.search(r" ON raw\.(\w+)\(", stmt).group(1)
+                assert " ".join(stmt.split()) in _indexes(by_table[table]), stmt
+    assert set(espn_odds.HISTORICAL_ODDS_COLUMNS) <= set(migrate.COLUMNS)
+    assert ("raw", "skater_games", "stats_filled_at", "TIMESTAMP") in migrate.COLUMNS
+    assert nhl_stats.DDL == ["ALTER TABLE raw.skater_games ADD COLUMN IF NOT EXISTS "
+                             "stats_filled_at TIMESTAMP"]
+
+
+# ── ensure_schema on a fake connection ─────────────────────────────
+
+class _SchemaConn:
+    def __init__(self, tables, columns):
+        self.tables, self.columns, self.ddl = tables, columns, []
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if "information_schema.tables" in sql:
+            return iter(self.tables)
+        if "information_schema.columns" in sql:
+            return iter(self.columns)
+        self.ddl.append(" ".join(sql.split()))
+        return None
+
+
+class _SchemaEngine:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @contextmanager
+    def begin(self):
+        yield self.conn
+
+
+def _all_tables():
+    return [(s, t) for s, t, _ in migrate.TABLES] + [
+        (s, t) for s, t, _, _ in migrate.COLUMNS]
+
+
+def _all_columns():
+    return [(s, t, c) for s, t, c, _ in migrate.COLUMNS]
+
+
+def _run_ensure_schema(monkeypatch, tables, columns):
+    conn = _SchemaConn(tables, columns)
+    monkeypatch.setattr(migrate, "engine", _SchemaEngine(conn))
+    monkeypatch.setattr(migrate, "_done", False)
+    migrate.ensure_schema()
+    return conn
+
+
+def test_up_to_date_database_runs_no_ddl(monkeypatch):
+    conn = _run_ensure_schema(monkeypatch, _all_tables(), _all_columns())
+    assert conn.ddl == []
+
+
+def test_missing_table_is_created_with_its_indexes(monkeypatch):
+    tables = [t for t in _all_tables() if t != ("raw", "prop_snapshots")]
+    conn = _run_ensure_schema(monkeypatch, tables, _all_columns())
+    assert len(conn.ddl) == 4
+    assert conn.ddl[0].startswith("CREATE TABLE IF NOT EXISTS raw.prop_snapshots (")
+    assert all(s.startswith("CREATE INDEX IF NOT EXISTS idx_prop_snapshots_")
+               for s in conn.ddl[1:])
+
+
+def test_missing_columns_are_added(monkeypatch):
+    columns = [c for c in _all_columns()
+               if c[1] != "historical_odds" and c[2] != "stats_filled_at"]
+    conn = _run_ensure_schema(monkeypatch, _all_tables(), columns)
+    assert len(conn.ddl) == 15
+    assert ("ALTER TABLE raw.historical_odds ADD COLUMN IF NOT EXISTS "
+            "over_price INTEGER") in conn.ddl
+    assert ("ALTER TABLE raw.skater_games ADD COLUMN IF NOT EXISTS "
+            "stats_filled_at TIMESTAMP") in conn.ddl
+
+
+def test_ensure_schema_runs_once_per_process(monkeypatch):
+    conn = _run_ensure_schema(monkeypatch, [], [])
+    first = len(conn.ddl)
+    assert first > 0
+    migrate.ensure_schema()
+    assert len(conn.ddl) == first
