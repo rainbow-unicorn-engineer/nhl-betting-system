@@ -2,15 +2,32 @@
 pipeline.py
 Master orchestrator for the NHL Betting System data pipeline.
 
-Usage:
+Usage (`python pipeline.py --help` lists every command; `<command> --help`
+prints that command's options and runs nothing):
     python pipeline.py setup                        # First-time setup verification
     python pipeline.py status                       # Check database status
     python pipeline.py backfill                     # Full historical backfill (BACKFILL_SEASONS)
     python pipeline.py features [--season YYYYYYYY] # Build feature store (all seasons by default)
-    python pipeline.py daily                        # Daily refresh, run via launchd (ops/launchd/)
-    python pipeline.py close [--due]                # Pre-puck-drop moneyline snapshot (2 credits)
+    python pipeline.py daily                        # Daily refresh + picks (the picks machine)
+    python pipeline.py odds                         # Midday snapshot (3 credits) + picks + alerts
+    python pipeline.py close [--due]                # Pre-puck-drop moneyline snapshot (1 credit)
+    python pipeline.py refresh                      # Free data only: no odds, no picks (props)
+    python pipeline.py props [--due]                # Player-props snapshot (the props machine)
+    python pipeline.py nhl-odds                     # Free snapshot of the NHL's own odds feed
+    python pipeline.py compare-feeds [--date D]     # NHL feed vs The Odds API, stored prices
+    python pipeline.py injuries                     # ESPN injury list snapshot (free)
+    python pipeline.py nhl-stats [--season S]       # Power-play, penalty-kill, faceoff stats (free)
+
+Machine roles: each machine has its own .env, Odds API key (500 free
+credits a month each) and database. The picks machine (the Mac) runs
+daily, odds and close; the props machine (the Windows PC) runs refresh,
+props and props --due. ops/launchd/ and ops/windows/ schedule them.
+
+Steps marked non-fatal log an error and let the chain continue.
 """
+import argparse
 import sys
+from datetime import date
 
 from config.settings import (check_db_connection, engine, BACKFILL_SEASONS,
                              local_today, logger)
@@ -41,6 +58,15 @@ def db_status():
         "Skater game logs": "SELECT COUNT(*) FROM raw.skater_games",
         "Goalie game logs": "SELECT COUNT(*) FROM raw.goalie_games",
         "Odds snapshots": "SELECT COUNT(*) FROM raw.odds_snapshots",
+        "NHL feed snapshots (free)": "SELECT COUNT(*) FROM raw.nhl_feed_snapshots",
+        "ESPN lines": "SELECT COUNT(*) FROM raw.historical_odds",
+        "ESPN lines with O/U prices": "SELECT COUNT(*) FROM raw.historical_odds "
+                                      "WHERE over_price IS NOT NULL",
+        "Skater games with PP stats": "SELECT COUNT(*) FROM raw.skater_games "
+                                      "WHERE stats_filled_at IS NOT NULL",
+        "Injury list rows": "SELECT COUNT(*) FROM raw.injuries",
+        "Prop lines (live, Odds API)": "SELECT COUNT(*) FROM raw.prop_snapshots",
+        "Prop lines (history, ESPN)": "SELECT COUNT(*) FROM raw.prop_odds_hist",
         "Players": "SELECT COUNT(*) FROM raw.players",
     }
 
@@ -145,16 +171,90 @@ def recommend():
         logger.error(f"Recommendation job failed (non-fatal): {e}")
 
 
+def nhl_feed(skip_when_idle: bool = True):
+    """Free snapshot of the NHL's own odds feed (DraftKings, FanDuel Canada
+    and the schedule's partner books) into raw.nhl_feed_snapshots
+    (non-fatal, no credits: three requests to api-web.nhle.com). The odds
+    and close chains take one right after each Odds API snapshot, so
+    `compare-feeds` has a free price within minutes of every paid one.
+    skip_when_idle: no request when no game starts in the next 24 hours."""
+    try:
+        from ingestion.nhl_odds import snapshot as nhl_snapshot
+        nhl_snapshot(skip_when_idle=skip_when_idle)
+    except Exception as e:
+        logger.error(f"NHL feed snapshot failed (non-fatal): {e}")
+
+
+def injuries():
+    """Today's ESPN injury list into raw.injuries (non-fatal, one free
+    request). ESPN keeps no history, so a day without a run has no list."""
+    try:
+        from ingestion.espn_injuries import ingest_injuries
+        ingest_injuries()
+    except Exception as e:
+        logger.error(f"ESPN injury snapshot failed (non-fatal): {e}")
+
+
+def nhl_stats(season=None):
+    """Power-play and penalty-kill ice time, power-play goals and assists,
+    and faceoffs for raw.skater_games from the free NHL stats API
+    (non-fatal). With no season: only the current season's dates whose
+    rows are still unfilled (3 requests on a normal day, none when every
+    row is filled). With a season: that whole season (about 27 requests)."""
+    try:
+        from ingestion import nhl_stats as stats
+        summary = stats.fill_season(season) if season else stats.fill_missing()
+        if summary.get("failed_windows"):
+            logger.error(f"NHL stats: {summary['failed_windows']} window(s) failed "
+                         f"(non-fatal; the next run retries them)")
+    except Exception as e:
+        logger.error(f"NHL stats fill failed (non-fatal): {e}")
+
+
+def props(due: bool = False, markets=None):
+    """Player-props snapshot from The Odds API into raw.prop_snapshots
+    (non-fatal). The props machine's job, never part of `daily`. Morning:
+    every game starting in the next 24 hours, 1 credit a game per market
+    returned. due=True (`props --due`, every 15 minutes): only games
+    starting within PROPS_CLOSE_LEAD_MINUTES (16) with no prop snapshot in
+    the last PROPS_CLOSE_MIN_GAP_MINUTES (16). See ingestion/props_odds.py."""
+    if not _wait_for_network():
+        return
+    try:
+        from ingestion.props_odds import snapshot_props
+        snapshot_props(markets=markets, due=due)
+    except Exception as e:
+        logger.error(f"Props snapshot failed (non-fatal): {e}")
+
+
+def refresh():
+    """The props machine's daily run: free data only, no Odds API request
+    and no picks. Refreshes the schedule (which props matching needs) and
+    box scores, fills power-play stats for newly finished games, and saves
+    the ESPN injury list."""
+    from ingestion.nhl_api import daily_refresh
+
+    logger.info(f"DATA REFRESH (no odds, no picks) — {local_today()}")
+    if not _wait_for_network():
+        return
+    daily_refresh()
+    nhl_stats()
+    injuries()
+    logger.info("DATA REFRESH COMPLETE")
+
+
 def odds():
-    """Full odds snapshot (6 credits) + starters, then recommendations for
-    games that have no pick yet (issued picks stay frozen) + arb/middle
-    alerts: this is the freshest-lines moment. For the closing line
-    alone, `close` is cheaper (2 credits)."""
+    """Full odds snapshot (3 credits with the default ODDS_BOOKMAKERS) +
+    a free NHL-feed snapshot + starters, then recommendations for games
+    that have no pick yet (issued picks stay frozen) + arb/middle alerts:
+    this is the freshest-lines moment. For the closing line alone, `close`
+    is cheaper (1 credit)."""
     from ingestion.odds_api import snapshot_odds
 
     if not _wait_for_network():
         return
     snapshot_odds()
+    nhl_feed()      # free, paired with the paid snapshot for compare-feeds
     starters()      # confirmations roll in through gameday
     recommend()
     try:
@@ -165,7 +265,8 @@ def odds():
 
 
 def close(due: bool = False):
-    """Closing-line snapshot: moneyline only (markets=h2h, 2 credits), no
+    """Closing-line snapshot: moneyline only (markets=h2h, 1 credit with
+    the default ODDS_BOOKMAKERS), then a free NHL-feed snapshot; no
     recommendations, no alerts. It becomes the close that settlement
     grades each pick against.
 
@@ -185,10 +286,12 @@ def close(due: bool = False):
     if not _wait_for_network():
         return
     odds_api.snapshot_odds(markets="h2h")
+    nhl_feed()      # free, paired with the close for compare-feeds
 
 
 def daily():
-    """Daily refresh pipeline. Run via launchd (ops/launchd/)."""
+    """Daily refresh pipeline for the picks machine. Run via launchd
+    (ops/launchd/) or Task Scheduler (ops/windows/, -Role picks)."""
     from ingestion.nhl_api import daily_refresh
     from ingestion.odds_api import snapshot_odds
     from config.settings import CURRENT_SEASON
@@ -198,12 +301,17 @@ def daily():
         return
     daily_refresh()
     snapshot_odds()
-    # ESPN reference-line top-up for newly-final games (no-op when current)
+    nhl_feed()      # free, paired with the paid snapshot for compare-feeds
+    # ESPN reference-line top-up for newly-final games (no-op when current);
+    # it also stores their opening and over/under prices
     try:
         from ingestion.espn_odds import backfill_historical_odds
         backfill_historical_odds(CURRENT_SEASON)
     except Exception as e:
         logger.error(f"ESPN odds top-up failed (non-fatal): {e}")
+    # Power-play / penalty-kill time and faceoffs for yesterday's box scores
+    # (before the feature rebuild, which reads them)
+    nhl_stats()
     # MoneyPuck shots (xG) for the season so far — shot-based features go
     # stale in season without this
     try:
@@ -216,6 +324,7 @@ def daily():
     features(season=CURRENT_SEASON)
     settle()        # yesterday's finals + closing snapshots are in
     starters()
+    injuries()      # ESPN keeps no history: save today's list before picks
     recommend()
     logger.info("DAILY REFRESH COMPLETE")
 
@@ -270,79 +379,138 @@ def setup_check():
     print()
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("""
-NHL Betting System Pipeline
-============================
-Usage:
-    python pipeline.py setup       Check prerequisites
-    python pipeline.py status      Database population status
-    python pipeline.py backfill    Full historical backfill (BACKFILL_FIRST_SEASON..current)
-    python pipeline.py features    Build feature store [--season YYYYYYYY]
-    python pipeline.py daily       Daily refresh (schedule + boxscores + odds + shots + features + recs)
-    python pipeline.py odds        Odds snapshot + starters + recommendation refresh
-    python pipeline.py close       Closing-line snapshot before puck drop (moneyline only, 2 credits)
-                                   [--due: only if a game starts soon and no recent snapshot]
-    python pipeline.py recommend   Score today's slate -> betting.recommendations
-    python pipeline.py starters    Ingest Daily Faceoff confirmed goalies
-    python pipeline.py settle      Settle paper bets + rebuild bankroll/CLV ledger
-        """)
-        sys.exit(0)
+# ── Command line ───────────────────────────────────────────────────
 
-    cmd = sys.argv[1].lower()
+def _season_value(value: str) -> int:
+    v = value.strip()
+    if len(v) == 8 and v.isdigit() and int(v[4:]) == int(v[:4]) + 1:
+        return int(v)
+    raise argparse.ArgumentTypeError(f"{value!r} is not a season like 20252026")
 
+
+def _date_value(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a date like 2026-09-29")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python pipeline.py",
+        description="NHL Betting System pipeline. `<command> --help` prints a "
+                    "command's options and runs nothing.",
+        epilog="Machine roles: the picks machine (the Mac) runs daily, odds and "
+               "close; the props machine (the Windows PC) runs refresh, props and "
+               "props --due. Each machine has its own .env, Odds API key and "
+               "database.")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name, text):
+        return sub.add_parser(name, help=text, description=text)
+
+    add("setup", "Check prerequisites: the database (adding any missing tables "
+                 "and columns), nhlpy, the Odds API key; seed the venues")
+    add("status", "Database population status")
+    add("backfill", "Full historical backfill (BACKFILL_FIRST_SEASON through the "
+                    "current season)")
+    p = add("features", "Build the feature store")
+    p.add_argument("--season", type=int, default=None, metavar="YYYYYYYY",
+                   help="one season, such as 20252026 (default: every season)")
+    add("daily", "The picks machine's daily run: schedule and box scores, odds "
+                 "snapshot (3 credits), free NHL-feed snapshot, ESPN lines, "
+                 "power-play stats, shots, features, settlement, starters, "
+                 "injuries, picks")
+    add("odds", "Odds snapshot (3 credits) + free NHL-feed snapshot + starters + "
+                "picks for games without one + arbitrage/middle alerts")
+    p = add("close", "Closing-line snapshot before puck drop: moneyline only "
+                     "(1 credit), then a free NHL-feed snapshot")
+    p.add_argument("--due", action="store_true",
+                   help="only if a game starts within CLOSE_LEAD_MINUTES (16) and no "
+                        "moneyline snapshot is under CLOSE_MIN_GAP_MINUTES (16) old")
+    add("recommend", "Score today's slate into betting.recommendations")
+    add("starters", "Starting goalies from Daily Faceoff")
+    add("settle", "Settle paper bets and rebuild the bankroll and CLV ledger")
+    add("refresh", "The props machine's daily run: schedule and box scores, "
+                   "power-play stats, ESPN injuries. No odds request, no picks")
+    p = add("props", "Player-props snapshot from The Odds API into "
+                     "raw.prop_snapshots (the props machine; 1 credit a game per "
+                     "market returned)")
+    p.add_argument("--due", action="store_true",
+                   help="pre-game form, every 15 minutes: only games starting within "
+                        "PROPS_CLOSE_LEAD_MINUTES (16) with no prop snapshot in the "
+                        "last PROPS_CLOSE_MIN_GAP_MINUTES (16)")
+    p.add_argument("--markets", default=None,
+                   help="comma-separated Odds API prop markets (default: "
+                        "PROPS_MARKETS, else player_shots_on_goal)")
+    add("nhl-odds", "Free snapshot of the NHL's own odds feed into "
+                    "raw.nhl_feed_snapshots (no credits)")
+    p = add("compare-feeds", "Compare stored NHL-feed prices with The Odds API's "
+                             "for one date (reads only)")
+    p.add_argument("--date", type=_date_value, default=None, metavar="YYYY-MM-DD",
+                   help="schedule date (default: today's local date)")
+    p.add_argument("--detail", action="store_true", help="also list every paired price")
+    add("injuries", "Save today's ESPN injury list into raw.injuries (free)")
+    p = add("nhl-stats", "Fill power-play / penalty-kill ice time, power-play "
+                         "points and faceoffs in raw.skater_games (free)")
+    p.add_argument("--season", type=_season_value, default=None, metavar="YYYYYYYY",
+                   help="fill this whole season (about 27 requests; default: only "
+                        "the current season's dates with unfilled rows)")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    cmd = args.command
+    if cmd is None:
+        parser.print_help()
+        return 0
     if cmd == "setup":
         setup_check()
-    elif cmd == "status":
+        return 0
+    if cmd == "status":
         db_status()
-    elif cmd == "backfill":
-        if not db_ready():
+        return 0
+    if not db_ready():
+        if cmd in ("backfill", "features"):
             print("ERROR: Database not reachable. Run: docker compose up -d")
-            sys.exit(1)
+        else:
+            logger.error("Database not reachable")
+        return 1
+
+    if cmd == "backfill":
         backfill()
     elif cmd == "features":
-        if not db_ready():
-            print("ERROR: Database not reachable. Run: docker compose up -d")
-            sys.exit(1)
-        season = None
-        if "--season" in sys.argv:
-            try:
-                season = int(sys.argv[sys.argv.index("--season") + 1])
-            except (IndexError, ValueError):
-                print("ERROR: --season requires a value like 20242025")
-                sys.exit(1)
-        features(season)
+        features(args.season)
+    elif cmd == "daily":
+        daily()
     elif cmd == "odds":
-        if not db_ready():
-            logger.error("Database not reachable")
-            sys.exit(1)
         odds()
     elif cmd == "close":
-        if not db_ready():
-            logger.error("Database not reachable")
-            sys.exit(1)
-        close(due="--due" in sys.argv[2:])
+        close(due=args.due)
     elif cmd == "recommend":
-        if not db_ready():
-            logger.error("Database not reachable")
-            sys.exit(1)
         recommend()
     elif cmd == "starters":
-        if not db_ready():
-            logger.error("Database not reachable")
-            sys.exit(1)
         starters()
     elif cmd == "settle":
-        if not db_ready():
-            logger.error("Database not reachable")
-            sys.exit(1)
         settle()
-    elif cmd == "daily":
-        if not db_ready():
-            logger.error("Database not reachable")
-            sys.exit(1)
-        daily()
-    else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
+    elif cmd == "refresh":
+        refresh()
+    elif cmd == "props":
+        props(due=args.due, markets=args.markets)
+    elif cmd == "nhl-odds":
+        if _wait_for_network():
+            nhl_feed(skip_when_idle=False)
+    elif cmd == "compare-feeds":
+        from ingestion.nhl_odds import compare_feeds, format_report
+        print(format_report(compare_feeds(args.date), detail=args.detail))
+    elif cmd == "injuries":
+        injuries()
+    elif cmd == "nhl-stats":
+        nhl_stats(args.season)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

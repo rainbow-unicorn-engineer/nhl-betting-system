@@ -10,6 +10,7 @@ def test_close_is_a_moneyline_only_snapshot(monkeypatch):
     from ingestion import odds_api
     calls = []
     monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(pipeline, "nhl_feed", lambda **kw: calls.append("nhl_feed"))
     monkeypatch.setattr(odds_api, "snapshot_odds",
                         lambda **kw: calls.append(kw) or 0)
     monkeypatch.setattr(pipeline, "recommend",
@@ -17,7 +18,7 @@ def test_close_is_a_moneyline_only_snapshot(monkeypatch):
     monkeypatch.setattr(pipeline, "starters",
                         lambda: pytest.fail("close must not fetch starters"))
     pipeline.close()
-    assert calls == [{"markets": "h2h"}]
+    assert calls == [{"markets": "h2h"}, "nhl_feed"]
 
 
 def test_close_waits_for_network(monkeypatch):
@@ -25,6 +26,8 @@ def test_close_waits_for_network(monkeypatch):
     monkeypatch.setattr(pipeline, "_wait_for_network", lambda: False)
     monkeypatch.setattr(odds_api, "snapshot_odds",
                         lambda **kw: pytest.fail("no network, no snapshot"))
+    monkeypatch.setattr(pipeline, "nhl_feed",
+                        lambda **kw: pytest.fail("no network, no NHL feed"))
     pipeline.close()
 
 
@@ -36,6 +39,8 @@ def test_close_due_skips_when_not_due(monkeypatch):
                         lambda: pytest.fail("not due: no network wait"))
     monkeypatch.setattr(odds_api, "snapshot_odds",
                         lambda **kw: pytest.fail("not due: no snapshot"))
+    monkeypatch.setattr(pipeline, "nhl_feed",
+                        lambda **kw: pytest.fail("not due: no NHL feed either"))
     pipeline.close(due=True)
 
 
@@ -44,10 +49,11 @@ def test_close_due_snapshots_moneyline_when_due(monkeypatch):
     calls = []
     monkeypatch.setattr(odds_api, "close_is_due", lambda: (True, "1 game soon"))
     monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(pipeline, "nhl_feed", lambda **kw: calls.append("nhl_feed"))
     monkeypatch.setattr(odds_api, "snapshot_odds",
                         lambda **kw: calls.append(kw) or 0)
     pipeline.close(due=True)
-    assert calls == [{"markets": "h2h"}]
+    assert calls == [{"markets": "h2h"}, "nhl_feed"]
 
 
 def test_plain_close_does_not_check_timing(monkeypatch):
@@ -56,6 +62,7 @@ def test_plain_close_does_not_check_timing(monkeypatch):
     monkeypatch.setattr(odds_api, "close_is_due",
                         lambda: pytest.fail("plain close never checks"))
     monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(pipeline, "nhl_feed", lambda **kw: None)
     monkeypatch.setattr(odds_api, "snapshot_odds",
                         lambda **kw: calls.append(kw) or 0)
     pipeline.close()
@@ -106,3 +113,193 @@ def test_setup_seeds_venues_only_when_missing(monkeypatch):
     monkeypatch.setattr(migrate, "venues_missing", lambda: False)
     assert pipeline.seed_venues_if_missing() == "OK"
     assert seeded == [1]
+
+
+# ── The chains: which steps run, in what order, and which are non-fatal ──
+
+def _record_chain(monkeypatch, calls):
+    """Stub every step the chains call, recording each by name."""
+    from ingestion import espn_odds, moneypuck, nhl_api, odds_api
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(nhl_api, "daily_refresh", lambda: calls.append("daily_refresh"))
+    monkeypatch.setattr(odds_api, "snapshot_odds",
+                        lambda **kw: calls.append(("snapshot_odds", kw)) or 0)
+    monkeypatch.setattr(espn_odds, "backfill_historical_odds",
+                        lambda season: calls.append("espn_lines"))
+    monkeypatch.setattr(moneypuck, "refresh_season", lambda season: calls.append("moneypuck"))
+    monkeypatch.setattr(pipeline, "features", lambda season=None: calls.append("features"))
+    for step in ("settle", "starters", "recommend", "injuries"):
+        monkeypatch.setattr(pipeline, step, lambda step=step: calls.append(step))
+    monkeypatch.setattr(pipeline, "nhl_feed", lambda **kw: calls.append("nhl_feed"))
+    monkeypatch.setattr(pipeline, "nhl_stats",
+                        lambda season=None: calls.append("nhl_stats"))
+    monkeypatch.setattr(pipeline, "props",
+                        lambda **kw: pytest.fail("props never runs in a chain"))
+
+
+def test_daily_adds_the_free_feeds_in_order(monkeypatch):
+    calls = []
+    _record_chain(monkeypatch, calls)
+    pipeline.daily()
+    assert calls == ["daily_refresh", ("snapshot_odds", {}), "nhl_feed", "espn_lines",
+                     "nhl_stats", "moneypuck", "features", "settle", "starters",
+                     "injuries", "recommend"]
+
+
+def test_odds_pairs_its_snapshot_with_a_free_nhl_feed_snapshot(monkeypatch):
+    from betting import alerts
+    calls = []
+    _record_chain(monkeypatch, calls)
+    monkeypatch.setattr(alerts, "run_alerts", lambda: calls.append("alerts"))
+    pipeline.odds()
+    assert calls == [("snapshot_odds", {}), "nhl_feed", "starters", "recommend", "alerts"]
+
+
+def test_refresh_is_free_data_only(monkeypatch):
+    """The props machine's daily run: no Odds API request, no picks."""
+    from ingestion import odds_api
+    calls = []
+    _record_chain(monkeypatch, calls)
+    monkeypatch.setattr(odds_api, "snapshot_odds",
+                        lambda **kw: pytest.fail("refresh spends no credits"))
+    monkeypatch.setattr(pipeline, "recommend",
+                        lambda: pytest.fail("refresh makes no picks"))
+    pipeline.refresh()
+    assert calls == ["daily_refresh", "nhl_stats", "injuries"]
+
+
+def test_new_steps_are_non_fatal(monkeypatch):
+    from ingestion import espn_injuries, nhl_odds, nhl_stats, props_odds
+
+    def boom(*a, **k):
+        raise RuntimeError("database gone")
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(nhl_odds, "snapshot", boom)
+    monkeypatch.setattr(espn_injuries, "ingest_injuries", boom)
+    monkeypatch.setattr(nhl_stats, "fill_missing", boom)
+    monkeypatch.setattr(nhl_stats, "fill_season", boom)
+    monkeypatch.setattr(props_odds, "snapshot_props", boom)
+    pipeline.nhl_feed()
+    pipeline.injuries()
+    pipeline.nhl_stats()
+    pipeline.nhl_stats(20252026)
+    pipeline.props(due=True)
+
+
+def test_nhl_feed_skips_when_idle_by_default(monkeypatch):
+    from ingestion import nhl_odds
+    seen = []
+    monkeypatch.setattr(nhl_odds, "snapshot", lambda skip_when_idle: seen.append(skip_when_idle))
+    pipeline.nhl_feed()
+    pipeline.nhl_feed(skip_when_idle=False)
+    assert seen == [True, False]
+
+
+def test_nhl_stats_daily_form_and_season_form(monkeypatch, caplog):
+    from ingestion import nhl_stats
+    seen = []
+    monkeypatch.setattr(nhl_stats, "fill_missing",
+                        lambda: seen.append("missing") or {"failed_windows": 0})
+    monkeypatch.setattr(nhl_stats, "fill_season",
+                        lambda s: seen.append(s) or {"failed_windows": 2})
+    pipeline.nhl_stats()
+    pipeline.nhl_stats(20252026)
+    assert seen == ["missing", 20252026]
+    assert "2 window(s) failed" in caplog.text
+
+
+def test_props_passes_due_and_markets_and_waits_for_network(monkeypatch):
+    from ingestion import props_odds
+    seen = []
+    monkeypatch.setattr(props_odds, "snapshot_props", lambda **kw: seen.append(kw) or 0)
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    pipeline.props(due=True, markets="player_points")
+    assert seen == [{"markets": "player_points", "due": True}]
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: False)
+    pipeline.props()
+    assert len(seen) == 1
+
+
+# ── The command line ───────────────────────────────────────────────
+
+COMMANDS = ("setup", "status", "backfill", "features", "daily", "odds", "close",
+            "recommend", "starters", "settle", "refresh", "props", "nhl-odds",
+            "compare-feeds", "injuries", "nhl-stats")
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_help_runs_nothing(monkeypatch, capsys, command):
+    monkeypatch.setattr(pipeline, "db_ready", lambda: pytest.fail("--help touched the DB"))
+    monkeypatch.setattr(pipeline, "setup_check", lambda: pytest.fail("--help ran setup"))
+    monkeypatch.setattr(pipeline, "db_status", lambda: pytest.fail("--help ran status"))
+    with pytest.raises(SystemExit) as exc:
+        pipeline.main([command, "--help"])
+    assert exc.value.code == 0
+    assert f"python pipeline.py {command}" in capsys.readouterr().out
+
+
+def test_no_command_prints_usage(monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "db_ready", lambda: pytest.fail("no command, no DB"))
+    assert pipeline.main([]) == 0
+    out = capsys.readouterr().out
+    for command in COMMANDS:
+        assert command in out
+
+
+def test_unknown_command_and_bad_options_exit_2(monkeypatch):
+    monkeypatch.setattr(pipeline, "db_ready", lambda: pytest.fail("bad input, no DB"))
+    for argv in (["nope"], ["nhl-stats", "--season", "2025"],
+                 ["compare-feeds", "--date", "29/09/2026"], ["props", "--sideways"]):
+        with pytest.raises(SystemExit) as exc:
+            pipeline.main(argv)
+        assert exc.value.code == 2, argv
+
+
+def test_no_database_runs_nothing(monkeypatch):
+    monkeypatch.setattr(pipeline, "db_ready", lambda: False)
+    monkeypatch.setattr(pipeline, "props", lambda **kw: pytest.fail("no DB, no props"))
+    assert pipeline.main(["props", "--due"]) == 1
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["props"], ("props", {"due": False, "markets": None})),
+    (["props", "--due", "--markets", "player_points"],
+     ("props", {"due": True, "markets": "player_points"})),
+    (["refresh"], ("refresh", {})),
+    (["injuries"], ("injuries", {})),
+    (["nhl-stats"], ("nhl_stats", {"season": None})),
+    (["nhl-stats", "--season", "20252026"], ("nhl_stats", {"season": 20252026})),
+    (["nhl-odds"], ("nhl_feed", {"skip_when_idle": False})),
+    (["close", "--due"], ("close", {"due": True})),
+    (["features", "--season", "20242025"], ("features", {"season": 20242025})),
+])
+def test_commands_dispatch(monkeypatch, argv, expected):
+    seen = []
+    monkeypatch.setattr(pipeline, "db_ready", lambda: True)
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(pipeline, "props", lambda due, markets: seen.append(
+        ("props", {"due": due, "markets": markets})))
+    monkeypatch.setattr(pipeline, "refresh", lambda: seen.append(("refresh", {})))
+    monkeypatch.setattr(pipeline, "injuries", lambda: seen.append(("injuries", {})))
+    monkeypatch.setattr(pipeline, "nhl_stats", lambda season: seen.append(
+        ("nhl_stats", {"season": season})))
+    monkeypatch.setattr(pipeline, "nhl_feed", lambda skip_when_idle: seen.append(
+        ("nhl_feed", {"skip_when_idle": skip_when_idle})))
+    monkeypatch.setattr(pipeline, "close", lambda due: seen.append(("close", {"due": due})))
+    monkeypatch.setattr(pipeline, "features", lambda season: seen.append(
+        ("features", {"season": season})))
+    assert pipeline.main(argv) == 0
+    assert seen == [expected]
+
+
+def test_compare_feeds_prints_the_report(monkeypatch, capsys):
+    from datetime import date
+    from ingestion import nhl_odds
+    seen = []
+    monkeypatch.setattr(pipeline, "db_ready", lambda: True)
+    monkeypatch.setattr(nhl_odds, "compare_feeds", lambda d: seen.append(d) or {"r": 1})
+    monkeypatch.setattr(nhl_odds, "format_report",
+                        lambda result, detail: f"REPORT {result} detail={detail}")
+    assert pipeline.main(["compare-feeds", "--date", "2026-09-29", "--detail"]) == 0
+    assert seen == [date(2026, 9, 29)]
+    assert "REPORT {'r': 1} detail=True" in capsys.readouterr().out
