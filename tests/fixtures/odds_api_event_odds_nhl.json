@@ -1,0 +1,72 @@
+{
+    "id": "e912304de2b2ce35b473ce2ecd43d5f4",
+    "sport_key": "icehockey_nhl",
+    "sport_title": "NHL",
+    "commence_time": "2026-01-16T00:00:00Z",
+    "home_team": "Buffalo Sabres",
+    "away_team": "Montréal Canadiens",
+    "bookmakers": [
+        {
+            "key": "draftkings",
+            "title": "DraftKings",
+            "markets": [
+                {
+                    "key": "player_shots_on_goal",
+                    "last_update": "2026-01-15T21:31:07Z",
+                    "outcomes": [
+                        {"name": "Over", "description": "Tage Thompson", "price": 105, "point": 3.5},
+                        {"name": "Under", "description": "Tage Thompson", "price": -135, "point": 3.5},
+                        {"name": "Over", "description": "Rasmus Dahlin", "price": -150, "point": 2.5},
+                        {"name": "Under", "description": "Rasmus Dahlin", "price": 118, "point": 2.5},
+                        {"name": "Over", "description": "Cole Caufield", "price": -110, "point": 3.5},
+                        {"name": "Under", "description": "Cole Caufield", "price": -115, "point": 3.5}
+                    ]
+                },
+                {
+                    "key": "player_goal_scorer_anytime",
+                    "last_update": "2026-01-15T21:31:07Z",
+                    "outcomes": [
+                        {"name": "Yes", "description": "Tage Thompson", "price": 150},
+                        {"name": "Yes", "description": "Cole Caufield", "price": 160},
+                        {"name": "No", "description": "Cole Caufield", "price": -210}
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "fanduel",
+            "title": "FanDuel",
+            "markets": [
+                {
+                    "key": "player_shots_on_goal",
+                    "last_update": "2026-01-15T21:28:40Z",
+                    "outcomes": [
+                        {"name": "Over", "description": "Tage Thompson", "price": 100, "point": 3.5},
+                        {"name": "Under", "description": "Tage Thompson", "price": -130, "point": 3.5},
+                        {"name": "Over", "description": "Lane Hutson", "price": -125, "point": 1.5}
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "betmgm",
+            "title": "BetMGM",
+            "markets": [
+                {
+                    "key": "player_shots_on_goal_alternate",
+                    "last_update": "2026-01-15T21:30:02Z",
+                    "outcomes": [
+                        {"name": "Over", "description": "Tage Thompson", "price": -250, "point": 2.5},
+                        {"name": "Over", "description": "Tage Thompson", "price": 110, "point": 3.5},
+                        {"name": "Over", "description": "Tage Thompson", "price": 260, "point": 4.5}
+                    ]
+                }
+            ]
+        },
+        {
+            "key": "kalshi",
+            "title": "Kalshi",
+            "markets": []
+        }
+    ]
+}
