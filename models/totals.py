@@ -27,53 +27,110 @@ Architecture (locked by File 3 / PROJECT_CONTEXT §6):
   with init_score = log(trailing-365-day league rate for its side) —
   point-in-time correct, computed only from games strictly before each
   row — and learns residual matchup effects on top.
-- Independence assumption (v1): P(H=h, A=a) = P(H=h)P(A=a). NHL goal
-  totals are near-Poisson and cross-team correlation is small; a
-  Dixon-Coles-style low-score adjustment is a later refinement if the
-  calibration evidence demands it.
+- Joint score shape (v2, 2026-09): the two sides' Poisson PMFs are
+  multiplied, then each (home, away) score cell is reweighted by its
+  regulation winning margin — tie, 1, 2, 3, 4+ goals — and the joint
+  renormalized (joint_pmf, MARGIN_WEIGHTS). v1 assumed the two scores
+  independent, which gets hockey's joint shape badly wrong: regulation
+  ties 22.3% actual vs 16.7% independent, one-goal wins 17.7% vs 30.4%,
+  three-goal wins 23.5% vs 14.9% (most likely the pulled goalie turning
+  one-goal games into ties or empty-net two-goal games). The weights are
+  fitted by maximum likelihood on training games only. Per side, the
+  goals stay near-Poisson (variance/mean 1.02-1.03); a negative binomial
+  (→ a Poisson with extra scatter) measured worse and is not used.
+- New-season drift correction (v2, 2026-09): the booster's inputs shift
+  from season to season and it reads the shift as a scoring change —
+  its mean log-adjustment is ~0 on the seasons it trained on but moves
+  on the next one: -0.015, +0.021, -0.011, -0.037, -0.039 for 2021-22
+  to 2025-26 (-0.037 is ~0.2 goals a game too low, so it leaned under at
+  the DraftKings line: mean P(over) 0.441 vs 0.508 actual). Each game's
+  rates are divided by exp(the booster's mean adjustment over the same
+  season's games on EARLIER dates), shrunk toward 0 by
+  DRIFT_PRIOR_GAMES while few have been played (drift_shift). The
+  adjustment is a prediction, not an outcome, and same-day games never
+  count, so it is known before puck drop. DRIFT_PRIOR_GAMES barely
+  matters (10 to 50 all gave 2.1801). Measured alternative, worse:
+  blanking the drift-prone inputs (shooting %, save %, Elo gap) instead
+  (2.1834 alone, 2.1809 with the correction).
 - Settlement totals: NHL totals settle on the final score INCLUDING the
   OT/SO winner's goal. The total PMF therefore shifts every regulation-tie
-  outcome (h == a) up by one goal:
-      P(T = t) = sum_{h+a=t, h != a} p_h(h) p_a(a)
-               + sum_{h == a, 2h+1 = t} p_h(h) p_a(h)
+  outcome (h == a) up by one goal, over the (reweighted) joint J:
+      P(T = t) = sum_{h+a=t, h != a} J(h, a) + sum_{h == a, 2h+1 = t} J(h, h)
 - Calibration: the environment offset (and only it) sets the level; the
   PMF stays internally coherent — no separate squeeze of P(over) that
   would detach it from the distribution, and no mean-scale correction
   (both variants measured harmful; see fit_totals_fold).
 
 Evaluation (walk-forward, expanding season folds, purge gap):
-- Gate: pooled OOF negative log-likelihood of the actual settlement total
-  under the model PMF must beat the ENVIRONMENT baseline (the trailing
-  league rates alone through the same PMF machinery) — i.e. the features
-  must add value beyond knowing how much the league is scoring lately.
-- STATUS (2026-07): GATE FAILED, honestly. Pooled OOF NLL 2.1867 vs
-  baseline 2.1815; over/under log loss at the DraftKings line 0.7053 vs
-  0.693 naive. Audited for leakage/join bugs on challenge (2026-07-17):
-  feature NaN rates are 0.0% (goalie) / 1.2% (team, thin early windows),
-  goalie features have real variance (std 0.40 normalized), and an
-  ablation shows removing goalie features slightly IMPROVES OOF NLL
-  (2.1834 vs 2.1867) while removing team features worsens it (2.1881) —
-  i.e. the shrunk historical-form goalie features are net noise for
-  totals (Buhlmann k=66: most goalies sit near league average most of
-  the time), and the only incremental totals info is team-level and
-  tiny (OOF Spearman of predicted vs actual total: 0.03-0.04). The
-  goalie signal that genuinely moves totals is WHICH goalie starts —
-  confirmed-starter data we don't have until Daily Faceoff (Phase 4). Public pre-game team features add essentially nothing to
-  totals beyond the scoring environment (they only win on the one fold
-  with a stable cross-season environment), and the model does NOT beat
-  the market total. Consequences: the model registers as inactive, the
-  daily job writes PMF predictions for visibility but NO totals
-  recommendations, and totals betting stays OFF until this passes with
-  (a) confirmed starters (Daily Faceoff, Phase 4), (b) live snapshot O/U
-  prices, and (c) boost-from-market-total once 2026-27 snapshot lines
-  accumulate — the exact offset trick that made the moneyline model work,
-  currently impossible for lack of historical totals prices.
+- Gate (hardened 2026-09): pooled OOF negative log-likelihood (NLL → how
+  surprised the model is by the actual final total; lower is better)
+  must beat the ENVIRONMENT baseline — the trailing league rates alone
+  through the same PMF machinery — WITH THE SAME margin weights, fitted
+  per fold on its training games. The baseline has no booster, so the
+  drift correction has nothing to remove there. The gate therefore asks
+  only whether the team stats add information beyond how much the league
+  is scoring lately. (Before hardening, a structural fix given to the
+  model alone could "pass": the model with both fixes scores 2.1801
+  against the unfixed baseline's 2.1815, a win owed to the margin fix,
+  not the team stats.)
+- Market check (reported with the gate; market_check): over/under log
+  loss of the model vs the no-vig market P(over) (bookmaker margin
+  removed) at the market's main line, same games, pushes dropped. It
+  needs O/U PRICES (load_market_quotes): the live snapshots
+  (raw.odds_snapshots, from 2026-27) and, once ingestion/espn_odds.py
+  stores them, ESPN's DraftKings closing prices (most of 2025-26). With
+  neither it reports "no prices". Beating the environment is not
+  beating the bookmakers: totals betting needs this check too.
+- STATUS (2026-09-29, v2): GATE FAILED, honestly. Pooled OOF NLL 2.1801
+  vs the hardened baseline 2.1787 (+0.0014, paired SE 0.0011) over 6,993
+  games. Per season, model vs hardened baseline: 2021-22 2.2035 vs
+  2.1986, 2022-23 2.1599 vs 2.1605, 2023-24 2.1762 vs 2.1763, 2024-25
+  2.2034 vs 2.2016, 2025-26 2.1575 vs 2.1563 — ahead in 2 of 5 seasons,
+  by 0.0006 and 0.0001. Before the fixes (v1, 2026-07): 2.1867 vs 2.1815.
+  The fixes make the numbers more accurate — the margin fix alone takes
+  the baseline from 2.1815 to 2.1787 and the model from 2.1867 to
+  2.1817, the drift correction then takes the model to 2.1801; together
+  they move the model's mean predicted total in 2025-26 from 5.87 to
+  6.19 (actual 6.23) and its over/under log loss at the DraftKings line
+  from 0.7051 to 0.6958 (n=1,011, 2025-26; a coin flip scores 0.6931) —
+  but they do not give the team stats an edge. A one-off market check
+  against 161 sampled 2025-26 games with DraftKings closing O/U prices
+  from ESPN's summary API (not stored): model 0.6978 vs no-vig market
+  0.6904 (model worse by 0.0074 ± 0.0125, too few games to be
+  conclusive).
+- Why it fails: the public team stats carry almost no totals signal (OOF
+  rank correlation of predicted vs actual total 0.02-0.06 by season;
+  even the DraftKings line manages only 0.084), and season-level scoring
+  shifts dominate the error. Audited for leakage/join bugs on challenge
+  (2026-07-17): feature NaN rates are 0.0% (goalie) / 1.2% (team, thin
+  early windows), goalie features have real variance (std 0.40
+  normalized), and removing the goalie features slightly IMPROVES OOF
+  NLL (2.1834 vs 2.1867) while removing the team features worsens it
+  (2.1881) — the shrunk historical-form goalie features are net noise
+  for totals (Buhlmann k=66: most goalies sit near league average most
+  of the time).
+- Confirmed starters will NOT make this pass by themselves (corrected
+  2026-09; the 2026-07 note said they would help). The historical test
+  already used each game's ACTUAL starting goalie: features/
+  build_vectors.py takes the starter from raw.goalie_games.is_starter and
+  writes it to features.matchup, which this model reads. So the test
+  knew every starter perfectly, and the goalie features were still net
+  noise. Daily Faceoff starters only keep live scoring as good as this
+  test; they add nothing the test lacked.
+- Consequences: the model registers as inactive, the daily job writes PMF
+  predictions for the bet checker and the alerts but NO totals
+  recommendations, and GATE_PASSED stays False. The realistic path is
+  boost-from-market-total (the offset trick that made the moneyline
+  model work) once 2026-27 snapshot O/U prices accumulate, judged by the
+  market check, not by the environment gate alone.
 - Market-line evaluation: raw.historical_odds.over_under is a placeholder
   constant (5.5) outside the DraftKings era — the ESPN pickcenter totals
   analogue of the one-sided ML junk (docs/historical_odds.md). Over/under
   log loss at the posted line is only computed on provider='DraftKings'
-  rows (2025-26). No O/U *prices* exist historically, so there is no
-  payout backtest for totals: the strategy proof starts at paper trading.
+  rows (2025-26). No O/U *prices* are stored historically (ESPN's summary
+  carries DraftKings closing O/U prices for most of 2025-26, but
+  ingestion/espn_odds.py doesn't keep them), so there is no payout
+  backtest for totals: the strategy proof starts at paper trading.
 """
 import logging
 
@@ -87,10 +144,15 @@ from models.baseline import ARTIFACT_DIR, PURGE_DAYS, walk_forward_folds
 logger = logging.getLogger("nhl.models.totals")
 
 MODEL_NAME = "poisson_totals"
-MODEL_VERSION = "v1"
-# The walk-forward gate verdict (STATUS above). The single switch for
-# totals betting: the bet checker and the daily recommendation job both
-# read it, so flipping it is the one change when a rebuild passes.
+MODEL_VERSION = "v2"           # v2: margin-reweighted joint + drift correction
+# The walk-forward gate verdict (STATUS above), set by hand. Two readers:
+# the bet checker (betting/checker.py), which won't give a totals leg a
+# BET verdict while it is False, and the daily recommendation job
+# (betting/recommend.py), which keeps totals predictions-only while it is
+# False and logs an ERROR when it is True, because no totals betting path
+# exists yet (the job writes no totals picks and settlement grades
+# moneyline picks only). So flipping it does NOT start totals betting on
+# its own: that also needs a totals pick writer and totals settlement.
 GATE_PASSED = False
 CAL_FRAC = 0.15
 MAX_GOALS = 12                 # per-side PMF support 0..12 (P(13+) ~ 1e-6)
@@ -356,12 +418,106 @@ def poisson_pmf(lam: np.ndarray, kmax: int = MAX_GOALS) -> np.ndarray:
     return pmf / pmf.sum(axis=1, keepdims=True)
 
 
-def total_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray) -> np.ndarray:
+# ── Joint score shape: regulation-margin reweighting ───────────────
+#
+# Two independent Poissons get the joint shape of hockey scores wrong:
+# regulation ties happen 22.3% of the time (independence says 16.7%),
+# one-goal regulation wins 17.7% (it says 30.4%) and three-goal wins
+# 23.5% (it says 14.9%) — the likely cause is the late pulled goalie,
+# which turns a one-goal game into a tie or an empty-net two-goal game.
+# So each (home, away) score cell is reweighted by its regulation
+# margin bucket — tie, 1, 2, 3, 4+ goals — and the joint renormalized.
+# The 4+ weight is fixed at 1 (only the ratios matter). Weights are
+# fitted by maximum likelihood on training games only
+# (fit_margin_weights); the walk-forward refits them inside every fold.
+
+MARGIN_CAP = 4                 # margins of 4+ goals share one bucket
+# Default weights for callers that only hold the per-side PMFs (the bet
+# checker, the arbitrage/middle alerts): fit_margin_weights on the
+# trailing-environment PMFs of every completed game, 2020-21 through
+# 2025-26 (7,945 games; fitted 2026-09-29) — all of them training seasons
+# for the live 2026-27 season. The walk-forward fold fits ranged tie
+# 1.11-1.16, 1-goal 0.50-0.55, 2-goal 0.69-0.73, 3-goal 1.21-1.36. The
+# daily job's own scores use the weights fit_production fits on its
+# training window, and it warns when one moves more than
+# MARGIN_WEIGHT_DRIFT_WARN away from these, so they can be refreshed.
+MARGIN_WEIGHTS = np.array([1.1540, 0.5080, 0.7228, 1.3429, 1.0])
+MARGIN_WEIGHT_DRIFT_WARN = 0.05
+
+
+def margin_buckets(k1: int) -> np.ndarray:
+    """(k1, k1) regulation-margin bucket of each (home, away) cell:
+    min(|h - a|, MARGIN_CAP), so 0 = tie."""
+    h, a = np.meshgrid(np.arange(k1), np.arange(k1), indexing="ij")
+    return np.minimum(np.abs(h - a), MARGIN_CAP)
+
+
+def _check_weights(w) -> np.ndarray:
+    w = np.asarray(w, dtype=float)
+    if w.shape != (MARGIN_CAP + 1,) or not np.all(np.isfinite(w)) \
+            or not np.all(w > 0):
+        raise ValueError(f"margin weights must be {MARGIN_CAP + 1} positive "
+                         f"finite numbers (tie, 1, 2, 3, 4+), got {w}")
+    return w
+
+
+def joint_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
+              margin_weights=MARGIN_WEIGHTS) -> np.ndarray:
+    """(n, K+1, K+1) joint regulation-score distribution from per-side
+    PMFs: their product, each cell times its margin bucket's weight,
+    renormalized per game to sum to 1. margin_weights=None keeps the
+    plain independent product."""
+    joint = pmf_h[:, :, None] * pmf_a[:, None, :]
+    if margin_weights is None:
+        return joint
+    w = _check_weights(margin_weights)
+    joint = joint * w[margin_buckets(pmf_h.shape[1])][None]
+    return joint / joint.sum(axis=(1, 2), keepdims=True)
+
+
+def fit_margin_weights(pmf_h: np.ndarray, pmf_a: np.ndarray,
+                       y_home, y_away) -> np.ndarray:
+    """Maximum-likelihood margin weights (tie, 1, 2, 3; 4+ fixed at 1)
+    from training games only: per-side PMFs (n, K+1) and the observed
+    regulation goals. Under the reweighted joint a game's likelihood is
+    base(h, a) * w[bucket] / sum_b(w_b * mass_b), where mass_b is the
+    game's independent probability of margin bucket b, so only the
+    bucket masses matter. The negative log-likelihood is convex in the
+    log-weights (a unique optimum): at it, the average predicted share of
+    each bucket equals the observed share."""
+    from scipy.optimize import minimize
+
+    k1 = pmf_h.shape[1]
+    buckets = margin_buckets(k1)
+    joint = pmf_h[:, :, None] * pmf_a[:, None, :]
+    mass = np.stack([joint[:, buckets == b].sum(axis=1)
+                     for b in range(MARGIN_CAP + 1)], axis=1)      # (n, 5)
+    h = np.clip(np.asarray(y_home).astype(int), 0, k1 - 1)
+    a = np.clip(np.asarray(y_away).astype(int), 0, k1 - 1)
+    observed = np.bincount(np.minimum(np.abs(h - a), MARGIN_CAP),
+                           minlength=MARGIN_CAP + 1) / len(h)
+
+    def nll_and_grad(log_w):
+        lw = np.append(log_w, 0.0)
+        weighted = mass * np.exp(lw)[None, :]
+        z = weighted.sum(axis=1)
+        nll = -observed @ lw + np.mean(np.log(z))
+        grad = -observed + (weighted / z[:, None]).mean(axis=0)
+        return nll, grad[:-1]
+
+    res = minimize(nll_and_grad, np.zeros(MARGIN_CAP), jac=True,
+                   method="L-BFGS-B")
+    return np.exp(np.append(res.x, 0.0))
+
+
+def total_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
+              margin_weights=MARGIN_WEIGHTS) -> np.ndarray:
     """Settlement-total distribution from two per-side regulation PMFs
-    (n, K+1) -> (n, 2K+2): convolution with every regulation tie shifted
+    (n, K+1) -> (n, 2K+2): the joint (margin-reweighted by default; see
+    joint_pmf) summed along each total, with every regulation tie shifted
     up one goal (the OT/SO winner's credited goal)."""
     n, k1 = pmf_h.shape
-    joint = pmf_h[:, :, None] * pmf_a[:, None, :]          # (n, K+1, K+1)
+    joint = joint_pmf(pmf_h, pmf_a, margin_weights)        # (n, K+1, K+1)
     out = np.zeros((n, 2 * k1))
     h_idx, a_idx = np.meshgrid(np.arange(k1), np.arange(k1), indexing="ij")
     t_idx = np.where(h_idx == a_idx, h_idx + a_idx + 1, h_idx + a_idx)
@@ -387,6 +543,53 @@ def nll_of_totals(tpmf: np.ndarray, totals: np.ndarray) -> np.ndarray:
     """Per-game negative log-likelihood of the observed settlement total."""
     p = tpmf[np.arange(len(totals)), np.clip(totals, 0, tpmf.shape[1] - 1)]
     return -np.log(np.clip(p, 1e-12, None))
+
+
+# ── New-season drift correction (point-in-time) ────────────────────
+#
+# The booster's average adjustment to the environment rate is ~0 on the
+# seasons it trained on but moves on each new season (-0.037 and -0.039
+# on the log scale for 2024-25 and 2025-26, ~0.2 goals a game): its
+# inputs shift from season to season and it reads the shift as a scoring
+# change. The environment offset is meant to own the scoring level, so
+# the level the booster adds on top is removed: every game's rates are
+# divided by exp(the booster's mean adjustment over the same season's
+# games on EARLIER dates), shrunk toward 0 by DRIFT_PRIOR_GAMES
+# pseudo-games while few games have been played. The adjustment is a
+# prediction, not an outcome, and only games already played count, so
+# the correction is known before each game.
+
+DRIFT_PRIOR_GAMES = 25
+
+
+def booster_adjustment(lam_h, lam_a, env_h, env_a) -> np.ndarray:
+    """Per game, the booster's mean log-adjustment of the two sides'
+    rates relative to the environment rates."""
+    return 0.5 * (np.log(np.asarray(lam_h) / np.asarray(env_h))
+                  + np.log(np.asarray(lam_a) / np.asarray(env_a)))
+
+
+def drift_shift(seasons, dates, adj,
+                prior_games: float = DRIFT_PRIOR_GAMES) -> np.ndarray:
+    """Per game: sum of `adj` over the same season's games on strictly
+    earlier dates / (their count + prior_games). Same-day and later games
+    never count, so the value is known before puck drop. 0 on a season's
+    first date."""
+    df = pd.DataFrame({"season": np.asarray(seasons),
+                       "date": pd.to_datetime(np.asarray(dates)),
+                       "adj": np.asarray(adj, dtype=float)})
+    day = df.groupby(["season", "date"], sort=True)["adj"].agg(["sum", "count"])
+    earlier = day.groupby(level="season").cumsum() - day
+    shift = (earlier["sum"] / (earlier["count"] + prior_games)).fillna(0.0)
+    keys = pd.MultiIndex.from_frame(df[["season", "date"]])
+    return shift.reindex(keys).to_numpy(dtype=float)
+
+
+def apply_drift(lam_h, lam_a, shift) -> tuple:
+    """Rates with the booster's season drift removed, clipped as usual."""
+    k = np.exp(-np.asarray(shift, dtype=float))
+    return (np.clip(np.asarray(lam_h) * k, *LAMBDA_CLIP),
+            np.clip(np.asarray(lam_a) * k, *LAMBDA_CLIP))
 
 
 # ── Fitting ────────────────────────────────────────────────────────
@@ -446,8 +649,11 @@ def predict_lambdas(fm: dict, Xh, Xa, env_home, env_away) -> tuple:
 def fit_production(cutoff_date=None) -> dict:
     """Production totals scorer trained on everything before cutoff_date
     (None = all labeled games). Mirrors models.lgbm.fit_production.
-    The environment rate frozen for scoring new games is the trailing rate
-    at the training-data horizon — exactly what would be known pre-slate."""
+    Everything frozen for scoring new games is what would be known
+    pre-slate: the trailing environment rate at the training-data
+    horizon, margin weights fitted on the training games, and each
+    season's running booster adjustment over its training games (the
+    drift correction; score_production looks up the slate's season)."""
     Xh, Xa, y_h, y_a, meta, names = load_totals_dataset()
     env_h = env_rates(meta["date"], y_h, ENV_PRIOR_RATE["home"])
     env_a = env_rates(meta["date"], y_a, ENV_PRIOR_RATE["away"])
@@ -461,20 +667,56 @@ def fit_production(cutoff_date=None) -> dict:
     fm = fit_totals_fold(Xh, Xa, y_h, y_a, env_h, env_a,
                          train_idx, meta["date"],
                          is_playoff=meta["is_playoff"].to_numpy())
+    weights = fit_margin_weights(poisson_pmf(env_h[train_idx]),
+                                 poisson_pmf(env_a[train_idx]),
+                                 y_h[train_idx], y_a[train_idx])
+    moved = np.abs(weights - MARGIN_WEIGHTS).max()
+    if moved > MARGIN_WEIGHT_DRIFT_WARN:
+        logger.warning(f"Totals margin weights fitted on the training games "
+                       f"{np.round(weights, 4).tolist()} differ from "
+                       f"MARGIN_WEIGHTS {MARGIN_WEIGHTS.tolist()} by up to "
+                       f"{moved:.3f}: the bet checker and the alerts still "
+                       f"use MARGIN_WEIGHTS, so refresh it in models/totals.py")
+
+    lam_h, lam_a = predict_lambdas(fm, Xh[train_idx], Xa[train_idx],
+                                   env_h[train_idx], env_a[train_idx])
+    adj = pd.Series(booster_adjustment(lam_h, lam_a, env_h[train_idx],
+                                       env_a[train_idx]))
+    by_season = adj.groupby(meta["season"].to_numpy()[train_idx])
+    drift = {int(k): (float(v["sum"]), int(v["count"]))
+             for k, v in by_season.agg(["sum", "count"]).iterrows()}
+
     # env rate to use for future slates: the trailing window at the
     # training-data horizon
     last = train_idx[np.argsort(meta["date"].iloc[train_idx].to_numpy())][-1]
     logger.info(f"Totals production fit: {len(train_idx)} games, "
                 f"scale={fm['scale']:.4f}, iters={fm['iters']}, "
-                f"env=({env_h[last]:.3f}, {env_a[last]:.3f})")
+                f"env=({env_h[last]:.3f}, {env_a[last]:.3f}), "
+                f"margin weights {np.round(weights, 3).tolist()}")
     return {"fm": fm, "names": names, "n_train": len(train_idx),
-            "env_home": float(env_h[last]), "env_away": float(env_a[last])}
+            "env_home": float(env_h[last]), "env_away": float(env_a[last]),
+            "margin_weights": weights, "drift": drift}
+
+
+def production_drift_shift(prod: dict, season=None) -> float:
+    """The drift correction for a slate in `season`: the booster's mean
+    adjustment over that season's training games (all before the cutoff),
+    shrunk like drift_shift. 0 for a season with no training games yet,
+    or when season is None."""
+    total, count = prod.get("drift", {}).get(
+        int(season) if season is not None else None, (0.0, 0))
+    return total / (count + DRIFT_PRIOR_GAMES) if count else 0.0
 
 
 def score_production(prod: dict, Xh_new: np.ndarray, Xa_new: np.ndarray,
-                     names_new: list) -> dict:
+                     names_new: list, season=None) -> dict:
     """PMFs + expected totals for new RAW attack matrices (environment
-    normalization is applied here, with the production env rates)."""
+    normalization is applied here, with the production env rates). The
+    rates get the drift correction of the slate's `season` (none when
+    season is None) and the total PMF uses the production margin
+    weights. pmf_home/pmf_away are the per-side Poisson PMFs that get
+    stored; total_pmf of them with MARGIN_WEIGHTS (what the checker and
+    the alerts compute) matches pmf_total up to the weights' refresh."""
     if list(names_new) != list(prod["names"]):
         raise ValueError("Feature names/order mismatch for totals model")
     n = len(Xh_new)
@@ -484,16 +726,147 @@ def score_production(prod: dict, Xh_new: np.ndarray, Xa_new: np.ndarray,
     lam_h, lam_a = predict_lambdas(
         prod["fm"], Xh_new, Xa_new,
         np.full(n, prod["env_home"]), np.full(n, prod["env_away"]))
+    shift = production_drift_shift(prod, season)
+    lam_h, lam_a = apply_drift(lam_h, lam_a, np.full(n, shift))
     ph, pa = poisson_pmf(lam_h), poisson_pmf(lam_a)
-    tp = total_pmf(ph, pa)
+    tp = total_pmf(ph, pa, prod.get("margin_weights", MARGIN_WEIGHTS))
     return {"lambda_home": lam_h, "lambda_away": lam_a,
             "pmf_home": ph, "pmf_away": pa, "pmf_total": tp,
-            "expected_total": expected_total(tp)}
+            "expected_total": expected_total(tp), "drift_shift": shift}
+
+
+# ── Market check (over/under prices) ───────────────────────────────
+#
+# Beating the environment baseline says the team stats add information;
+# it says nothing about beating the bookmakers. The market check asks
+# that: over/under log loss of the model's P(over) against the market's
+# no-vig P(over) (bookmaker margin removed), on the same games, at the
+# market's main line. It needs O/U PRICES: the live snapshots
+# (raw.odds_snapshots, market 'total', from 2026-27) and ESPN's
+# DraftKings closing prices once ingestion/espn_odds.py stores them
+# (load_market_quotes); with neither it reports "no prices". A push
+# refunds the bet, so both sides are compared as P(over | no push) and
+# pushes are dropped.
+
+MARKET_CHECK_MIN_GAMES = 200
+
+
+def market_over_probs(quotes: pd.DataFrame) -> pd.DataFrame:
+    """Per game, the market's main line and no-vig P(over) there. quotes:
+    game_id, book_name, line, over_price, under_price — one row per book
+    (its last pre-game quote). Main line: the one most books quote; on a
+    tie, the one whose fair P(over) is nearest 50%. Fair P(over): median
+    across those books of each book's no-vig over probability."""
+    from features.util import american_implied_prob
+
+    cols = ["game_id", "line", "fair_over", "n_books"]
+    q = quotes.dropna(subset=["line", "over_price", "under_price"])
+    if q.empty:
+        return pd.DataFrame(columns=cols)
+    po = q["over_price"].astype(float).map(american_implied_prob)
+    pu = q["under_price"].astype(float).map(american_implied_prob)
+    q = q.assign(line=q["line"].astype(float), novig=po / (po + pu))
+    by_line = (q.groupby(["game_id", "line"])["novig"]
+               .agg(["median", "count"]).reset_index())
+    by_line["balance"] = (by_line["median"] - 0.5).abs()
+    best = (by_line.sort_values(["game_id", "count", "balance"],
+                                ascending=[True, False, True])
+            .drop_duplicates("game_id"))
+    return (best.rename(columns={"median": "fair_over", "count": "n_books"})
+            [cols].reset_index(drop=True))
+
+
+def market_check(p_over, p_push, market_over, totals, lines,
+                 min_games: int = MARKET_CHECK_MIN_GAMES) -> dict:
+    """Over/under log loss, model vs the no-vig market, on the same
+    games (pushes dropped; the model's P(over) taken given no push).
+    beats_market: True only when the model's log loss is lower with 95%
+    confidence (the paired difference's upper bound is below 0); None
+    when fewer than min_games games qualify."""
+    p_over, p_push = np.asarray(p_over, float), np.asarray(p_push, float)
+    market_over = np.asarray(market_over, float)
+    totals, lines = np.asarray(totals, float), np.asarray(lines, float)
+    keep = totals != lines
+    n = int(keep.sum())
+    if n == 0:
+        return {"n": 0, "beats_market": None}
+    over = (totals > lines)[keep]
+    model = np.clip(p_over[keep] / np.clip(1.0 - p_push[keep], 1e-12, None),
+                    1e-6, 1 - 1e-6)
+    market = np.clip(market_over[keep], 1e-6, 1 - 1e-6)
+
+    def ll(p):
+        return -(over * np.log(p) + (~over) * np.log(1.0 - p))
+
+    diff = ll(model) - ll(market)
+    se = float(diff.std(ddof=1) / np.sqrt(n)) if n > 1 else float("nan")
+    out = {"n": n, "model_log_loss": float(ll(model).mean()),
+           "market_log_loss": float(ll(market).mean()),
+           "diff": float(diff.mean()), "diff_se": se}
+    out["beats_market"] = (None if n < min_games
+                           else bool(out["diff"] + 1.96 * se < 0))
+    return out
+
+
+_SNAPSHOT_QUOTES_SQL = """
+    SELECT DISTINCT ON (o.game_id, o.book_name)
+           o.game_id, o.book_name, o.line, o.over_price, o.under_price
+    FROM raw.odds_snapshots o
+    JOIN raw.games g USING (game_id)
+    WHERE o.market_type = 'total' AND o.line IS NOT NULL
+      AND o.over_price IS NOT NULL AND o.under_price IS NOT NULL
+      AND g.game_state IN ('FINAL', 'OFF')
+      AND g.start_time_utc IS NOT NULL
+      AND o.captured_at < (g.start_time_utc AT TIME ZONE 'UTC')
+    ORDER BY o.game_id, o.book_name, o.captured_at DESC
+"""
+
+# ESPN's DraftKings closing over/under price, once ingestion/espn_odds.py
+# stores it (raw.historical_odds.over_price / under_price go with the
+# closing line over_under). DraftKings rows only: ESPN's older Unibet-era
+# prices include in-play quotes.
+_ESPN_QUOTES_SQL = """
+    SELECT h.game_id, 'espn_' || h.provider AS book_name,
+           h.over_under AS line, h.over_price, h.under_price
+    FROM raw.historical_odds h
+    JOIN raw.games g USING (game_id)
+    WHERE h.provider = 'DraftKings' AND h.over_under IS NOT NULL
+      AND h.over_price IS NOT NULL AND h.under_price IS NOT NULL
+      AND g.game_state IN ('FINAL', 'OFF')
+"""
+
+
+def load_market_quotes(conn=None) -> pd.DataFrame:
+    """Over/under quotes with both prices for completed games, one row per
+    book: each snapshot book's last quote taken strictly before puck drop
+    (raw.games.start_time_utc; the same window settlement uses for a
+    close — games with no start time are left out, their quotes can't be
+    shown to be pre-game), plus ESPN's DraftKings closing quote as one
+    more book when raw.historical_odds has the price columns. conn: read
+    inside that connection's transaction."""
+    if conn is None:
+        with engine.connect() as c:
+            return load_market_quotes(c)
+    cols = ["game_id", "book_name", "line", "over_price", "under_price"]
+    parts = [pd.read_sql(text(_SNAPSHOT_QUOTES_SQL), conn)]
+    stored = {r[0] for r in conn.execute(text("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'raw' AND table_name = 'historical_odds'
+    """))}
+    if {"over_price", "under_price"} <= stored:
+        parts.append(pd.read_sql(text(_ESPN_QUOTES_SQL), conn))
+    parts = [f[cols] for f in parts if not f.empty]
+    return (pd.concat(parts, ignore_index=True) if parts
+            else pd.DataFrame(columns=cols))
 
 
 # ── Walk-forward validation ────────────────────────────────────────
 
-def run_totals(register: bool = True) -> dict:
+def run_totals(register: bool = True, market_quotes=None) -> dict:
+    """Walk-forward evaluation with the hardened gate (module docstring,
+    Evaluation). market_quotes: game_id, book_name, line, over_price,
+    under_price rows for the market check; None loads them from the
+    database (load_market_quotes)."""
     from sklearn.metrics import log_loss
 
     Xh, Xa, y_h, y_a, meta, names = load_totals_dataset()
@@ -501,50 +874,86 @@ def run_totals(register: bool = True) -> dict:
     env_a = env_rates(meta["date"], y_a, ENV_PRIOR_RATE["away"])
     folds = walk_forward_folds(meta)
     totals = meta["total"].to_numpy()
+    seasons, dates = meta["season"].to_numpy(), meta["date"].to_numpy()
     logger.info(f"Totals dataset: {len(meta)} games x {len(names)} attack "
                 f"features, {len(folds)} folds (purge {PURGE_DAYS}d)")
 
+    if market_quotes is None:
+        market_quotes = load_market_quotes()
+    mkt = market_over_probs(market_quotes).set_index("game_id")
+    mkt_line = meta["game_id"].map(mkt["line"]).to_numpy(dtype=float)
+    mkt_fair = meta["game_id"].map(mkt["fair_over"]).to_numpy(dtype=float)
+
     oof_nll = np.full(len(meta), np.nan)
     oof_base_nll = np.full(len(meta), np.nan)
+    oof_nll_v1 = np.full(len(meta), np.nan)        # before the fixes
+    oof_base_nll_v1 = np.full(len(meta), np.nan)
     oof_over = np.full(len(meta), np.nan)      # P(over) at DK line
     oof_exp_total = np.full(len(meta), np.nan)
+    oof_mkt_over = np.full(len(meta), np.nan)  # at the market's line
+    oof_mkt_push = np.full(len(meta), np.nan)
     fold_metrics = []
 
     for fold in folds:
+        tr, val = fold.train_idx, fold.val_idx
         fm = fit_totals_fold(Xh, Xa, y_h, y_a, env_h, env_a,
-                             fold.train_idx, meta["date"],
+                             tr, meta["date"],
                              is_playoff=meta["is_playoff"].to_numpy())
-        lam_h, lam_a = predict_lambdas(fm, Xh[fold.val_idx], Xa[fold.val_idx],
-                                       env_h[fold.val_idx], env_a[fold.val_idx])
-        tp = total_pmf(poisson_pmf(lam_h), poisson_pmf(lam_a))
+        lam_h, lam_a = predict_lambdas(fm, Xh[val], Xa[val],
+                                       env_h[val], env_a[val])
+        # Drift correction: the booster's running adjustment over this
+        # season's earlier games (predictions only) comes off each game
+        adj = booster_adjustment(lam_h, lam_a, env_h[val], env_a[val])
+        shift = drift_shift(seasons[val], dates[val], adj)
+        lam_hc, lam_ac = apply_drift(lam_h, lam_a, shift)
+        # Margin weights fitted on the training games only, and given to
+        # the model AND the baseline: the gate then asks only whether the
+        # team stats add information, not which side got a structural fix
+        weights = fit_margin_weights(poisson_pmf(env_h[tr]),
+                                     poisson_pmf(env_a[tr]), y_h[tr], y_a[tr])
+        tp = total_pmf(poisson_pmf(lam_hc), poisson_pmf(lam_ac), weights)
 
         # Environment baseline: the trailing league rates alone, through
         # the identical PMF machinery — the bar the features must clear
-        tp_base = total_pmf(poisson_pmf(env_h[fold.val_idx]),
-                            poisson_pmf(env_a[fold.val_idx]))
+        pe_h, pe_a = poisson_pmf(env_h[val]), poisson_pmf(env_a[val])
+        tp_base = total_pmf(pe_h, pe_a, weights)
 
-        tv = totals[fold.val_idx]
-        oof_nll[fold.val_idx] = nll_of_totals(tp, tv)
-        oof_base_nll[fold.val_idx] = nll_of_totals(tp_base, tv)
-        oof_exp_total[fold.val_idx] = expected_total(tp)
+        tv = totals[val]
+        oof_nll[val] = nll_of_totals(tp, tv)
+        oof_base_nll[val] = nll_of_totals(tp_base, tv)
+        oof_exp_total[val] = expected_total(tp)
+        # v1 for comparison: independent joint, no drift correction
+        oof_nll_v1[val] = nll_of_totals(
+            total_pmf(poisson_pmf(lam_h), poisson_pmf(lam_a), None), tv)
+        oof_base_nll_v1[val] = nll_of_totals(total_pmf(pe_h, pe_a, None), tv)
 
-        lines = meta["market_line"].to_numpy()[fold.val_idx]
+        priced = np.isfinite(mkt_line[val])
+        if priced.any():
+            po, pp = prob_over(tp[priced], mkt_line[val][priced])
+            oof_mkt_over[val[priced]], oof_mkt_push[val[priced]] = po, pp
+
+        lines = meta["market_line"].to_numpy()[val]
         lined = np.isfinite(lines)
         m = {
-            "val_season": int(meta["season"].iloc[fold.val_idx[0]]),
-            "n_val": len(fold.val_idx),
+            "val_season": int(meta["season"].iloc[val[0]]),
+            "n_val": len(val),
             "iters": fm["iters"], "scale": round(fm["scale"], 4),
-            "nll": float(np.mean(oof_nll[fold.val_idx])),
-            "baseline_nll": float(np.mean(oof_base_nll[fold.val_idx])),
-            "mean_pred_total": float(np.mean(oof_exp_total[fold.val_idx])),
+            "nll": float(np.mean(oof_nll[val])),
+            "baseline_nll": float(np.mean(oof_base_nll[val])),
+            "nll_v1": float(np.mean(oof_nll_v1[val])),
+            "baseline_nll_v1": float(np.mean(oof_base_nll_v1[val])),
+            "margin_weights": [round(float(w), 3) for w in weights],
+            "mean_booster_adj": float(adj.mean()),
+            "mean_pred_total": float(np.mean(oof_exp_total[val])),
             "mean_actual_total": float(tv.mean()),
             "n_lined": int(lined.sum()),
+            "n_priced": int(priced.sum()),
         }
         if lined.any():
             p_over, p_push = prob_over(tp[lined], lines[lined])
             over_actual = tv[lined] > lines[lined]
             push = tv[lined] == lines[lined]
-            oof_over[fold.val_idx[lined]] = p_over
+            oof_over[val[lined]] = p_over
             keep = ~push
             if keep.sum() > 50:
                 m["over_log_loss"] = float(log_loss(
@@ -553,7 +962,8 @@ def run_totals(register: bool = True) -> dict:
         fold_metrics.append(m)
         logger.info(
             f"  fold {m['val_season']}: nll={m['nll']:.4f} "
-            f"(baseline {m['baseline_nll']:.4f}) "
+            f"(baseline {m['baseline_nll']:.4f}; before the fixes "
+            f"{m['nll_v1']:.4f} vs {m['baseline_nll_v1']:.4f}) "
             f"pred_total={m['mean_pred_total']:.2f} vs {m['mean_actual_total']:.2f}"
             + (f" | over_ll={m['over_log_loss']:.4f} (n={m['n_lined']})"
                if "over_log_loss" in m else ""))
@@ -562,8 +972,12 @@ def run_totals(register: bool = True) -> dict:
     pooled = {
         "nll": float(np.mean(oof_nll[scored])),
         "baseline_nll": float(np.mean(oof_base_nll[scored])),
+        "nll_v1": float(np.mean(oof_nll_v1[scored])),
+        "baseline_nll_v1": float(np.mean(oof_base_nll_v1[scored])),
         "n_scored": int(scored.sum()),
     }
+    diff = oof_nll[scored] - oof_base_nll[scored]
+    pooled["nll_diff_se"] = float(diff.std(ddof=1) / np.sqrt(len(diff)))
     pooled["gate_passed"] = pooled["nll"] < pooled["baseline_nll"]
 
     lined = ~np.isnan(oof_over)
@@ -574,13 +988,33 @@ def run_totals(register: bool = True) -> dict:
             (totals > lines)[keep], np.clip(oof_over[keep], 1e-6, 1 - 1e-6)))
         pooled["n_lined"] = int(keep.sum())
 
+    priced = ~np.isnan(oof_mkt_over)
+    pooled["market_check"] = market_check(
+        oof_mkt_over[priced], oof_mkt_push[priced], mkt_fair[priced],
+        totals[priced], mkt_line[priced])
+
     logger.info(
         f"POOLED OOF: nll={pooled['nll']:.4f} vs baseline "
-        f"{pooled['baseline_nll']:.4f} — GATE "
-        f"{'PASSED' if pooled['gate_passed'] else 'FAILED'}"
+        f"{pooled['baseline_nll']:.4f} (both margin-reweighted) — GATE "
+        f"{'PASSED' if pooled['gate_passed'] else 'FAILED'} | before the "
+        f"fixes {pooled['nll_v1']:.4f} vs {pooled['baseline_nll_v1']:.4f}"
         + (f" | over_log_loss={pooled['over_log_loss']:.4f} "
            f"(n={pooled['n_lined']}, naive 0.693)" if "over_log_loss" in pooled
            else ""))
+    mc = pooled["market_check"]
+    if mc["n"] == 0:
+        logger.info("Market check: no over/under prices for any scored game "
+                    "yet (live snapshots or ESPN's DraftKings closing "
+                    "prices), so no comparison with the market — totals "
+                    "betting also needs this check")
+    else:
+        verdict = {None: f"too few games to judge (< {MARKET_CHECK_MIN_GAMES})",
+                   True: "BEATS the market",
+                   False: "does not beat the market"}[mc["beats_market"]]
+        logger.info(f"Market check: over/under log loss {mc['model_log_loss']:.4f} "
+                    f"vs the no-vig market {mc['market_log_loss']:.4f} over "
+                    f"{mc['n']} games (difference {mc['diff']:+.4f} ± "
+                    f"{1.96 * mc['diff_se']:.4f}) — {verdict}")
 
     if register:
         _register(pooled, meta, names)
@@ -611,7 +1045,22 @@ def _register(pooled: dict, meta, names: list) -> None:
     logger.info(f"Registered {MODEL_NAME} {MODEL_VERSION} in models.model_registry")
 
 
+def main(argv=None) -> dict:
+    """Command line: run the walk-forward evaluation and register the
+    model (inactive), or with --no-register only report. --help runs
+    nothing."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Walk-forward evaluation of the totals model (hardened "
+                    "gate + market check); registers it, inactive, in "
+                    "models.model_registry")
+    parser.add_argument("--no-register", action="store_true",
+                        help="evaluate and report only; write nothing")
+    args = parser.parse_args(argv)
+    return run_totals(register=not args.no_register)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    run_totals()
+    main()
