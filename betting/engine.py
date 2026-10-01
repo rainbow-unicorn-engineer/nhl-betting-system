@@ -10,6 +10,14 @@ Rules (locked):
 - Bet only when model edge >= EDGE_MIN for the market (moneyline 2.5%).
 - Stake = KELLY_FRACTION (0.25) of the full Kelly fraction, capped at
   MAX_STAKE_PCT (2%) of bankroll per bet and MAX_DAILY_PCT (10%) per day.
+- Per game, at most MAX_BETS_PER_GAME (3) bets and MAX_GAME_STAKE_PCT (4%)
+  of bankroll staked, counting every market. Bets on one game are
+  correlated → they tend to win or lose together (a high-scoring game
+  moves the total, the puck line and the scorers' props at once), so
+  three bets on one game are riskier than three bets on three games.
+  That is §7's "max 3 correlated bets per game". game_cap_reason() is
+  the check; betting/recommend.py applies it with the daily cap,
+  strongest edges first.
 - Edge is measured against the NO-VIG implied probability; payouts are
   settled at the actual (vig-inclusive) price. Both matter: edge vs the
   fair line, cash at the offered line.
@@ -23,6 +31,8 @@ EDGE_MIN_ML = 0.025
 KELLY_FRACTION = 0.25
 MAX_STAKE_PCT = 0.02
 MAX_DAILY_PCT = 0.10
+MAX_BETS_PER_GAME = 3          # bets on one game, any market (§7)
+MAX_GAME_STAKE_PCT = 0.04      # of bankroll, all bets on one game together
 
 
 def no_vig_probs(home_ml: float, away_ml: float) -> tuple:
@@ -89,6 +99,27 @@ def evaluate_moneyline(model_home_prob: float,
     fair_home, _ = no_vig_probs(home_ml, away_ml)
     return evaluate_market(model_home_prob, fair_home, home_ml, away_ml,
                            edge_min)
+
+
+def game_cap_reason(stake: float, bets_on_game: int, staked_on_game: float,
+                    bankroll: float,
+                    max_bets: int = MAX_BETS_PER_GAME,
+                    max_game_stake_pct: float = MAX_GAME_STAKE_PCT
+                    ) -> Optional[str]:
+    """Whether one more bet of `stake` fits the per-game limits, for any
+    market. bets_on_game / staked_on_game: the bets already on that game
+    and their total stake, counting every market and the new bets kept
+    earlier in the same run. Returns None when it fits, otherwise a
+    plain-English reason."""
+    if bets_on_game + 1 > max_bets:
+        return (f"per-game limit: {bets_on_game} bet(s) already on this "
+                f"game, max {max_bets}")
+    limit = bankroll * max_game_stake_pct
+    if staked_on_game + stake > limit + 1e-9:     # 1e-9: float noise only
+        return (f"per-game stake limit: {staked_on_game:.2f} already on this "
+                f"game + {stake:.2f} would pass {limit:.2f} "
+                f"({max_game_stake_pct:.0%} of bankroll)")
+    return None
 
 
 def settle(decision: BetDecision, home_won: bool, stake: float) -> float:

@@ -4,8 +4,9 @@ Tests for betting/engine.py — every number here is hand-computed.
 import pytest
 
 from betting.engine import (
-    BetDecision, EDGE_MIN_ML, KELLY_FRACTION, MAX_STAKE_PCT, decimal_odds,
-    evaluate_moneyline, kelly_fraction, no_vig_probs, settle,
+    BetDecision, EDGE_MIN_ML, KELLY_FRACTION, MAX_BETS_PER_GAME,
+    MAX_GAME_STAKE_PCT, MAX_STAKE_PCT, decimal_odds, evaluate_moneyline,
+    game_cap_reason, kelly_fraction, no_vig_probs, settle,
 )
 
 
@@ -68,3 +69,33 @@ class TestSettle:
         a = BetDecision("AWAY", 130, 0.48, 0.43, 0.05, 0.04, 0.01)
         assert settle(a, home_won=False, stake=2.0) == pytest.approx(2.6)
         assert settle(a, home_won=True, stake=2.0) == -2.0
+
+
+class TestGameCaps:
+    """Per-game limits (§7: max 3 correlated bets per game), any market.
+    Bankroll 1000: 4% = 40 across every bet on one game."""
+
+    def test_locked_defaults(self):
+        assert MAX_BETS_PER_GAME == 3
+        assert MAX_GAME_STAKE_PCT == pytest.approx(0.04)
+
+    def test_fits(self):
+        assert game_cap_reason(10.0, 0, 0.0, 1000) is None
+        # two bets and 20 already on the game: a third of 20 lands exactly
+        # on the 40 limit and still fits
+        assert game_cap_reason(20.0, 2, 20.0, 1000) is None
+
+    def test_fourth_bet_is_refused(self):
+        why = game_cap_reason(1.0, 3, 3.0, 1000)
+        assert why is not None and "max 3" in why
+
+    def test_stake_past_the_game_limit_is_refused(self):
+        why = game_cap_reason(20.01, 1, 20.0, 1000)
+        assert why is not None and "40.00" in why
+
+    def test_limits_are_parameters(self):
+        assert game_cap_reason(5.0, 1, 0.0, 1000, max_bets=1) is not None
+        assert game_cap_reason(25.0, 0, 0.0, 1000,
+                               max_game_stake_pct=0.02) is not None
+        assert game_cap_reason(25.0, 0, 0.0, 1000,
+                               max_game_stake_pct=0.05) is None

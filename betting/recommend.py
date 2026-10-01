@@ -40,11 +40,23 @@ so the game can get a new one when it is played on its new date. Each
 pick stores the game's start time as written (scheduled_start), which
 settlement compares with the actual start to spot a moved game.
 
-Daily cap: cap_daily_exposure() is the one (pure) allocation rule. It runs
-once when deciding, then again inside write_recommendations under the
-writers' advisory lock, against the committed stake re-read there, so
-overlapping daily/odds runs can't together exceed MAX_DAILY_PCT. Voided
-picks (postponed or cancelled games) commit nothing.
+Exposure caps: cap_daily_exposure() is the one (pure) allocation rule.
+Strongest edges first, it keeps a pick only while three limits hold: the
+day's budget (MAX_DAILY_PCT of bankroll), and per game at most
+MAX_BETS_PER_GAME bets and MAX_GAME_STAKE_PCT of bankroll, counting every
+market (bets on one game are correlated → they tend to win or lose
+together). It runs once when deciding, then again inside
+write_recommendations under the writers' advisory lock, against the
+stakes re-read there, so overlapping daily/odds runs can't together pass
+a limit. SKIPPED and voided picks (postponed or cancelled games) count
+toward none of them. Moneyline issues at most one pick per game, so the
+per-game limits guard the totals and props picks still to come.
+
+Totals: models.totals.GATE_PASSED is read once per run. While it is False
+(the default) the totals model is predictions-only: its PMFs are stored,
+no totals pick is made. If it is True the job logs an ERROR instead of
+betting, because no totals betting path exists yet (settlement grades
+moneyline picks only).
 
 Simulation: --date <past date> --simulate treats that day's completed
 games as an upcoming slate. fit_production gets the same date as cutoff,
@@ -53,6 +65,7 @@ dress rehearsal for the 2026-27 paper-trading season.
 """
 import argparse
 import logging
+import math
 import os
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
@@ -62,8 +75,11 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from betting.engine import (MAX_DAILY_PCT, decimal_odds, evaluate_market,
-                            EDGE_MIN_ML)
+from betting.engine import (MAX_BETS_PER_GAME as _DEFAULT_BETS_PER_GAME,
+                            MAX_DAILY_PCT,
+                            MAX_GAME_STAKE_PCT as _DEFAULT_GAME_STAKE_PCT,
+                            decimal_odds, evaluate_market, EDGE_MIN_ML,
+                            game_cap_reason)
 from config.migrate import ensure_schema
 from config.settings import engine as db, local_today
 
@@ -77,6 +93,35 @@ RECENT_TEAM_GAMES = 10          # starter projection window
 BETTABLE_BOOKS = frozenset(b.strip().lower() for b in
                            os.getenv("BETTABLE_BOOKS", "").split(",")
                            if b.strip())
+
+
+def _limit_setting(name: str, default, parse, valid, what: str):
+    """An exposure limit from the environment. Unset or blank = default; a
+    malformed or out-of-range value logs an error and uses the default, so
+    a typo in .env can't abort the import, and with it the daily chain."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = parse(raw)
+        if not valid(value):
+            raise ValueError(raw)
+        return value
+    except (ValueError, OverflowError):
+        logger.error(f"{name}={raw!r} is not {what} — using the default, "
+                     f"{default:g}")
+        return default
+
+
+# Per-game limits (PROJECT_CONTEXT §7: max 3 correlated bets per game),
+# every market counted. Defaults are betting/engine.py's.
+MAX_BETS_PER_GAME = _limit_setting(
+    "MAX_BETS_PER_GAME", _DEFAULT_BETS_PER_GAME, int, lambda v: v >= 1,
+    "a whole number of bets, 1 or more")
+MAX_GAME_STAKE_PCT = _limit_setting(
+    "MAX_GAME_STAKE_PCT", _DEFAULT_GAME_STAKE_PCT, float,
+    lambda v: math.isfinite(v) and 0 < v <= 1,
+    "a fraction of bankroll above 0 and at most 1 (0.04 = 4%)")
 
 
 # ── Slate ──────────────────────────────────────────────────────────
@@ -360,15 +405,38 @@ def score_slate(slate_vectors: pd.DataFrame, cutoff_date=None) -> pd.DataFrame:
 
 # ── Totals PMFs (predictions only — no recommendations) ───────────
 #
-# The totals model has NOT passed its walk-forward gate (it neither beats
-# its environment baseline nor the market line; models/totals.py STATUS).
-# PMFs are still scored and persisted per slate for dashboard visibility
-# and future props work, but no totals bet is ever recommended until the
-# gate passes with live O/U prices.
+# The totals model has NOT passed its walk-forward gate (models/totals.py
+# STATUS). PMFs (probability mass functions → the chance of each possible
+# goal count) are still scored and stored per slate for the bet checker,
+# the arbitrage/middle alerts and future props work. The job reads
+# models.totals.GATE_PASSED once per run (log_totals_gate): False keeps
+# totals predictions-only; True logs an ERROR, because there is no totals
+# betting path yet — settlement grades moneyline picks only — so flipping
+# the switch alone must not look like totals betting started.
+
+
+def log_totals_gate() -> None:
+    """Read models.totals.GATE_PASSED and log what it means for this run
+    (the job calls it once per run). Either way no totals pick is
+    written: the job has no totals pick writer and settlement has no
+    totals grading. True only turns the line into an ERROR, so a flipped
+    switch that changes nothing can't go unnoticed."""
+    from models import totals as T
+    if T.GATE_PASSED:
+        logger.error("models.totals.GATE_PASSED is True, but there is no "
+                     "totals betting path yet: this job writes no totals "
+                     "picks and settlement grades moneyline picks only. "
+                     "Totals stay predictions-only until both are built")
+    else:
+        logger.info("Totals are predictions-only: the totals model has not "
+                    "passed its gate (models.totals.GATE_PASSED is False), "
+                    "so no totals bet is recommended")
+
 
 def score_totals(slate: pd.DataFrame, target_date,
                  cutoff_date=None) -> pd.DataFrame:
-    """Total-goals PMFs for the slate via the attack-row totals model."""
+    """Total-goals PMFs for the slate via the attack-row totals model
+    (drift-corrected for the slate's season, margin-reweighted joint)."""
     from models import totals as T
 
     season = int(slate["season"].iloc[0])
@@ -385,7 +453,8 @@ def score_totals(slate: pd.DataFrame, target_date,
     Xh, Xa = T.build_attack_matrix(games, team_wide, goalie_wide)
 
     prod = T.fit_production(cutoff_date)
-    out = T.score_production(prod, Xh, Xa, T.ATTACK_FEATURES)
+    # season: the drift correction uses this season's games played so far
+    out = T.score_production(prod, Xh, Xa, T.ATTACK_FEATURES, season=season)
 
     res = slate[["game_id"]].copy()
     res["expected_total"] = out["expected_total"]
@@ -493,21 +562,21 @@ def write_predictions(scored: pd.DataFrame) -> dict:
 
 
 _ISSUED_SQL = """
-    SELECT r.game_id, r.status, r.recommended_stake,
+    SELECT r.game_id, r.market_type, r.status, r.recommended_stake,
            EXISTS (SELECT 1 FROM betting.placed_bets p
                    WHERE p.rec_id = r.rec_id AND p.result = 'VOID') AS voided
     FROM betting.recommendations r
     JOIN raw.games g USING (game_id)
-    WHERE g.date = :d AND r.market_type = 'ml'
+    WHERE g.date = :d
 """
 
 
 def load_issued_picks(target_date, conn=None) -> pd.DataFrame:
-    """Moneyline picks already issued for games on target_date (any
-    status), including games that have since started — they still count
-    against the day's exposure budget. voided = settled as VOID
-    (postponed or cancelled game). conn: read inside that connection's
-    transaction (write_recommendations, under its lock)."""
+    """Picks already issued for games on target_date, every market and
+    any status, including games that have since started — they still
+    count against the day's and their game's exposure limits. voided =
+    settled as VOID (postponed or cancelled game). conn: read inside that
+    connection's transaction (write_recommendations, under its lock)."""
     if conn is not None:
         return pd.read_sql(text(_ISSUED_SQL), conn, params={"d": target_date})
     with db.connect() as c:
@@ -515,48 +584,112 @@ def load_issued_picks(target_date, conn=None) -> pd.DataFrame:
 
 
 def frozen_games(issued: pd.DataFrame) -> set:
-    """Games that already have their pick (load_issued_picks rows) and so
-    are never re-decided: every issued pick, SKIPPED included, except
-    picks settled VOID. A voided pick's game (postponed, then played on a
-    new date) is open for a new pick."""
+    """Games that already have their MONEYLINE pick (load_issued_picks
+    rows) and so are never re-decided: every issued ml pick, SKIPPED
+    included, except picks settled VOID. A voided pick's game (postponed,
+    then played on a new date) is open for a new pick. Picks in other
+    markets don't freeze the moneyline; a frame without a market_type
+    column is taken as all moneyline."""
     if issued.empty:
         return set()
+    if "market_type" in issued:
+        issued = issued[issued["market_type"].eq("ml")]
     live = issued[~issued["voided"].eq(True)]          # None/NaN = not voided
     return set(live["game_id"].astype(int))
 
 
+def _live_picks(issued: pd.DataFrame) -> pd.DataFrame:
+    """Issued picks that still carry a stake: all but SKIPPED ones
+    (released by hand) and voided ones (the book returned the stake)."""
+    return issued[(issued["status"] != "SKIPPED")
+                  & ~issued["voided"].fillna(False).astype(bool)]
+
+
 def committed_stake(issued: pd.DataFrame) -> float:
-    """Stake already committed for the day (load_issued_picks rows): every
-    issued pick except SKIPPED ones (released by hand) and voided ones
-    (the book returned the stake)."""
+    """Stake already committed for the day (load_issued_picks rows), every
+    market: every issued pick except SKIPPED and voided ones."""
     if issued.empty:
         return 0.0
-    live = issued[(issued["status"] != "SKIPPED")
-                  & ~issued["voided"].fillna(False).astype(bool)]
-    return float(live["recommended_stake"].astype(float).sum())
+    return float(_live_picks(issued)["recommended_stake"].astype(float).sum())
+
+
+def game_exposure(issued: pd.DataFrame) -> tuple:
+    """({game_id: bets}, {game_id: stake}) already on each game
+    (load_issued_picks rows), every market, counting the same picks as
+    committed_stake: all but SKIPPED and voided ones."""
+    if issued.empty:
+        return {}, {}
+    live = _live_picks(issued)
+    bets, stakes = {}, {}
+    for gid, stake in zip(live["game_id"].astype(int),
+                          live["recommended_stake"].astype(float).fillna(0.0)):
+        bets[int(gid)] = bets.get(int(gid), 0) + 1
+        stakes[int(gid)] = stakes.get(int(gid), 0.0) + float(stake)
+    return bets, stakes
+
+
+def allocate_exposure(recs: list, committed: float, bankroll: float,
+                      picked=frozenset(), game_bets: dict = None,
+                      game_stakes: dict = None,
+                      max_daily_pct: float = MAX_DAILY_PCT,
+                      max_bets_per_game: int = None,
+                      max_game_stake_pct: float = None) -> list:
+    """The exposure caps, pure and market-agnostic. recs: dicts with
+    game_id, edge_pct and recommended_stake, from any market. Returns
+    [(rec, reason)] strongest edge first, for every rec whose game is not
+    in `picked` (games that already have their pick in this market are
+    never re-decided): reason is None for a rec to issue, else why it was
+    skipped. A rec is kept while all three limits still hold with it:
+    - the day: committed + kept stakes <= bankroll * max_daily_pct;
+    - its game's bets: game_bets[g] (bets already issued on game g, any
+      market, SKIPPED and voided excluded) + kept ones <= max_bets_per_game;
+    - its game's stake: game_stakes[g] + kept stakes on g
+      <= bankroll * max_game_stake_pct.
+    A rec that doesn't fit is skipped, and a smaller one, or one on
+    another game, after it can still fit. Per-game defaults: the
+    MAX_BETS_PER_GAME / MAX_GAME_STAKE_PCT settings."""
+    if max_bets_per_game is None:
+        max_bets_per_game = MAX_BETS_PER_GAME
+    if max_game_stake_pct is None:
+        max_game_stake_pct = MAX_GAME_STAKE_PCT
+    bets = {int(g): int(n) for g, n in (game_bets or {}).items()}
+    staked = {int(g): float(x) for g, x in (game_stakes or {}).items()}
+    budget = bankroll * max_daily_pct
+    spent = float(committed)
+    out = []
+    for r in sorted(recs, key=lambda r: -float(r["edge_pct"])):
+        gid = int(r["game_id"])
+        if gid in picked:
+            continue
+        stake = float(r["recommended_stake"])
+        if spent + stake > budget + 1e-9:        # 1e-9: float noise only
+            out.append((r, f"daily cap: {spent:.2f} of {budget:.2f} "
+                           f"already staked"))
+            continue
+        why = game_cap_reason(stake, bets.get(gid, 0), staked.get(gid, 0.0),
+                              bankroll, max_bets_per_game, max_game_stake_pct)
+        if why is not None:
+            out.append((r, why))
+            continue
+        spent += stake
+        bets[gid] = bets.get(gid, 0) + 1
+        staked[gid] = staked.get(gid, 0.0) + stake
+        out.append((r, None))
+    return out
 
 
 def cap_daily_exposure(recs: list, committed: float, bankroll: float,
                        picked=frozenset(),
-                       max_daily_pct: float = MAX_DAILY_PCT) -> list:
-    """The daily exposure cap, pure. recs: dicts with game_id, edge_pct
-    and recommended_stake. Returns the recs to issue, strongest edge
-    first: games in `picked` already have a pick and are never re-decided;
-    the rest are taken while committed + their stakes stay within
-    bankroll * max_daily_pct. A stake that doesn't fit is skipped, and a
-    smaller one after it can still fit."""
-    budget = bankroll * max_daily_pct
-    spent = float(committed)
-    kept = []
-    for r in sorted(recs, key=lambda r: -float(r["edge_pct"])):
-        if int(r["game_id"]) in picked:
-            continue
-        stake = float(r["recommended_stake"])
-        if spent + stake > budget + 1e-9:        # 1e-9: float noise only
-            continue
-        spent += stake
-        kept.append(r)
-    return kept
+                       max_daily_pct: float = MAX_DAILY_PCT,
+                       game_bets: dict = None, game_stakes: dict = None,
+                       max_bets_per_game: int = None,
+                       max_game_stake_pct: float = None) -> list:
+    """The recs to issue under the daily and per-game caps, strongest edge
+    first (allocate_exposure without the skip reasons; see there)."""
+    return [r for r, why in allocate_exposure(
+                recs, committed, bankroll, picked, game_bets, game_stakes,
+                max_daily_pct, max_bets_per_game, max_game_stake_pct)
+            if why is None]
 
 
 def write_recommendations(recs: list, slate_game_ids: list, slate_date=None,
@@ -568,10 +701,11 @@ def write_recommendations(recs: list, slate_game_ids: list, slate_date=None,
     (re-pricing every run is what made same-book CLV read 0). The one
     exception is a pick settled VOID: it no longer blocks a new pick.
     Each row stores the game's start_time_utc as scheduled_start.
-    The cap is applied again here, under the writers' lock, against the
-    committed stake re-read for slate_date (default: the slate games'
-    date), so a run that decided before another run's picks landed is
-    trimmed instead of pushing the day past MAX_DAILY_PCT."""
+    The caps are applied again here, under the writers' lock, against the
+    stakes re-read for slate_date (default: the slate games' date), so a
+    run that decided before another run's picks landed is trimmed instead
+    of pushing the day past MAX_DAILY_PCT, or a game past its per-game
+    limits."""
     ids = list(map(int, slate_game_ids))
     with db.begin() as conn:
         # Serialize writers (launchd can fire daily + odds together on wake)
@@ -590,14 +724,17 @@ def write_recommendations(recs: list, slate_game_ids: list, slate_date=None,
             """), {"ids": ids}).scalar()
         issued = load_issued_picks(slate_date, conn=conn)
         picked |= frozen_games(issued)
+        game_bets, game_stakes = game_exposure(issued)
         allowed = cap_daily_exposure(recs, committed_stake(issued), bankroll,
-                                     picked)
+                                     picked, game_bets=game_bets,
+                                     game_stakes=game_stakes)
         trimmed = [r for r in recs if r["game_id"] not in picked
                    and not any(r is a for a in allowed)]
         if trimmed:
-            logger.info(f"Daily cap re-checked under the lock: {len(trimmed)} "
+            logger.info(f"Caps re-checked under the lock: {len(trimmed)} "
                         f"pick(s) dropped, because less of {slate_date}'s "
-                        f"budget is left than when they were decided")
+                        f"budget, or of their games' per-game limits, is "
+                        f"left than when they were decided")
         to_insert = [dict(r, priced_at=r.get("priced_at")) for r in allowed]
         if to_insert:
             conn.execute(text("""
@@ -658,6 +795,7 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
     issued = load_issued_picks(target_date)
     picked = frozen_games(issued)
     committed = committed_stake(issued)
+    game_bets, game_stakes = game_exposure(issued)
     if picked:
         logger.info(f"{len(picked)} game(s) on {target_date} already have a "
                     f"pick (kept at its issued price); {committed:.2f} "
@@ -695,14 +833,18 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
             "matchup": f"{g.away_team} @ {g.home_team}",
         })
 
-    # Daily exposure cap, strongest edges first; games issued earlier are
-    # frozen and never re-decided (checked again under the write lock)
+    # Daily and per-game caps, strongest edges first; games issued earlier
+    # are frozen and never re-decided (checked again under the write lock)
     day_budget = bankroll * MAX_DAILY_PCT
-    recs = cap_daily_exposure(candidates, committed, bankroll, picked)
-    for r in candidates:
-        if r["game_id"] not in picked and not any(r is k for k in recs):
-            logger.info(f"  daily cap: skipping {r['matchup']} ({r['side']} "
-                        f"{r['best_price']:+d}, edge {r['edge_pct']:.1%})")
+    recs = []
+    for r, why in allocate_exposure(candidates, committed, bankroll, picked,
+                                    game_bets, game_stakes):
+        if why is None:
+            recs.append(r)
+        else:
+            logger.info(f"  skipping {r['matchup']} ({r['side']} "
+                        f"{r['best_price']:+d}, edge {r['edge_pct']:.1%}): "
+                        f"{why}")
     spent = committed + sum(r["recommended_stake"] for r in recs)
 
     for r in recs:
@@ -722,8 +864,9 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
                                   slate_date=target_date, bankroll=bankroll)
         logger.info(f"Wrote {len(pred_ids)} predictions, {n} recommendations")
 
-    # Totals PMFs: predictions only, never recommendations — the totals
-    # model has not passed its gate (see models/totals.py STATUS)
+    # Totals PMFs: predictions only, never recommendations (see
+    # log_totals_gate; models/totals.py STATUS has the gate verdict)
+    log_totals_gate()
     try:
         t_scored = score_totals(slate, target_date,
                                 cutoff_date=target_date if simulate else None)

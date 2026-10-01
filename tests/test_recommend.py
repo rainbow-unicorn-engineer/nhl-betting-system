@@ -14,8 +14,9 @@ import pandas as pd
 import pytest
 
 from betting.engine import EDGE_MIN_ML, MAX_STAKE_PCT, evaluate_market
-from betting.recommend import (cap_daily_exposure, committed_stake,
-                               frozen_games, summarize_market)
+from betting.recommend import (allocate_exposure, cap_daily_exposure,
+                               committed_stake, frozen_games, game_exposure,
+                               summarize_market)
 from config.settings import check_db_connection
 
 requires_db = pytest.mark.skipif(not check_db_connection(),
@@ -173,6 +174,137 @@ class TestDailyCap:
         assert [r["game_id"] for r in kept] == [2, 1]
 
 
+def _mcand(game_id, market, edge, stake):
+    return {"game_id": game_id, "market_type": market, "edge_pct": edge,
+            "recommended_stake": stake}
+
+
+class TestPerGameCaps:
+    """PROJECT_CONTEXT §7: max 3 correlated bets per game, plus at most
+    MAX_GAME_STAKE_PCT (4%: 40 of a 1000 bankroll) across one game's
+    bets. Every market counts; strongest edges are kept. The daily
+    budget (100) is ample in these cases unless a test says otherwise."""
+
+    def test_at_most_three_bets_per_game_strongest_edges_kept(self):
+        cands = [_mcand(1, "ml", 0.03, 5), _mcand(1, "total", 0.06, 5),
+                 _mcand(1, "prop_a", 0.05, 5), _mcand(1, "prop_b", 0.08, 5),
+                 _mcand(2, "ml", 0.04, 5)]
+        kept = cap_daily_exposure(cands, committed=0, bankroll=1000)
+        assert [(r["game_id"], r["market_type"]) for r in kept] == [
+            (1, "prop_b"), (1, "total"), (1, "prop_a"), (2, "ml")]
+
+    def test_bets_already_issued_count_toward_the_three(self):
+        # game 1 already carries 2 live bets (any market): 1 more fits
+        cands = [_mcand(1, "total", 0.06, 5), _mcand(1, "prop", 0.05, 5)]
+        kept = cap_daily_exposure(cands, committed=10, bankroll=1000,
+                                  game_bets={1: 2}, game_stakes={1: 10.0})
+        assert [r["market_type"] for r in kept] == ["total"]
+        # already at 3: nothing more on game 1, other games unaffected
+        kept = cap_daily_exposure(cands + [_mcand(2, "ml", 0.03, 5)],
+                                  committed=15, bankroll=1000,
+                                  game_bets={1: 3}, game_stakes={1: 15.0})
+        assert [r["game_id"] for r in kept] == [2]
+
+    def test_game_stake_limit_and_a_smaller_stake_can_still_fit(self):
+        # 20 already on game 1; limit 40: the 15 fits (35), the 10 would
+        # pass it (45) and is skipped, the 5 after it still fits (40)
+        cands = [_mcand(1, "total", 0.09, 15), _mcand(1, "prop", 0.07, 10),
+                 _mcand(1, "prop2", 0.05, 5)]
+        kept = cap_daily_exposure(cands, committed=20, bankroll=1000,
+                                  game_bets={1: 1}, game_stakes={1: 20.0})
+        assert [r["market_type"] for r in kept] == ["total", "prop2"]
+
+    def test_limits_are_parameters(self):
+        cands = [_mcand(1, "ml", 0.06, 5), _mcand(1, "total", 0.05, 5)]
+        assert len(cap_daily_exposure(cands, 0, 1000,
+                                      max_bets_per_game=1)) == 1
+        assert len(cap_daily_exposure(cands, 0, 1000,
+                                      max_game_stake_pct=0.004)) == 0
+
+    def test_daily_cap_still_applies_across_games(self):
+        cands = [_mcand(g, "ml", 0.05 + g / 1000, 20) for g in range(8)]
+        kept = cap_daily_exposure(cands, committed=0, bankroll=1000)
+        assert sum(r["recommended_stake"] for r in kept) <= 100 + 1e-9
+        assert len(kept) == 5
+
+    def test_skip_reasons(self):
+        cands = [_mcand(1, "ml", 0.06, 15), _mcand(1, "total", 0.05, 5),
+                 _mcand(2, "ml", 0.04, 20), _mcand(3, "ml", 0.03, 5)]
+        out = allocate_exposure(cands, committed=70, bankroll=1000,
+                                picked={3}, game_bets={1: 2},
+                                game_stakes={1: 20.0})
+        reasons = {(r["game_id"], r["market_type"]): why for r, why in out}
+        assert (3, "ml") not in reasons            # frozen: never re-decided
+        assert reasons[(1, "ml")] is None          # 85 of 100; game 1 at 35
+        assert "per-game limit" in reasons[(1, "total")]
+        assert "daily cap" in reasons[(2, "ml")]
+
+    def test_moneyline_only_slate_is_unchanged(self):
+        # one ml candidate per game, nothing issued: the per-game limits
+        # never bind, so the result equals the daily cap alone
+        cands = [_cand(i, 0.03 + i / 1000, 20) for i in range(10)]
+        assert cap_daily_exposure(cands, committed=0, bankroll=1000) == \
+            cap_daily_exposure(cands, committed=0, bankroll=1000,
+                               max_bets_per_game=99, max_game_stake_pct=1.0)
+
+
+class TestGameExposure:
+    def test_counts_every_market_except_skipped_and_voided(self):
+        issued = pd.DataFrame({
+            "game_id": [1, 1, 1, 1, 2],
+            "market_type": ["ml", "total", "prop", "pl", "ml"],
+            "status": ["PENDING", "SETTLED", "SKIPPED", "PENDING", "SETTLED"],
+            "recommended_stake": [10.0, 5.0, 7.0, 3.0, 20.0],
+            "voided": [False, False, False, True, False],
+        })
+        bets, stakes = game_exposure(issued)
+        assert bets == {1: 2, 2: 1}
+        assert stakes == {1: pytest.approx(15.0), 2: pytest.approx(20.0)}
+
+    def test_nothing_issued(self):
+        empty = pd.DataFrame(columns=["game_id", "market_type", "status",
+                                      "recommended_stake", "voided"])
+        assert game_exposure(empty) == ({}, {})
+
+
+class TestExposureSettings:
+    """MAX_BETS_PER_GAME / MAX_GAME_STAKE_PCT from the environment: blank
+    = default; a malformed or out-of-range value logs an error and falls
+    back instead of breaking the import (and the daily chain)."""
+
+    def _read(self, bets: str, pct: str):
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+        root = Path(__file__).parent.parent
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import betting.recommend as r; "
+             "print(r.MAX_BETS_PER_GAME, r.MAX_GAME_STAKE_PCT)"],
+            cwd=root, capture_output=True, text=True, check=True,
+            env={**os.environ, "PYTHONPATH": str(root),
+                 "MAX_BETS_PER_GAME": bets, "MAX_GAME_STAKE_PCT": pct})
+        n, p = out.stdout.strip().splitlines()[-1].split()
+        return int(n), float(p), out.stderr
+
+    def test_blank_means_the_engine_defaults(self):
+        n, p, err = self._read("", "")
+        assert (n, p) == (3, 0.04) and "ERROR" not in err
+
+    def test_valid_values(self):
+        n, p, _ = self._read(" 2 ", "0.05")
+        assert (n, p) == (2, 0.05)
+
+    @pytest.mark.parametrize("bets,pct", [("abc", "4"), ("0", "nan"),
+                                          ("2.5", "0"), ("-1", "-0.1")])
+    def test_bad_values_fall_back_with_an_error(self, bets, pct):
+        n, p, err = self._read(bets, pct)
+        assert (n, p) == (3, 0.04)
+        assert f"MAX_BETS_PER_GAME={bets!r}" in err
+        assert f"MAX_GAME_STAKE_PCT={pct!r}" in err
+
+
 class TestCommittedStake:
     def test_skipped_and_voided_picks_commit_nothing(self):
         issued = pd.DataFrame({
@@ -187,6 +319,16 @@ class TestCommittedStake:
         empty = pd.DataFrame(columns=["game_id", "status",
                                       "recommended_stake", "voided"])
         assert committed_stake(empty) == 0.0
+
+    def test_every_market_counts_toward_the_day(self):
+        issued = pd.DataFrame({
+            "game_id": [1, 1, 2],
+            "market_type": ["ml", "total", "prop"],
+            "status": ["PENDING", "PENDING", "SKIPPED"],
+            "recommended_stake": [10.0, 5.0, 7.0],
+            "voided": [False, False, False],
+        })
+        assert committed_stake(issued) == pytest.approx(15.0)
 
 
 class TestFrozenGames:
@@ -207,6 +349,18 @@ class TestFrozenGames:
         issued = pd.DataFrame({"game_id": [7], "status": ["PENDING"],
                                "recommended_stake": [10.0], "voided": [None]})
         assert frozen_games(issued) == {7}
+
+    def test_other_markets_do_not_freeze_the_moneyline(self):
+        # load_issued_picks now returns every market; only an ml pick
+        # makes a game's moneyline frozen
+        issued = pd.DataFrame({
+            "game_id": [1, 2, 3],
+            "market_type": ["total", "ml", "prop"],
+            "status": ["PENDING", "PENDING", "SKIPPED"],
+            "recommended_stake": [5.0, 10.0, 3.0],
+            "voided": [False, False, False],
+        })
+        assert frozen_games(issued) == {2}
 
     def test_nothing_issued(self):
         empty = pd.DataFrame(columns=["game_id", "status",
@@ -477,13 +631,18 @@ class TestFrozenPicks:
         assert write_recommendations([_rec(g1, "AWAY", -130)], two_games) == 0
         assert len(self._recs([g1])) == 1
 
-    def test_cap_is_rechecked_under_the_write_lock(self, two_games):
+    def test_cap_is_rechecked_under_the_write_lock(self, two_games,
+                                                  monkeypatch):
         """A run that decided before another run's pick landed: the budget
         is re-read inside write_recommendations, so its new pick is
-        trimmed instead of pushing the day past the cap."""
+        trimmed instead of pushing the day past the cap. (The per-game
+        stake limit is lifted here: this test puts most of a day's budget
+        on one game to isolate the daily cap.)"""
+        import betting.recommend as R
         from betting.engine import MAX_DAILY_PCT
         from betting.recommend import (BANKROLL, committed_stake,
                                        load_issued_picks, write_recommendations)
+        monkeypatch.setattr(R, "MAX_GAME_STAKE_PCT", 1.0)
         g1, g2 = two_games
         budget = BANKROLL * MAX_DAILY_PCT
         already = committed_stake(load_issued_picks(SIM_DATE))
@@ -497,3 +656,117 @@ class TestFrozenPicks:
         # a stake that fits what is left still goes in
         assert write_recommendations([_rec(g2, stake=5.0)], two_games,
                                      slate_date=SIM_DATE) == 1
+
+    def test_per_game_limits_count_other_markets_under_the_write_lock(
+            self, two_games):
+        """A totals pick already on the game counts toward the per-game
+        limits when the moneyline pick is written: 30 on the total + 15
+        would pass the 40 (4% of 1000) game limit; 10 fits. The totals
+        row does not freeze the moneyline."""
+        from sqlalchemy import text
+        from betting.recommend import write_recommendations
+        from config.settings import engine
+        g1, _ = two_games
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO betting.recommendations
+                    (game_id, market_type, side, model_prob, best_book,
+                     best_price, recommended_stake, status)
+                VALUES (:g, 'total', 'OVER', 0.55, 'testbook', -110, 30.0,
+                        'PENDING')"""), {"g": g1})
+        assert write_recommendations([_rec(g1, stake=15.0)], two_games,
+                                     slate_date=SIM_DATE, bankroll=1000) == 0
+        assert write_recommendations([_rec(g1, stake=10.0)], two_games,
+                                     slate_date=SIM_DATE, bankroll=1000) == 1
+
+
+class TestTotalsGateSwitch:
+    """The daily job reads models.totals.GATE_PASSED once per run, with
+    everything else faked (no database, no model training)."""
+
+    @pytest.fixture()
+    def job(self, monkeypatch):
+        import betting.recommend as R
+        calls = {"recs": [], "totals_scored": 0, "totals_written": 0}
+        slate = pd.DataFrame({"game_id": [1, 2], "season": [20262027] * 2,
+                              "date": [SIM_DATE] * 2,
+                              "home_team": ["BOS", "NYR"],
+                              "away_team": ["TOR", "PHI"]})
+        monkeypatch.setattr(R, "ensure_schema", lambda: None)
+        monkeypatch.setattr(R, "load_slate", lambda d, simulate=False: slate)
+        monkeypatch.setattr(R, "build_slate_vectors",
+                            lambda s, d, asof=None: s[["game_id"]])
+        monkeypatch.setattr(R, "score_slate", lambda v, cutoff_date=None:
+                            pd.DataFrame({"game_id": [1, 2],
+                                          "prob_home": [0.60, 0.50],
+                                          "market_available": [1.0, 1.0]}))
+        monkeypatch.setattr(R, "load_market", lambda ids, asof=None:
+                            pd.DataFrame({
+                                "game_id": [1, 2], "fair_home_prob": [0.5, 0.5],
+                                "n_books": [3, 3], "home_price": [-105, -110],
+                                "home_book": ["b", "b"], "home_priced_at": [None] * 2,
+                                "away_price": [-110, -110], "away_book": ["b", "b"],
+                                "away_priced_at": [None] * 2}))
+        monkeypatch.setattr(R, "load_issued_picks", lambda d, conn=None:
+                            pd.DataFrame(columns=["game_id", "market_type",
+                                                  "status", "recommended_stake",
+                                                  "voided"]))
+        monkeypatch.setattr(R, "write_predictions",
+                            lambda scored: {1: 11, 2: 12})
+
+        def fake_write_recs(recs, ids, slate_date=None, bankroll=None):
+            calls["recs"].extend(recs)
+            return len(recs)
+
+        def fake_score_totals(slate, d, cutoff_date=None):
+            calls["totals_scored"] += 1
+            return pd.DataFrame({"game_id": [1, 2],
+                                 "expected_total": [6.1, 5.9]})
+
+        def fake_write_totals(scored, lines):
+            calls["totals_written"] += 1
+            return len(scored)
+
+        monkeypatch.setattr(R, "write_recommendations", fake_write_recs)
+        monkeypatch.setattr(R, "score_totals", fake_score_totals)
+        monkeypatch.setattr(R, "load_total_lines", lambda ids, asof=None:
+                            pd.DataFrame(columns=["game_id", "line"]))
+        monkeypatch.setattr(R, "write_total_predictions", fake_write_totals)
+
+        def run(gate_passed):
+            import models.totals as T
+            monkeypatch.setattr(T, "GATE_PASSED", gate_passed)
+            recs = R.generate_recommendations(SIM_DATE, bankroll=1000,
+                                              edge_min=0.025)
+            return recs, calls
+        return run
+
+    @staticmethod
+    def _gate_records(caplog):
+        return [r for r in caplog.records if "GATE_PASSED" in r.getMessage()]
+
+    def test_gate_closed_keeps_totals_predictions_only(self, job, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, logger="nhl.betting.recommend"):
+            recs, calls = job(False)
+        gate = self._gate_records(caplog)
+        assert len(gate) == 1 and gate[0].levelno == logging.INFO
+        assert "predictions-only" in gate[0].getMessage()
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        # totals scored and stored as predictions; the only pick is ml
+        assert calls["totals_scored"] == 1 and calls["totals_written"] == 1
+        assert [r["game_id"] for r in calls["recs"]] == [1]
+        assert list(recs["side"]) == ["HOME"]
+
+    def test_gate_open_logs_an_error_and_still_bets_no_totals(self, job,
+                                                             caplog):
+        import logging
+        with caplog.at_level(logging.INFO, logger="nhl.betting.recommend"):
+            recs, calls = job(True)
+        gate = self._gate_records(caplog)
+        assert len(gate) == 1 and gate[0].levelno == logging.ERROR
+        assert "no totals betting path" in gate[0].getMessage()
+        # nothing else changes: predictions stored, moneyline pick only
+        assert calls["totals_scored"] == 1 and calls["totals_written"] == 1
+        assert [r["game_id"] for r in calls["recs"]] == [1]
+        assert "market_type" not in recs or set(recs["market_type"]) <= {"ml"}
