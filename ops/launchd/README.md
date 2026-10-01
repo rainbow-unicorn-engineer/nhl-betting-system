@@ -2,15 +2,19 @@
 
 Templates for the Mac's scheduled runs. launchd is the job scheduler built into macOS; each job is a small XML file (a plist) in `~/Library/LaunchAgents`. These files are templates. Nothing installs them, and the live Mac's existing `com.nhlbetting.daily` and `com.nhlbetting.odds` plists are not replaced automatically. On Windows, use [ops/windows/](../windows/) instead.
 
+**The Mac keeps the picks role.** Each machine has one role, its own `.env`, its own Odds API key and its own database. The Mac makes the moneyline picks and takes the closing lines that grade them, with the three jobs below. The Windows PC is the props machine: it collects player-props lines with its own key (`register-tasks.ps1 -Role props`, see [ops/windows/](../windows/)). The Mac needs no props job and no new plist: the new free steps (an NHL-feed snapshot after each odds snapshot, power-play stats and the ESPN injury list) run inside `daily`, `odds` and `close`.
+
 | File | Runs | When | Credits a run |
 |---|---|---|---|
-| `com.nhlbetting.daily.plist` | `python pipeline.py daily` | 9:00 | 6 |
-| `com.nhlbetting.odds.plist` (optional) | `python pipeline.py odds` | 13:00 | 6 |
-| `com.nhlbetting.close.plist` | `python pipeline.py close --due` | every 15 minutes | 2 when a game is about to start, otherwise 0 |
+| `com.nhlbetting.daily.plist` | `python pipeline.py daily` | 9:00 | 3 |
+| `com.nhlbetting.odds.plist` (optional) | `python pipeline.py odds` | 13:00 | 3 |
+| `com.nhlbetting.close.plist` | `python pipeline.py close --due` | every 15 minutes | 1 when a game is about to start, otherwise 0 |
 
-Times are the Mac's local time, and the defaults suit a Mac on Central time. Every snapshot run makes no Odds API request, and costs nothing, when no game starts in the next 24 hours. `close --due` takes its 2-credit moneyline snapshot only when some game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old; the other runs log one line and exit. So every start time gets one close, in the last 15-minute run before puck drop, afternoon games included, and the close job has no times to adjust. Those two limits are defaults, set by `CLOSE_LEAD_MINUTES` and `CLOSE_MIN_GAP_MINUTES` in `.env`.
+The credits are for the default `ODDS_BOOKMAKERS`: ten named books bill as one region, half the old `us,us2` cost of 6 and 2.
 
-**Credits:** at the defaults, the closes average about 8 credits a game day, so the daily run plus the close job comes to at most about 456 credits in any month of the 2026-27 schedule, under the free plan's 500. Adding the midday `odds` run goes over. [Snapshot schedule](../../README.md#snapshot-schedule) in the main README has the numbers.
+Times are the Mac's local time, and the defaults suit a Mac on Central time. Every snapshot run makes no Odds API request, and costs nothing, when no game starts in the next 24 hours. `close --due` takes its 1-credit moneyline snapshot only when some game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old; the other runs log one line and exit. So every start time gets one close, in the last 15-minute run before puck drop, afternoon games included, and the close job has no times to adjust. Those two limits are defaults, set by `CLOSE_LEAD_MINUTES` and `CLOSE_MIN_GAP_MINUTES` in `.env`.
+
+**Credits:** at the defaults, the closes average about 4 credits a game day, so the daily run plus the close job comes to at most about 228 credits in any month of the 2026-27 schedule, under the free plan's 500. The midday `odds` run adds about 93 in a full month, so it fits too. [Snapshot schedule](../../README.md#snapshot-schedule) in the main README has the numbers.
 
 Each file has two placeholders:
 
@@ -57,7 +61,7 @@ launchctl unload "$HOME/Library/LaunchAgents/com.nhlbetting.daily.plist"
 launchctl load "$HOME/Library/LaunchAgents/com.nhlbetting.daily.plist"
 ```
 
-- The close job needs no adjusting for the slate: it reads each game's start time from the database. `python pipeline.py close` (without `--due`) still takes a snapshot on demand, for 2 credits.
+- The close job needs no adjusting for the slate: it reads each game's start time from the database. `python pipeline.py close` (without `--due`) still takes a snapshot on demand, for 1 credit.
 - A game with no snapshot between its pick and its puck drop settles with a blank CLV.
 
 ## Sleep, Docker, and the off-season
@@ -73,4 +77,4 @@ launchctl load "$HOME/Library/LaunchAgents/com.nhlbetting.daily.plist"
 
 ## Two machines
 
-Each machine reads its own `.env`, so a second machine (such as the Windows PC) can use its own Odds API key with its own 500 free credits a month. Sharing one key splits those 500 credits between the machines.
+Each machine reads its own `.env`, so the Windows PC uses its own Odds API key for props, with its own 500 free credits a month. Sharing one key would split those 500 credits between the Mac's moneyline snapshots and the PC's props.

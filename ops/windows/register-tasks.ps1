@@ -1,10 +1,29 @@
 <#
 .SYNOPSIS
-    Registers Windows Task Scheduler tasks that mirror ops/launchd/:
-    daily at 9:00, the optional midday odds run at 13:00, and
-    `close --due` every 15 minutes.
+    Registers the Windows Task Scheduler tasks for one machine role.
+    -Role is required: picks or props.
 
 .DESCRIPTION
+    Each machine has one role, its own .env, its own Odds API key (500 free
+    credits a month per key) and its own database:
+
+      -Role picks   The moneyline machine (the owner's Mac; mirrors
+                    ops/launchd/). Registers:
+                      daily      python pipeline.py daily        at -DailyTime (9:00)
+                      odds       python pipeline.py odds         at -OddsTime (13:00), only with -IncludeOdds
+                      close      python pipeline.py close --due  every 15 minutes
+
+      -Role props   The props machine (the owner's Windows PC). Registers:
+                      refresh    python pipeline.py refresh      at -DailyTime (9:00): schedule,
+                                                                 box scores, power-play stats and
+                                                                 injuries; no odds request, no picks
+                      props      python pipeline.py props        at -PropsTime (10:00)
+                      props-due  python pipeline.py props --due  every 15 minutes
+                    and none of the picks tasks.
+
+    Registering one role removes the other role's tasks from \NHLBetting\
+    if they are there, so one machine never spends its key on both jobs.
+
     Each task runs "<PythonPath> pipeline.py <command>" with the repo as its
     working folder (so .env and DATA_DIR resolve as they do by hand) and
     appends its output to logs\<task>.log in the repo (git ignores logs\).
@@ -21,6 +40,12 @@
     Nothing runs this script automatically. Run it again to update the
     tasks; -Unregister removes them.
 
+.PARAMETER Role
+    Required (except with -Unregister). "picks": daily, close --due every 15
+    minutes and, with -IncludeOdds, the midday odds run; moneyline picks and
+    closing lines. "props": refresh, a morning props snapshot and props --due
+    every 15 minutes; player-props lines, no picks.
+
 .PARAMETER RepoPath
     The repo folder. Default: two levels up from this script.
 
@@ -28,56 +53,83 @@
     The Python the project is installed in. Default: <RepoPath>\.venv\Scripts\python.exe
 
 .PARAMETER IncludeOdds
-    Also register the optional midday `odds` run (6 credits a game day).
+    -Role picks only: also register the optional midday `odds` run (3
+    credits a game day with the default ODDS_BOOKMAKERS).
 
 .PARAMETER DailyTime
-    Local time of the daily run. Default 09:00.
+    Local time of the daily run (daily for picks, refresh for props). Default 09:00.
 
 .PARAMETER OddsTime
-    Local time of the midday odds run. Default 13:00.
+    Local time of the midday odds run (-Role picks -IncludeOdds). Default 13:00.
+
+.PARAMETER PropsTime
+    Local time of the morning props snapshot (-Role props). Default 10:00,
+    after the 9:00 refresh has loaded the day's schedule.
 
 .PARAMETER VisibleConsole
     Start cmd.exe directly instead of through "conhost.exe --headless", as
     older versions of this script did. For Windows older than 10 21H2: a
     console window then opens for a moment at every run, every 15 minutes
-    for the close task.
+    for the close and props-due tasks.
 
 .PARAMETER Unregister
-    Remove the tasks this script registers, then stop.
+    Remove every task this script registers (either role), then stop.
 
 .EXAMPLE
-    .\ops\windows\register-tasks.ps1 -IncludeOdds
+    .\ops\windows\register-tasks.ps1 -Role props
 
 .EXAMPLE
-    .\ops\windows\register-tasks.ps1 -RepoPath C:\Working\nhl-betting-system -PythonPath C:\Working\nhl-betting-system\.venv\Scripts\python.exe
+    .\ops\windows\register-tasks.ps1 -Role picks -IncludeOdds
+
+.EXAMPLE
+    .\ops\windows\register-tasks.ps1 -Role props -RepoPath C:\Working\nhl-betting-system -PythonPath C:\Working\nhl-betting-system\.venv\Scripts\python.exe
 
 .EXAMPLE
     .\ops\windows\register-tasks.ps1 -Unregister
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = "Register")]
 param(
+    [Parameter(Mandatory = $true, ParameterSetName = "Register",
+        HelpMessage = "picks = moneyline picks and closes (daily, close --due, optional odds); props = player-props lines (refresh, props, props --due)")]
+    [ValidateSet("picks", "props")]
+    [string]$Role,
     [string]$RepoPath = (Join-Path $PSScriptRoot "..\.."),
     [string]$PythonPath = "",
+    [Parameter(ParameterSetName = "Register")]
     [switch]$IncludeOdds,
     [string]$DailyTime = "09:00",
     [string]$OddsTime = "13:00",
+    [string]$PropsTime = "10:00",
     [switch]$VisibleConsole,
+    [Parameter(Mandatory = $true, ParameterSetName = "Unregister")]
     [switch]$Unregister
 )
 
 $ErrorActionPreference = "Stop"
 $TaskFolder = "\NHLBetting\"
-$TaskNames = @("daily", "odds", "close")
+$RoleTasks = @{
+    "picks" = @("daily", "odds", "close")
+    "props" = @("refresh", "props", "props-due")
+}
+$AllTasks = $RoleTasks["picks"] + $RoleTasks["props"]
+
+function Remove-PipelineTask([string]$Name) {
+    $task = Get-ScheduledTask -TaskPath $TaskFolder -TaskName $Name -ErrorAction SilentlyContinue
+    if ($task) {
+        Unregister-ScheduledTask -TaskPath $TaskFolder -TaskName $Name -Confirm:$false
+        Write-Host "Removed $TaskFolder$Name"
+    }
+}
 
 if ($Unregister) {
-    foreach ($name in $TaskNames) {
-        $task = Get-ScheduledTask -TaskPath $TaskFolder -TaskName $name -ErrorAction SilentlyContinue
-        if ($task) {
-            Unregister-ScheduledTask -TaskPath $TaskFolder -TaskName $name -Confirm:$false
-            Write-Host "Removed $TaskFolder$name"
-        }
+    foreach ($name in $AllTasks) {
+        Remove-PipelineTask $name
     }
     return
+}
+
+if ($IncludeOdds -and $Role -ne "picks") {
+    throw "-IncludeOdds adds the midday moneyline odds run, which belongs to -Role picks. The props role makes no picks."
 }
 
 $RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
@@ -134,6 +186,15 @@ function New-PipelineAction([string]$Command, [string]$LogName) {
     }
 }
 
+function New-QuarterHourTrigger {
+    # Every 15 minutes, all day, every day
+    $trigger = New-ScheduledTaskTrigger -Daily -At "00:00"
+    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At "00:00" `
+        -RepetitionInterval (New-TimeSpan -Minutes 15) `
+        -RepetitionDuration (New-TimeSpan -Days 1)).Repetition
+    return $trigger
+}
+
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
     -MultipleInstances IgnoreNew -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries
@@ -141,32 +202,54 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
 function Register-PipelineTask([string]$Name, $Trigger, $Action, [string]$What) {
     Register-ScheduledTask -TaskPath $TaskFolder -TaskName $Name `
         -Action $Action -Trigger $Trigger -Settings $settings `
-        -Description "nhl-betting-system: $What" -Force | Out-Null
+        -Description "nhl-betting-system ($Role role): $What" -Force | Out-Null
     Write-Host "Registered $TaskFolder$Name ($What)"
 }
 
-# daily: refresh, full snapshot (6 credits), picks
-Register-PipelineTask "daily" (New-ScheduledTaskTrigger -Daily -At $DailyTime) `
-    (New-PipelineAction "daily" "daily") "python pipeline.py daily at $DailyTime"
-
-# odds (optional): confirmed starters, picks for games without one, alerts
-if ($IncludeOdds) {
-    Register-PipelineTask "odds" (New-ScheduledTaskTrigger -Daily -At $OddsTime) `
-        (New-PipelineAction "odds" "odds") "python pipeline.py odds at $OddsTime"
-} elseif (Get-ScheduledTask -TaskPath $TaskFolder -TaskName "odds" -ErrorAction SilentlyContinue) {
-    Write-Host "Left the existing $($TaskFolder)odds task alone (-IncludeOdds not given; -Unregister removes all three)"
+# One machine, one role: the other role's tasks would spend this machine's
+# key on a second job.
+$OtherRole = if ($Role -eq "picks") { "props" } else { "picks" }
+foreach ($name in $RoleTasks[$OtherRole]) {
+    Remove-PipelineTask $name
 }
 
-# close --due every 15 minutes, all day: it snapshots (2 credits) only when
-# a game starts within 16 minutes and no moneyline snapshot is under 16
-# minutes old, so each start time gets one close, in the last run before
-# puck drop, and most runs just log a line and exit.
-$closeTrigger = New-ScheduledTaskTrigger -Daily -At "00:00"
-$closeTrigger.Repetition = (New-ScheduledTaskTrigger -Once -At "00:00" `
-    -RepetitionInterval (New-TimeSpan -Minutes 15) `
-    -RepetitionDuration (New-TimeSpan -Days 1)).Repetition
-Register-PipelineTask "close" $closeTrigger (New-PipelineAction "close --due" "close") `
-    "python pipeline.py close --due every 15 minutes"
+if ($Role -eq "picks") {
+    # daily: refresh, full snapshot (3 credits), free NHL feed, picks
+    Register-PipelineTask "daily" (New-ScheduledTaskTrigger -Daily -At $DailyTime) `
+        (New-PipelineAction "daily" "daily") "python pipeline.py daily at $DailyTime"
+
+    # odds (optional): confirmed starters, picks for games without one, alerts
+    if ($IncludeOdds) {
+        Register-PipelineTask "odds" (New-ScheduledTaskTrigger -Daily -At $OddsTime) `
+            (New-PipelineAction "odds" "odds") "python pipeline.py odds at $OddsTime"
+    } elseif (Get-ScheduledTask -TaskPath $TaskFolder -TaskName "odds" -ErrorAction SilentlyContinue) {
+        Write-Host "Left the existing $($TaskFolder)odds task alone (-IncludeOdds not given; -Unregister removes every task)"
+    }
+
+    # close --due every 15 minutes, all day: it snapshots (1 credit) only
+    # when a game starts within 16 minutes and no moneyline snapshot is
+    # under 16 minutes old, so each start time gets one close, in the last
+    # run before puck drop, and most runs just log a line and exit.
+    Register-PipelineTask "close" (New-QuarterHourTrigger) `
+        (New-PipelineAction "close --due" "close") `
+        "python pipeline.py close --due every 15 minutes"
+} else {
+    # refresh: schedule and box scores (props are matched to raw.games),
+    # power-play stats and the ESPN injury list. Free: no Odds API request
+    Register-PipelineTask "refresh" (New-ScheduledTaskTrigger -Daily -At $DailyTime) `
+        (New-PipelineAction "refresh" "refresh") "python pipeline.py refresh at $DailyTime"
+
+    # props: one snapshot of every game starting in the next 24 hours, 1
+    # credit a game per market returned (nothing for a game without props yet)
+    Register-PipelineTask "props" (New-ScheduledTaskTrigger -Daily -At $PropsTime) `
+        (New-PipelineAction "props" "props") "python pipeline.py props at $PropsTime"
+
+    # props --due every 15 minutes: one pre-game snapshot per game, 1 to 16
+    # minutes before its puck drop; most runs just log a line and exit
+    Register-PipelineTask "props-due" (New-QuarterHourTrigger) `
+        (New-PipelineAction "props --due" "props-due") `
+        "python pipeline.py props --due every 15 minutes"
+}
 
 Write-Host ""
 if ($VisibleConsole) {

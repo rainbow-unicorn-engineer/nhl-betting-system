@@ -5,14 +5,15 @@
   due flag (see ProgramArguments), every 15 minutes. XML comments cannot
   hold a double hyphen, so the flag is not spelled out here.
   Settlement grades each pick against the same book's
-  last snapshot before that game's puck drop. A run takes the 2-credit
+  last snapshot before that game's puck drop. A run takes the 1-credit
   moneyline snapshot (no picks, no alerts) only when some game starts
   within 16 minutes and no moneyline snapshot is under 16 minutes old;
   every other run logs one line and exits, at no cost. So each start time
   gets one close, in the last run before puck drop, early afternoon games
   included, with no times to adjust for the slate or your time zone. At
   those defaults the daily run plus this job stay under the free plan's
-  500 credits a month (at most about 456 on the 2026-27 schedule).
+  500 credits a month (at most about 228 on the 2026-27 schedule, with
+  the default ODDS_BOOKMAKERS). A free NHL-feed snapshot follows each close.
 
   Replace __REPO__ with the repo's absolute path and __PYTHON__ with the
   virtual environment's Python (usually __REPO__/.venv/bin/python), then

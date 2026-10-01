@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  TEMPLATE: the morning run, `python pipeline.py daily` (full 6-credit odds
+  TEMPLATE: the morning run, `python pipeline.py daily` (full 3-credit odds
   snapshot; the day's picks are issued and locked at its prices).
 
   Replace __REPO__ with the repo's absolute path and __PYTHON__ with the

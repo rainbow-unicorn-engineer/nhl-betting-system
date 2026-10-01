@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   TEMPLATE (optional job): the midday run, `python pipeline.py odds` (full
-  6-credit odds snapshot, confirmed starting goalies, picks for games that
+  3-credit odds snapshot, confirmed starting goalies, picks for games that
   still have none, arbitrage and middle alerts). It never changes a pick
   already issued. Skip this job if the monthly credits run short.
 
