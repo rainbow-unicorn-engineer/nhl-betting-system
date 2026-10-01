@@ -128,3 +128,14 @@ class TestIntegration:
                 WHERE model_name = :n AND version = :v
             """), {"n": MODEL_NAME, "v": MODEL_VERSION}).one()
         assert float(row.cv_log_loss) == pytest.approx(pooled["log_loss"], abs=5e-4)
+
+
+def test_a_season_just_started_is_not_a_validation_fold():
+    """The first week of a new season (8 games against 30-game seasons)
+    must not become a fold of its own."""
+    meta = synth_meta()
+    extra = pd.DataFrame([{"game_id": 1000 + k, "season": 20232024,
+                           "date": pd.Timestamp("2023-10-10") + timedelta(days=k)}
+                          for k in range(2)])
+    folds = walk_forward_folds(pd.concat([meta, extra], ignore_index=True))
+    assert [f.val_season for f in folds] == [20212022, 20222023]

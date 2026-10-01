@@ -83,10 +83,19 @@ def walk_forward_folds(meta: pd.DataFrame, purge_days: int = PURGE_DAYS) -> List
     Expanding-window season folds. For validation season N, training rows are
     games from earlier seasons whose date is more than `purge_days` before
     the first game of season N. Never yields a fold without training data.
+
+    A season with fewer games than a tenth of the median season (e.g. the
+    first week of a season in progress) is not a validation fold: a handful
+    of games says nothing about the model and would shuffle which seasons
+    the gates score. Those games still train later folds once played.
     """
     seasons = sorted(meta["season"].unique())
+    sizes = meta.groupby("season").size()
+    min_games = max(1, int(0.1 * float(sizes.median())))
     folds = []
     for val_season in seasons[1:]:
+        if sizes[val_season] < min_games:
+            continue
         val_mask = meta["season"] == val_season
         val_start = meta.loc[val_mask, "date"].min()
         cutoff = val_start - timedelta(days=purge_days)
