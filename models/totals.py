@@ -117,6 +117,22 @@ Evaluation (walk-forward, expanding season folds, purge gap):
   knew every starter perfectly, and the goalie features were still net
   noise. Daily Faceoff starters only keep live scoring as good as this
   test; they add nothing the test lacked.
+- Starter-role experiment (2026-10-01, pre-registered; run_totals
+  variant=A|B|C|D, features/goalie_role.py). Pass rule fixed in advance:
+  pooled NLL below the baseline by >= 2 paired SEs AND ahead in >= 4 of 5
+  folds. Baseline 2.1787 throughout. A (v2) 2.1801 (+0.0014, SE 0.0011,
+  2/5 folds); B (no goalie_*) 2.1793 (+0.0006, SE 0.0010, 1/5); C (v2 +
+  defending goalie's start shares, primary flag, rest, back-to-back,
+  carried save%, gap to the other goalie) 2.1790 (+0.0003, SE 0.0010,
+  2/5); D (C minus goalie_*) 2.1791 (+0.0004, SE 0.0010, 3/5). NONE
+  passes. O/U log loss at the DraftKings line (n=1,011): A 0.6958, B
+  0.6949, C 0.6941, D 0.6945 (coin flip 0.6931). On games where either
+  starter was not his team's season-to-date leader (4,466 scored games;
+  the definition counts ties and early-season splits, so it is broad) all
+  four variants are still behind the baseline (2.1788-2.1795 vs 2.1781).
+  Attack rows facing a non-leader goalie do score ~0.12 more regulation
+  goals on average, but that difference did not turn into a lower
+  out-of-fold NLL for any variant.
 - Consequences: the model registers as inactive, the daily job writes PMF
   predictions for the bet checker and the alerts but NO totals
   recommendations, and GATE_PASSED stays False. The realistic path is
