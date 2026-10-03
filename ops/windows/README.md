@@ -2,9 +2,21 @@
 
 Task Scheduler is the job scheduler built into Windows. `register-tasks.ps1` registers the tasks for one **machine role** in a Task Scheduler folder named `\NHLBetting\`. `-Role` is required.
 
-Each machine has one role, its own `.env`, its own Odds API key and its own database. The owner's setup: the Mac is the **picks** machine (moneyline picks and closing lines, scheduled by [ops/launchd/](../launchd/)), and this Windows PC is the **props** machine (player-props lines). Each key has its own 500 free credits a month, so the two jobs never share a budget.
+Each machine has its own `.env`, its own Odds API key and its own database. **The owner's setup (2026-10-01): both the Mac and this Windows PC run every job, `-Role all`** (on the Mac, every template in [ops/launchd/](../launchd/)). `-Role picks` and `-Role props` split the jobs between two machines instead.
 
-**`-Role props`** (the Windows PC):
+**`-Role all`** (the Windows PC): the `-Role picks` tasks below plus `props` and `props-due` from `-Role props`. It does not register `refresh`, because `daily` already does everything `refresh` does.
+
+| Task | Runs | When |
+|---|---|---|
+| `daily` | `python pipeline.py daily` | 9:00 |
+| `odds` (optional, `-IncludeOdds`) | `python pipeline.py odds` | 13:00 |
+| `close` | `python pipeline.py close --due` | every 15 minutes |
+| `props` | `python pipeline.py props` | 10:00 |
+| `props-due` | `python pipeline.py props --due` | every 15 minutes |
+
+**Credits for `-Role all`:** the picks tasks' credits plus the props tasks' credits, both given below. That is more than the free plan's 500 a month, so a machine running every job needs a paid key (the 20K plan covers it).
+
+**`-Role props`** (props only, no picks):
 
 | Task | Runs | When | Credits a run |
 |---|---|---|---|
@@ -16,7 +28,7 @@ Each machine has one role, its own `.env`, its own Odds API key and its own data
 
 **Credits for props:** a morning and a pre-game snapshot is 2 credits a game for each market. With the default single market (`PROPS_MARKETS=player_shots_on_goal`) that is at most 308 (February) to 464 (January) credits a month on the 2026-27 schedule, under the free plan's 500, narrowly in January. Four markets need the paid 20K plan. A game where no book has posted props yet costs nothing.
 
-**`-Role picks`** (the same jobs as the Mac's launchd agents, for a Windows PC that makes picks instead):
+**`-Role picks`** (moneyline picks and closing lines only, the same jobs as the Mac's daily, odds and close agents):
 
 | Task | Runs | When | Credits a run |
 |---|---|---|---|
@@ -26,28 +38,29 @@ Each machine has one role, its own `.env`, its own Odds API key and its own data
 
 The credits are for the default `ODDS_BOOKMAKERS` (10 named books bill as one region). `close --due` takes its 1-credit snapshot only when a game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old (`CLOSE_LEAD_MINUTES` and `CLOSE_MIN_GAP_MINUTES`), so each start time gets one close, in the last run before puck drop; the other runs log one line and exit. At the defaults the daily run plus the closes come to at most about 228 credits in any month of the 2026-27 schedule, and the midday `odds` run (about 93 more) fits too. [Snapshot schedule](../../README.md#snapshot-schedule) in the main README has the numbers. The picks chains also take a free NHL-feed snapshot after each Odds API snapshot.
 
-Times are this PC's local time. Every snapshot run makes no Odds API request, and costs nothing, when no game starts in the next 24 hours. Registering one role removes the other role's tasks, if any, so one machine never spends its key on both jobs. Nothing runs the script automatically, and it changes nothing on the Mac.
+Times are this PC's local time. Every snapshot run makes no Odds API request, and costs nothing, when no game starts in the next 24 hours. Registering a role removes any `\NHLBetting\` task that role leaves out (for example `refresh` when switching to `all`, or the picks tasks when switching to `props`), so the folder always matches the role given. Nothing runs the script automatically, and it changes nothing on the Mac.
 
 ## Register the tasks
 
 From the repo folder in PowerShell:
 
 ```powershell
-.\ops\windows\register-tasks.ps1 -Role props                  # the props machine (this PC)
-.\ops\windows\register-tasks.ps1 -Role picks -IncludeOdds     # a picks machine; leave out -IncludeOdds to skip the midday run
+.\ops\windows\register-tasks.ps1 -Role all                    # every job (the owner's setup); add -IncludeOdds for the midday run
+.\ops\windows\register-tasks.ps1 -Role props                  # props only
+.\ops\windows\register-tasks.ps1 -Role picks -IncludeOdds     # picks only; leave out -IncludeOdds to skip the midday run
 ```
 
-Without `-Role`, PowerShell asks for it (type `!?` at the prompt for help), and a non-interactive run stops with "missing mandatory parameters: Role". If PowerShell refuses to run the script, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once (the same fix as for `Activate.ps1`), or run it as `powershell -ExecutionPolicy Bypass -File .\ops\windows\register-tasks.ps1 -Role props`.
+Without `-Role`, PowerShell asks for it (type `!?` at the prompt for help), and a non-interactive run stops with "missing mandatory parameters: Role". If PowerShell refuses to run the script, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once (the same fix as for `Activate.ps1`), or run it as `powershell -ExecutionPolicy Bypass -File .\ops\windows\register-tasks.ps1 -Role all`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `-Role` | required | `props`: `refresh`, `props`, `props-due`. `picks`: `daily`, `close`, and `odds` with `-IncludeOdds` |
+| `-Role` | required | `all`: `daily`, `close`, `props`, `props-due`, and `odds` with `-IncludeOdds`. `props`: `refresh`, `props`, `props-due`. `picks`: `daily`, `close`, and `odds` with `-IncludeOdds` |
 | `-RepoPath` | the repo the script is in | The repo folder |
 | `-PythonPath` | `<RepoPath>\.venv\Scripts\python.exe` | The Python the project is installed in. Calling it directly means the task doesn't need to activate the virtual environment |
-| `-IncludeOdds` | off | `-Role picks` only: also register the midday `odds` task |
-| `-DailyTime` | `09:00` | Local time of `daily` (picks) or `refresh` (props) |
+| `-IncludeOdds` | off | `-Role all` or `picks`: also register the midday `odds` task |
+| `-DailyTime` | `09:00` | Local time of `daily` (all, picks) or `refresh` (props) |
 | `-OddsTime` | `13:00` | Local time of the midday `odds` run |
-| `-PropsTime` | `10:00` | Local time of the morning `props` snapshot, after `refresh` has loaded the day's schedule |
+| `-PropsTime` | `10:00` | Local time of the morning `props` snapshot, after the 9:00 run has loaded the day's schedule |
 | `-VisibleConsole` | off | Start `cmd.exe` directly instead of hidden, for Windows older than 10 21H2 (see [No console windows](#no-console-windows)) |
 | `-Unregister` | | Remove every task of either role (no `-Role` needed) |
 
@@ -56,7 +69,7 @@ Running the script again replaces the tasks, so that is also how to change a tim
 ## What the tasks do
 
 - Each task starts in the repo folder, so `.env` is found and a relative `DATA_DIR` resolves to `<repo>\data`.
-- Output is appended to `logs\<task>.log` in the repo: `refresh.log`, `props.log` and `props-due.log` for the props role, `daily.log`, `odds.log` and `close.log` for the picks role. The script creates `logs\`, and git ignores it.
+- Output is appended to `logs\<task>.log` in the repo, named after the task: `daily.log`, `odds.log`, `close.log`, `props.log`, `props-due.log` and `refresh.log`. The script creates `logs\`, and git ignores it.
 - The tasks run as you, only while you are logged on, so no password is stored and no administrator rights are needed. Docker Desktop must be running too, or every run fails at the database check.
 - The tasks run hidden: no console window opens, and nothing takes the focus from what you are doing. See the next section.
 - A run missed while the PC was off or asleep starts as soon as the PC is back. The pipeline then waits up to 3 minutes for the network, and a late close or props snapshot skips games already under way.
