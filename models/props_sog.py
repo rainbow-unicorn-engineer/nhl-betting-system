@@ -110,7 +110,8 @@ as a FORECASTER. Not a betting result: there are no prop prices here.
   mean drifts. Mean predicted minus actual SOG per game, M / B1: 2021-22
   +0.020 / -0.003, 2022-23 +0.095 / +0.048, 2023-24 +0.078 / +0.053,
   2024-25 +0.026 / +0.048, 2025-26 -0.038 / +0.000. M's per-fold ECE of
-  P(> 2.5) (0.008-0.019) is worse than B1's in 3 of 5 folds; the pooled
+  P(> 2.5) (0.008-0.019) is worse than B1's in 4 of 5 folds (2024-25 only
+  narrowly; corrected from "3 of 5" by the reproduction review); the pooled
   ECE is low partly because the season biases cancel. This is the same
   failure the totals booster had (models/totals.py, drift correction),
   and its fix — subtract the booster's running same-season mean
