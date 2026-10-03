@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE: the morning player-props snapshot, `python pipeline.py props`:
+  every game starting in the next 24 hours, 1 credit a game per market
+  returned (nothing for a game without props posted yet). Part of the
+  "every job on every machine" setup; a Mac that only makes picks does
+  not need it.
+
+  Replace __REPO__ with the repo's absolute path and __PYTHON__ with the
+  virtual environment's Python (usually __REPO__/.venv/bin/python), then
+  install it as ops/launchd/README.md describes. Nothing installs this file
+  automatically.
+
+  The time is this Mac's local time: 10:00 runs after the 9:00 daily job
+  has loaded the day's schedule, which props are matched to.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nhlbetting.props</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/pipeline.py</string>
+        <string>props</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- The logs/ folder must exist before the job first runs; git ignores it -->
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/props.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/props.log</string>
+</dict>
+</plist>

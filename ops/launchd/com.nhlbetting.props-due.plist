@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE: the pre-game player-props snapshot, `python pipeline.py props`
+  with its due flag (see ProgramArguments), every 15 minutes. XML comments
+  cannot hold a double hyphen, so the flag is not spelled out here.
+  A run snapshots only games starting within PROPS_CLOSE_LEAD_MINUTES (16)
+  that have no props snapshot in the last PROPS_CLOSE_MIN_GAP_MINUTES (16),
+  so each game gets one pre-game snapshot and every other run logs one
+  line and exits, at no cost. Part of the "every job on every machine"
+  setup; a Mac that only makes picks does not need it.
+
+  Replace __REPO__ with the repo's absolute path and __PYTHON__ with the
+  virtual environment's Python (usually __REPO__/.venv/bin/python), then
+  install it as ops/launchd/README.md describes. Nothing installs this file
+  automatically.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nhlbetting.props-due</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/pipeline.py</string>
+        <string>props</string>
+        <string>--due</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- Every 900 seconds (15 minutes) while the Mac is awake -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- The logs/ folder must exist before the job first runs; git ignores it -->
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/props-due.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/props-due.log</string>
+</dict>
+</plist>
