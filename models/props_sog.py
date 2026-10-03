@@ -5,8 +5,9 @@ skater's shots on goal in a game, given that he plays (toi_seconds > 0),
 from which P(SOG > line) is read for the usual prop lines 0.5 .. 4.5.
 
 STATUS: see the STATUS section at the end of this docstring. Registration
-is disabled (run_props(register=True) raises): this model has not been
-judged against prop prices yet, and nothing reads it.
+is disabled (run_props(register=True) raises), and nothing reads it. The
+price check (STATUS, "Market check") found that it does NOT beat the prop
+market.
 
 Model M (the candidate), pre-registered before any results were seen:
 - One LightGBM regressor, objective poisson, predicting expected SOG.
@@ -184,6 +185,54 @@ based check exists yet.
   is untested: it needs a check against stored prop prices, which this
   module does not run yet. Registration stays disabled until that test
   exists.
+- Market check (2026-10-03; models/props_market_check.py, pre-registered
+  there before any result; read-only; `python -m models.props_market_check`).
+  VERDICT: v2 does NOT beat the market, for either book or pooled.
+  Model = this module's 2025-26 out-of-fold validation fold (49,627
+  player-games, booster trained on 228,914 earlier rows; the same run
+  reproduced the v2 numbers above: fold NLL 1.53823, pooled 1.57818).
+  Prices = raw.prop_odds_hist player_shots_on_goal two-sided pre-game
+  pairs: the stored current pair when last_updated < event_start, else
+  the opening pair. DraftKings 1,354 rows / 75 games (2026-01-14 ..
+  05-08; 20 regular-season, 55 playoff games): 975 current, 379 opening;
+  1,331 matched (unmatched: 1 no player id, 19 did not play, 3 < 5 prior
+  appearances). ESPN BET 5,769 rows / 410 games (2025-10-07 .. 12-01):
+  171 current, 5,595 opening (81 of them carry a current pair stamped at
+  or after puck drop, never used), 3 with no two-sided pre-game pair;
+  5,733 matched (15 no player id, 18 < 5 prior). No pushes (all lines
+  N.5). The 27 late-playoff games (2026-05-09 .. 06-14) are not loaded.
+  PRIMARY: per prop, log loss(model P(over)) - log loss(no-vig market
+  P(over)); SE clustered by game; beats only if mean + 1.96 SE < 0 and
+  n >= 300.
+    DraftKings 1,331 props: +0.00428 (SE 0.00547; upper +0.01500) NO
+    ESPN BET   5,733 props: +0.00526 (SE 0.00167; upper +0.00853) NO
+    pooled     7,064 props: +0.00508 (SE 0.00170; upper +0.00840) NO
+  The market is the better forecaster; on ESPN BET (openings) and pooled
+  it is better by about 3 SE. Brier model / market: DraftKings 0.24716 /
+  0.24536, ESPN BET 0.24564 / 0.24315, pooled 0.24593 / 0.24357. ECE (10
+  bins) model / market: 0.0486 / 0.0360, 0.0224 / 0.0130, pooled 0.0271 /
+  0.0081. Mean P(over) model / market / actual over rate: DraftKings
+  0.455 / 0.497 / 0.461, ESPN BET 0.519 / 0.514 / 0.516.
+  SECONDARY (information only, flat 1 unit at the quoted prices, ROI with
+  a game-clustered bootstrap 95% interval, 2,000 resamples, seed 7):
+    DraftKings T=0.04 481 bets, hit 0.536, ROI +0.016 [-0.082, +0.117];
+               T=0.06 334 bets, hit 0.560, ROI +0.062 [-0.046, +0.176]
+    ESPN BET   T=0.04 1,550 bets, hit 0.518, ROI -0.022 [-0.071, +0.024];
+               T=0.06 911 bets, hit 0.535, ROI +0.016 [-0.046, +0.081]
+    pooled     T=0.04 2,031 bets, hit 0.522, ROI -0.013 [-0.055, +0.030];
+               T=0.06 1,245 bets, hit 0.541, ROI +0.028 [-0.030, +0.085]
+  Every interval includes 0. Pooled T=0.04 by line: 0.5 14 bets ROI
+  -0.147, 1.5 1,034 +0.005, 2.5 794 -0.028, 3.5+ 189 -0.046; by
+  position: F 1,526 -0.015, D 505 -0.007 (all intervals include 0).
+  DraftKings bets are 88% unders at T=0.04 (425 of 481): its over prices
+  imply 0.497 on average against an over rate of 0.461 in this mostly-
+  playoff sample, which is a small and unrepresentative sample (75
+  games), not an edge. DraftKings "N+" milestones (over only, no no-vig
+  possible; information only): 1,337 matched; T=0.04 40 bets, ROI +0.012
+  [-0.334, +0.302]; T=0.06 18 bets, ROI -0.321 [-0.724, +0.168].
+  GATE_PASSED (the forecasting gate) and the disabled registration are
+  unchanged: the model is a better forecaster than its baselines, and a
+  worse one than the prop market.
 """
 import logging
 
