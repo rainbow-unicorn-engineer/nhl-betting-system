@@ -99,14 +99,14 @@ Research notes behind the 2026-09-29 feeds work are in [docs/research/](docs/res
 
 ### Machine roles
 
-Each machine has one role, its own `.env`, its own Odds API key, and its own database. Each key has its own 500 free credits a month, so the two jobs never share a budget.
+Each machine has its own `.env`, its own Odds API key, and its own database. **The owner runs every job on both machines** (decided 2026-10-01): the Mac installs all five [ops/launchd/](ops/launchd/) templates, and the Windows PC runs `.\ops\windows\register-tasks.ps1 -Role all`. The two roles below are what "every job" is made of, and either one can still be run alone on a machine that should do only that job.
 
-| Role | Machine | Scheduled runs | What its key pays for |
-|---|---|---|---|
-| Picks | The Mac ([ops/launchd/](ops/launchd/)) | `daily`, `close --due` every 15 minutes, optional midday `odds` | Moneyline snapshots and closes: at most about 228 credits a month, about 321 with the midday run |
-| Props | The Windows PC ([ops/windows/](ops/windows/), `-Role props`) | `refresh` at 9:00, `props` at 10:00, `props --due` every 15 minutes | Player-props lines: at most 308 to 464 credits a month for one market (February to January) |
+| Role | Scheduled runs | What its key pays for |
+|---|---|---|
+| Picks | `daily`, `close --due` every 15 minutes, optional midday `odds` | Moneyline snapshots and closes: at most about 228 credits a month, about 321 with the midday run |
+| Props | `props` at 10:00, `props --due` every 15 minutes, plus `refresh` at 9:00 when the machine doesn't run `daily` | Player-props lines: at most 308 to 464 credits a month for one market (February to January) |
 
-A pick can be graded only against closing snapshots taken on the machine that made it, which is why the picks machine takes its own closes. The props machine makes no picks; its `refresh` run loads the schedule (every props line is tied to a game), box scores, power-play stats and the injury list, all free.
+A machine running both roles therefore needs more than the free plan's 500 credits a month: on a free key, run the picks role only (`-Role picks`, about 228 credits a month, about 321 with the midday run) and leave props to a machine with a paid key. A pick can be graded only against closing snapshots taken on the machine that made it, which is why every picks machine takes its own closes. Each machine keeps its own picks and paper ledger, so the Mac and the PC each issue and grade their own picks. `refresh` loads the schedule (every props line is tied to a game), box scores, power-play stats and the injury list, all free; `daily` already does all of that, so a machine running every job skips `refresh`.
 
 ### The Odds API: ten named books
 
@@ -286,7 +286,7 @@ After pulling the 2026-09-29 changes, on each machine:
 
    In PowerShell: `foreach ($S in 20202021,20212022,20222023,20232024,20242025,20252026,20262027) { python -m ingestion.nhl_stats --season $S }`.
 4. Fill the ESPN prices for the games already stored: `python -m ingestion.espn_odds --refresh --season 20252026` first (the DraftKings season a backtest can use), then the other seasons if wanted. About one request a game; resumable.
-5. On the picks machine, check `ODDS_BOOKMAKERS` and `BETTABLE_BOOKS` in `.env` (see [Configuration](#configuration)); without them the defaults apply. On the Windows PC, register the props role: `.\ops\windows\register-tasks.ps1 -Role props`, which also removes any picks tasks registered there before.
+5. On the picks machine, check `ODDS_BOOKMAKERS` and `BETTABLE_BOOKS` in `.env` (see [Configuration](#configuration)); without them the defaults apply. On the Windows PC, register every job: `.\ops\windows\register-tasks.ps1 -Role all`, which also removes a `refresh` task registered there before (`daily` covers it).
 
 Games already stored have no start time or schedule state until their schedule is loaded again. The next `daily` run fills the window from 3 days back to 7 days ahead. To fill a whole season at once, run `python -m ingestion.nhl_api season 20262027` (the current season). Older seasons can stay blank. An odds snapshot matches a game with no start time by its Eastern date instead, and settlement logs a warning that the game's closing window has no puck-drop limit.
 
@@ -469,16 +469,16 @@ These figures were replayed at the old cost of 6 credits a full snapshot and 2 a
 
 The live copy runs on macOS under launchd. Don't add cron entries as well, because the crontab is intentionally empty.
 
-Templates for three agents are in [ops/launchd/](ops/launchd/), with install steps in its README: `com.nhlbetting.daily`, `com.nhlbetting.close` (`close --due` every 15 minutes), and the optional `com.nhlbetting.odds`. Each job logs to the repo's `logs/` folder, which git ignores. The live Mac already has `com.nhlbetting.daily` and `com.nhlbetting.odds` in `~/Library/LaunchAgents`, with their own times and log paths. Nothing replaces those files automatically: add the `close` agent by hand (unloading any earlier fixed-time close first), and compare the other two with the templates before replacing them.
+Templates for five agents are in [ops/launchd/](ops/launchd/), with install steps in its README: `com.nhlbetting.daily`, `com.nhlbetting.close` (`close --due` every 15 minutes), the optional `com.nhlbetting.odds`, and the props agents `com.nhlbetting.props` (10:00) and `com.nhlbetting.props-due` (`props --due` every 15 minutes). Each job logs to the repo's `logs/` folder, which git ignores. The live Mac already has `com.nhlbetting.daily` and `com.nhlbetting.odds` in `~/Library/LaunchAgents`, with their own times and log paths. Nothing replaces those files automatically: add the `close` agent by hand (unloading any earlier fixed-time close first), and compare the other two with the templates before replacing them.
 
 - **Check the agents** with `launchctl list | grep com.nhlbetting`. The middle column is the last exit code.
 - **Docker Desktop must be running**, or every run fails at the database check.
 - **A Mac that was asleep** at the daily or midday time runs that job once when it wakes. The run waits up to 3 minutes for the network, and a late close skips the games already under way.
-- **Pause them for the off-season** with `launchctl unload ~/Library/LaunchAgents/com.nhlbetting.odds.plist`, and the same for `.daily` and `.close`.
+- **Pause them for the off-season** with `launchctl unload ~/Library/LaunchAgents/com.nhlbetting.odds.plist`, and the same for `.daily`, `.close`, `.props` and `.props-due`.
 
-The Mac keeps the picks role, so it needs no props job: the new free steps run inside `daily`, `odds` and `close`.
+The Mac runs every job, so it installs the two props agents too; the free steps (NHL feed, power-play stats, injuries) run inside `daily`, `odds` and `close`, so it needs no `refresh` job.
 
-**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers one role's jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role props`, the Windows PC's role, registers `refresh` at 9:00, `props` at 10:00 and `props --due` every 15 minutes. `-Role picks` registers the Mac's three jobs instead: `daily` at 9:00, `odds` at 13:00 with `-IncludeOdds`, and `close --due` every 15 minutes. Registering one role removes the other role's tasks. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details.
+**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all`, the Windows PC's setup, registers `daily` at 9:00, `close --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details.
 
 ## Tests
 
@@ -548,8 +548,8 @@ features/              team, goalie, schedule, and Elo builders; build_all orche
 models/                baseline, lgbm (moneyline), totals; artifacts/ holds calibration plots
 betting/               engine, recommend, settle, backtest, checker, alerts, promo
 dashboard/app.py       Streamlit control room: Today, Model, Backtest, Bankroll and Check a bet tabs
-ops/launchd/           launchd job templates for the Mac (the picks role): daily, odds, close
-ops/windows/           Task Scheduler registration script for Windows: -Role props or -Role picks
+ops/launchd/           launchd job templates for the Mac: daily, odds, close, props, props-due
+ops/windows/           Task Scheduler registration script for Windows: -Role all, picks or props
 pipeline.py            Master command-line entry point
 tests/                 Test suite; conftest.py keeps it off the live database; fixtures/ holds trimmed API responses
 PROJECT_CONTEXT.md     Locked decisions, status, and lessons learned

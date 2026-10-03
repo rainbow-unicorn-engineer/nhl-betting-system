@@ -18,10 +18,11 @@ prints that command's options and runs nothing):
     python pipeline.py injuries                     # ESPN injury list snapshot (free)
     python pipeline.py nhl-stats [--season S]       # Power-play, penalty-kill, faceoff stats (free)
 
-Machine roles: each machine has its own .env, Odds API key (500 free
-credits a month each) and database. The picks machine (the Mac) runs
-daily, odds and close; the props machine (the Windows PC) runs refresh,
-props and props --due. ops/launchd/ and ops/windows/ schedule them.
+Machine roles: each machine has its own .env, Odds API key and database.
+The picks jobs are daily, odds and close; the props jobs are props and
+props --due (plus refresh on a machine without daily). The owner runs
+every job on both the Mac and the Windows PC. ops/launchd/ and
+ops/windows/ (-Role all) schedule them.
 
 Steps marked non-fatal log an error and let the chain continue.
 """
@@ -290,8 +291,9 @@ def close(due: bool = False):
 
 
 def daily():
-    """Daily refresh pipeline for the picks machine. Run via launchd
-    (ops/launchd/) or Task Scheduler (ops/windows/, -Role picks)."""
+    """Daily refresh pipeline for a machine that makes picks. Run via
+    launchd (ops/launchd/) or Task Scheduler (ops/windows/, -Role all or
+    picks)."""
     from ingestion.nhl_api import daily_refresh
     from ingestion.odds_api import snapshot_odds
     from config.settings import CURRENT_SEASON
@@ -400,10 +402,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python pipeline.py",
         description="NHL Betting System pipeline. `<command> --help` prints a "
                     "command's options and runs nothing.",
-        epilog="Machine roles: the picks machine (the Mac) runs daily, odds and "
-               "close; the props machine (the Windows PC) runs refresh, props and "
-               "props --due. Each machine has its own .env, Odds API key and "
-               "database.")
+        epilog="Machine roles: the picks jobs are daily, odds and close; the "
+               "props jobs are props and props --due (plus refresh where daily "
+               "doesn't run). The owner runs every job on both machines. Each "
+               "machine has its own .env, Odds API key and database.")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     def add(name, text):
