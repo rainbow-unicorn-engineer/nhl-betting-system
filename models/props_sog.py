@@ -224,8 +224,9 @@ based check exists yet.
   Every interval includes 0. Pooled T=0.04 by line: 0.5 14 bets ROI
   -0.147, 1.5 1,034 +0.005, 2.5 794 -0.028, 3.5+ 189 -0.046; by
   position: F 1,526 -0.015, D 505 -0.007 (all intervals include 0).
-  DraftKings bets are 88% unders at T=0.04 (425 of 481): its over prices
-  imply 0.497 on average against an over rate of 0.461 in this mostly-
+  DraftKings bets are 88% unders at T=0.04 (425 of 481): its no-vig over
+  probability averages 0.497 (0.528 with the vig left in) against an over
+  rate of 0.461 in this mostly-
   playoff sample, which is a small and unrepresentative sample (75
   games), not an edge. DraftKings "N+" milestones (over only, no no-vig
   possible; information only): 1,337 matched; T=0.04 40 bets, ROI +0.012
