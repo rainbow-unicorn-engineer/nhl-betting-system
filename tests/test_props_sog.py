@@ -365,6 +365,95 @@ class TestBaselines:
         assert P.main([]) is None
 
 
+# ── In-season drift correction (M2) ────────────────────────────────
+
+def _drift_rows(seed=0, n_days=30, seasons=(20232024, 20242025)):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for si, season in enumerate(seasons):
+        start = pd.Timestamp(f"{2023 + si}-10-10")
+        for d in range(n_days):
+            for _ in range(int(rng.integers(1, 6))):
+                rows.append((season, start + pd.Timedelta(days=d),
+                             float(rng.normal(0.05, 0.2))))
+    return pd.DataFrame(rows, columns=["season", "date", "adj"])
+
+
+class TestDriftCorrection:
+    def test_shrinkage_formula_hand_computed(self):
+        d = pd.to_datetime(["2024-10-10", "2024-10-10", "2024-10-11",
+                            "2024-10-12", "2024-10-12"])
+        adj = np.array([0.10, 0.30, -0.20, 0.50, 0.70])
+        s = np.full(5, 20242025)
+        got = P.drift_shift(s, d, adj)
+        # date 1: nothing earlier; date 2: (0.1 + 0.3) / (2 + 2000);
+        # date 3: (0.1 + 0.3 - 0.2) / (3 + 2000)
+        np.testing.assert_allclose(
+            got, [0, 0, 0.4 / 2002, 0.2 / 2003, 0.2 / 2003], rtol=1e-12)
+        # i.e. the earlier rows' mean shrunk by n / (n + prior)
+        assert got[2] == pytest.approx(np.mean([0.1, 0.3]) * 2 / (2 + 2000))
+        got3 = P.drift_shift(s, d, adj, prior_rows=1.0)
+        assert got3[3] == pytest.approx(0.2 / 4)
+        assert P.DRIFT_PRIOR_ROWS == 2000
+
+    def test_unshrunk_limit_is_the_running_mean(self):
+        df = _drift_rows(seed=3)
+        got = P.drift_shift(df["season"], df["date"], df["adj"], prior_rows=0.0)
+        for i in (40, 70):
+            r = df.iloc[i]
+            prev = df[(df["season"] == r["season"]) & (df["date"] < r["date"])]
+            assert got[i] == pytest.approx(prev["adj"].mean())
+
+    def test_first_date_of_each_season_has_c_equal_one(self):
+        df = _drift_rows(seed=1)
+        got = P.drift_shift(df["season"], df["date"], df["adj"])
+        first = df.groupby("season")["date"].transform("min") == df["date"]
+        assert first.sum() >= 2 and (got[first.to_numpy()] == 0.0).all()
+        # the second season does not inherit the first season's adjustment
+        mu = np.full(len(df), 2.0)
+        corrected, _ = P.drift_correct(mu * np.exp(df["adj"]), mu,
+                                           df["season"], df["date"])
+        np.testing.assert_allclose(
+            corrected[first.to_numpy()],
+            (mu * np.exp(df["adj"]))[first.to_numpy()])
+
+    @pytest.mark.parametrize("cut_day", [1, 9, 22])
+    def test_rewriting_or_removing_rows_on_or_after_the_date(self, cut_day):
+        df = _drift_rows(seed=cut_day)
+        season = 20242025
+        days = sorted(df.loc[df["season"] == season, "date"].unique())
+        cut = days[cut_day]
+        full = P.drift_shift(df["season"], df["date"], df["adj"])
+        keep = (df["season"] != season) | (df["date"] <= cut)
+        part = df[keep].copy()
+        on = (part["season"] == season) & (part["date"] == cut)
+        part.loc[on, "adj"] = np.random.default_rng(7).normal(3, 1, on.sum())
+        got = P.drift_shift(part["season"], part["date"], part["adj"])
+        np.testing.assert_allclose(got, full[keep.to_numpy()], rtol=1e-12)
+        # ... rows after the cut are gone, and the rewritten rows did matter
+        # to the NEXT date (sanity: the test can see a change)
+        nxt = df.copy()
+        sel = (nxt["season"] == season) & (nxt["date"] == cut)
+        nxt.loc[sel, "adj"] = 3.0
+        moved = P.drift_shift(nxt["season"], nxt["date"], nxt["adj"])
+        after = ((df["season"] == season) & (df["date"] > cut)).to_numpy()
+        assert not np.allclose(moved[after], full[after])
+
+    def test_drift_correct_divides_by_c(self):
+        base = np.array([1.0, 2.0, 1.5, 3.0])
+        mu = base * np.exp([0.2, 0.2, 0.4, 0.0])
+        d = pd.to_datetime(["2024-10-10", "2024-10-10", "2024-10-11",
+                            "2024-10-12"])
+        s = np.full(4, 20242025)
+        corrected, shift = P.drift_correct(mu, base, s, d, prior_rows=2.0)
+        np.testing.assert_allclose(shift, [0, 0, 0.4 / 4, 0.8 / 5])
+        np.testing.assert_allclose(corrected, mu / np.exp(shift))
+        np.testing.assert_allclose(P.booster_adjustment(mu, base),
+                                   [0.2, 0.2, 0.4, 0.0], atol=1e-12)
+        # clipped like every other mean
+        assert P.apply_drift([20.0], [0.0])[0] == P.MU_CLIP[1]
+
+
 class TestWalkForwardWiring:
     def test_runs_end_to_end_on_a_synthetic_league(self):
         seasons = (20202021, 20212022, 20222023)
@@ -401,3 +490,57 @@ class TestWalkForwardWiring:
         np.testing.assert_allclose(v["mu_B1"], want, rtol=1e-9)
         np.testing.assert_allclose(v["mu_B0"],
                                    np.clip(v["b0_mean"], *P.MU_CLIP))
+        # M2 = M1 / c, c from M1's own adjustment over earlier same-season
+        # dates; "M" is whichever variant DRIFT_CORRECT selects
+        log_c = P.drift_shift(oof["season"], oof["date"],
+                              P.booster_adjustment(oof["mu_M1"], oof["mu_B1"]))
+        np.testing.assert_allclose(oof["log_c"], log_c, rtol=1e-9, atol=1e-15)
+        np.testing.assert_allclose(
+            oof["mu_M2"], np.clip(oof["mu_M1"] / np.exp(log_c), *P.MU_CLIP))
+        active = "M2" if P.DRIFT_CORRECT else "M1"
+        assert pooled["model"] == active
+        np.testing.assert_array_equal(oof["mu_M"], oof[f"mu_{active}"])
+        assert pooled["nll_M"] == pooled[f"nll_{active}"]
+        assert {"diff_M2_M1", "se_M2_M1", "bias_M1", "bias_M2"} <= set(pooled)
+        assert set(pooled["drift_decision"]) >= {"adopt_m2", "c_bias_lower"}
+        assert pooled["gate_M2"]["folds_won_vs_B1"] == sum(
+            f["nll_M2"] < f["nll_B1"] for f in res["folds"])
+
+    def test_m2_alpha_is_fitted_on_corrected_training_predictions(
+            self, monkeypatch):
+        seasons = (20202021, 20212022, 20222023)
+        s, g, a, t = random_league(seed=4, seasons=seasons, days=40,
+                                   n_teams=6, roster=6)
+        frame = build_player_features(s, g, a, t)
+        params = dict(P.LGBM_PARAMS, n_estimators=20, min_child_samples=50)
+        calls = []
+        real_fit = P.fit_nb_alpha
+        monkeypatch.setattr(P, "fit_nb_alpha", lambda y, mu: (
+            calls.append(np.asarray(mu, float).copy()) or real_fit(y, mu)))
+        P.run_props(frame=frame, params=params)
+        data = P.load_props_dataset(frame)
+        folds = P.walk_forward_folds(data[["season", "date"]])
+        assert len(calls) == 4 * len(folds)
+        last = folds[-1]
+        m1, m2, b1 = calls[-4], calls[-3], calls[-2]   # order M1, M2, B1, B0
+        tr = data.iloc[last.train_idx]
+        assert tr["season"].nunique() == 2        # two training seasons
+        shift = P.drift_shift(tr["season"], tr["date"], np.log(m1 / b1))
+        np.testing.assert_allclose(m2, np.clip(m1 / np.exp(shift), *P.MU_CLIP))
+        assert not np.allclose(m2, m1)
+        # each training season starts again at c = 1
+        first = (tr["date"] == tr.groupby("season")["date"].transform("min"))
+        np.testing.assert_array_equal(m2[first.to_numpy()], m1[first.to_numpy()])
+
+    def test_flag_selects_the_reported_model(self):
+        s, g, a, t = random_league(seed=2, seasons=(20202021, 20212022),
+                                   days=40, n_teams=6, roster=6)
+        frame = build_player_features(s, g, a, t)
+        params = dict(P.LGBM_PARAMS, n_estimators=20, min_child_samples=50)
+        on = P.run_props(frame=frame, params=params, drift_correct_m=True)
+        off = P.run_props(frame=frame, params=params, drift_correct_m=False)
+        assert on["pooled"]["model"] == "M2" and off["pooled"]["model"] == "M1"
+        np.testing.assert_array_equal(on["oof"]["mu_M"], on["oof"]["mu_M2"])
+        np.testing.assert_array_equal(off["oof"]["mu_M"], off["oof"]["mu_M1"])
+        # the same booster underlies both runs
+        np.testing.assert_array_equal(on["oof"]["mu_M1"], off["oof"]["mu_M1"])

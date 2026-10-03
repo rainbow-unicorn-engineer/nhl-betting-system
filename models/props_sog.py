@@ -5,8 +5,8 @@ skater's shots on goal in a game, given that he plays (toi_seconds > 0),
 from which P(SOG > line) is read for the usual prop lines 0.5 .. 4.5.
 
 STATUS: see the STATUS section at the end of this docstring. Registration
-is disabled (run_props(register=True) raises): this model has no prices to
-be judged against on this database, and nothing reads it yet.
+is disabled (run_props(register=True) raises): this model has not been
+judged against prop prices yet, and nothing reads it.
 
 Model M (the candidate), pre-registered before any results were seen:
 - One LightGBM regressor, objective poisson, predicting expected SOG.
@@ -51,6 +51,19 @@ Model M (the candidate), pre-registered before any results were seen:
   with mean = the prediction and ONE dispersion alpha per fold, fitted by
   maximum likelihood on that fold's training predictions (alpha >= 0;
   alpha = 0 is Poisson).
+- In-season drift correction (v2; M2 in the code, now the default M —
+  STATUS has the decision): for a player-game g on date D in season S,
+  r = log(M1's prediction) - log(exposure baseline) is the booster's
+  adjustment, and
+      c(g) = exp( sum of r over S's eligible player-games dated strictly
+                  before D / (their count n + DRIFT_PRIOR_ROWS) )
+  i.e. their mean shrunk toward 0 with weight n / (n + 2000); c = 1 on a
+  season's first date. M2 = M1 / c. It is applied when scoring
+  validation rows and, within each training season from the in-sample
+  booster predictions, before fitting the NB alpha. Same booster,
+  features, params, folds and eligibility as v1 (M1). The adjustment is
+  a prediction, not an outcome, and same-day rows never count, so c is
+  known before puck drop. Copied from models/totals.py (drift_shift).
 
 Baselines (same rows, same NB-dispersion treatment fitted on their own
 training predictions):
@@ -77,13 +90,62 @@ GATE (decided before any run): M passes only if pooled NLL(M) < NLL(B1)
 by at least 2 paired SE, AND M beats B1 in at least 4 of 5 folds, AND
 the pooled ECE of M's P(SOG > 2.5) is <= 0.02. The same comparison vs B0
 is reported for information. A pass means "a better forecaster than
-simple baselines"; it does NOT mean profitable. That needs prop PRICES
-(raw.prop_odds_hist / raw.prop_snapshots do not exist on this database),
-and DraftKings props carry about a 6.2% bookmaker margin.
+simple baselines"; it does NOT mean profitable. That needs a check
+against prop PRICES, which this module does not have yet, and DraftKings
+props carry about a 6.2% bookmaker margin.
 
-STATUS (2026-10-02, v1, first and only gated run; read-only on the live
-database; two further runs reproduced every number): GATE PASSED
-as a FORECASTER. Not a betting result: there are no prop prices here.
+STATUS (2026-10-03, v2 = M2, the drift-corrected booster; read-only on
+the live database): GATE PASSED as a FORECASTER, and M2 replaced v1 under
+the pre-registered decision rule below. Not a betting result: no price-
+based check exists yet.
+- v2 decision rule (fixed before the run): M2 replaces v1 only if (a) M2
+  passes the v1 gate vs B1, (b) pooled NLL(M2) <= NLL(v1), and (c) the
+  mean over folds of |mean predicted - actual SOG| is lower for M2. The
+  same run re-scored v1 from the same boosters and reproduced its numbers
+  exactly (pooled NLL 1.57827, B1 1.58173). All three held, so v2 is the
+  default (DRIFT_CORRECT = True; run_props(drift_correct_m=False) gives
+  v1, and every run reports both as M1 and M2):
+  (a) pooled NLL M2 1.57818 vs B1 1.58173: M2 - B1 = -0.00355 (paired SE
+      0.00018, ~20 SE); M2 beats B1 in 5 of 5 folds and B0 in 5 of 5;
+      pooled ECE(> 2.5) 0.0087 (gate <= 0.02). PASS.
+  (b) M2 - v1 = -0.000094 (paired SE 0.000052, -1.8 SE): not worse, but
+      also not a clear improvement. PASS.
+  (c) mean |fold bias| v1 0.0511 -> M2 0.0499. PASS, narrowly.
+- v2 per fold, NLL M2 / v1 / B1 (M2 - v1, SE) and mean predicted minus
+  actual SOG M2 / v1 / B1:
+    2021-22 1.62150 / 1.62159 / 1.62470 (-0.00009, 0.00002)  +0.017 / +0.020 / -0.003
+    2022-23 1.60374 / 1.60479 / 1.60771 (-0.00105, 0.00008)  +0.068 / +0.095 / +0.048
+    2023-24 1.57988 / 1.57989 / 1.58384 (-0.00001, 0.00001)  +0.077 / +0.078 / +0.053
+    2024-25 1.54769 / 1.54657 / 1.55053 (+0.00112, 0.00016)  +0.071 / +0.026 / +0.048
+    2025-26 1.53823 / 1.53868 / 1.54199 (-0.00045, 0.00019)  +0.016 / -0.038 / +0.000
+  M2 - B1 per fold: -0.0032, -0.0040, -0.0040, -0.0028, -0.0038.
+- v2 calibration, ECE of P(> 2.5) per fold M2 / v1 / B1: 0.0078 / 0.0076
+  / 0.0140, 0.0132 / 0.0189 / 0.0150, 0.0131 / 0.0131 / 0.0099, 0.0141 /
+  0.0089 / 0.0086, 0.0061 / 0.0120 / 0.0055 — M2 is worse than B1 in 3
+  of 5 folds (v1: 4 of 5). ECE of P(> 1.5) per fold M2 / v1 / B1: 0.0121
+  / 0.0122 / 0.0188, 0.0186 / 0.0250 / 0.0223, 0.0195 / 0.0196 / 0.0208,
+  0.0167 / 0.0107 / 0.0139, 0.0048 / 0.0128 / 0.0082. Pooled: ECE(> 2.5)
+  M2 0.0087, v1 0.0068, B1 0.0070; ECE(> 1.5) M2 0.0136, v1 0.0106, B1
+  0.0146; Brier(> 2.5) M2 0.15681, v1 0.15681, B1 0.15753; Brier(> 1.5)
+  M2 0.21207, v1 0.21210, B1 0.21312. Pooled mean predicted minus actual
+  SOG: M2 +0.050, v1 +0.036, B1 +0.029 (the pooled ECEs are worse for M2
+  because v1's season biases of opposite sign cancelled when pooled).
+  2025-26 by position, M2: forwards NLL 1.5982 (v1 1.5988), ECE(> 2.5)
+  0.0078 (v1 0.0152, B1 0.0076); defensemen NLL 1.4196 (v1 1.4198),
+  ECE(> 2.5) 0.0050 (v1 0.0073, B1 0.0070). Fitted alpha per fold, M2:
+  0.042-0.054. A second run reproduced every v2 number.
+- What the correction does and does not fix: it removes the booster's own
+  level, so M2's level moves toward B1's. In 2025-26 that took M from
+  -0.038 to +0.016; in 2024-25 it took M from +0.026 to +0.071, toward
+  B1's own +0.048. B1 over-predicts by ~+0.05 SOG a game in 2022-23
+  through 2024-25, and no booster-side correction can remove that.
+  Second, c works on the log scale: in 2023-24 the booster's mean log
+  adjustment is -0.004 (c ~ 1, no change) while its mean prediction sits
+  +0.025 above B1's. Much of the remaining level error is the exposure
+  baseline's (drift ratio and career-to-date rate); that is the next
+  thing to examine, not part of this change.
+- v1 history (2026-10-02, the first gated run; the numbers below are v1,
+  "M" = v1; two further runs reproduced every number):
 - Rows: 285,929 played skater games built; 278,541 eligible (>= 5 prior
   appearances); 248,589 scored over 5 folds (2021-22 .. 2025-26;
   2020-21 trains only).
@@ -113,15 +175,15 @@ as a FORECASTER. Not a betting result: there are no prop prices here.
   P(> 2.5) (0.008-0.019) is worse than B1's in 4 of 5 folds (2024-25 only
   narrowly; corrected from "3 of 5" by the reproduction review); the pooled
   ECE is low partly because the season biases cancel. This is the same
-  failure the totals booster had (models/totals.py, drift correction),
-  and its fix — subtract the booster's running same-season mean
-  adjustment — is the first thing to try before any pricing use.
+  failure the totals booster had (models/totals.py, drift correction);
+  its fix, tried 2026-10-03 as M2, is v2 above.
 - What a pass does and does not mean: M is a better shots forecaster
   than a last-10 average and than the exposure baseline, by a small but
-  steady margin over B1 (0.0035 nats a player-game). Whether that beats
-  DraftKings props, which carry about a 6.2% margin, is untested: it
-  needs stored prop prices (no raw.prop_odds_hist / raw.prop_snapshots
-  on this database). Registration stays disabled until that test exists.
+  steady margin over B1 (0.0035 nats a player-game in v1, 0.0036 in v2).
+  Whether that beats DraftKings props, which carry about a 6.2% margin,
+  is untested: it needs a check against stored prop prices, which this
+  module does not run yet. Registration stays disabled until that test
+  exists.
 """
 import logging
 
@@ -133,7 +195,7 @@ from models.baseline import PURGE_DAYS, expected_calibration_error, walk_forward
 logger = logging.getLogger("nhl.models.props_sog")
 
 MODEL_NAME = "props_sog"
-MODEL_VERSION = "v1"
+MODEL_VERSION = "v2"           # v2: v1 + in-season drift correction (M2)
 # The forecasting gate verdict (STATUS), set by hand. It is NOT a betting
 # approval: no price-based check exists yet, and nothing reads it.
 GATE_PASSED = True
@@ -145,6 +207,12 @@ CAL_FRAC = 0.15                # time-ordered tail for early stopping
 GATE_SE = 2.0
 GATE_MIN_FOLDS = 4
 GATE_ECE = 0.02
+# In-season drift correction (M2; STATUS): shrinkage pseudo-count, in
+# player-games, of the booster's running same-season mean adjustment.
+DRIFT_PRIOR_ROWS = 2000
+# Whether the reported model M is the drift-corrected M2 (v2) rather than
+# v1 (M1); set by the pre-registered decision rule recorded in STATUS.
+DRIFT_CORRECT = True
 
 LGBM_PARAMS = {
     "objective": "poisson",
@@ -271,6 +339,56 @@ def predict(fm: dict, X, base) -> np.ndarray:
     return np.clip(np.exp(np.log(base) + raw), *MU_CLIP)
 
 
+# ── In-season drift correction (point-in-time; M2) ─────────────────
+#
+# The same fix as the totals booster's (models/totals.py, drift_shift):
+# the booster's inputs shift from season to season and it reads the shift
+# as a change in shooting level, so its mean log-adjustment to the
+# exposure baseline is ~0 on the seasons it trained on but moves on the
+# next one. The baseline's drift ratio is meant to own the league level,
+# so the level the booster adds on top is divided out: every player-game
+# is divided by c = exp(the booster's mean adjustment over the same
+# season's player-games on strictly EARLIER dates, shrunk toward 0 with
+# weight n / (n + DRIFT_PRIOR_ROWS)). The adjustment is a prediction, not
+# an outcome, and same-day rows never count, so c is known before puck
+# drop.
+
+def booster_adjustment(mu, base) -> np.ndarray:
+    """Per player-game, r = log(M's prediction) - log(exposure baseline)."""
+    return np.log(np.asarray(mu, float)) - np.log(np.asarray(base, float))
+
+
+def drift_shift(seasons, dates, adj,
+                prior_rows: float = DRIFT_PRIOR_ROWS) -> np.ndarray:
+    """Per row, log c: the mean of `adj` over the same season's rows on
+    strictly earlier dates, shrunk toward 0 with weight n / (n +
+    prior_rows), n = their count; i.e. sum / (n + prior_rows). 0 on a
+    season's first date."""
+    df = pd.DataFrame({"season": np.asarray(seasons),
+                       "date": pd.to_datetime(np.asarray(dates)),
+                       "adj": np.asarray(adj, dtype=float)})
+    day = df.groupby(["season", "date"], sort=True)["adj"].agg(["sum", "count"])
+    earlier = day.groupby(level="season").cumsum() - day
+    shift = (earlier["sum"] / (earlier["count"] + prior_rows)).fillna(0.0)
+    keys = pd.MultiIndex.from_frame(df[["season", "date"]])
+    return shift.reindex(keys).to_numpy(dtype=float)
+
+
+def apply_drift(mu, shift) -> np.ndarray:
+    """mu / c with c = exp(shift), clipped as usual."""
+    return np.clip(np.asarray(mu, float) * np.exp(-np.asarray(shift, float)),
+                   *MU_CLIP)
+
+
+def drift_correct(mu, base, seasons, dates,
+                  prior_rows: float = DRIFT_PRIOR_ROWS) -> tuple:
+    """(corrected means, log c per row) for one set of rows. Seasons are
+    handled separately, so a multi-season training window works too."""
+    shift = drift_shift(seasons, dates, booster_adjustment(mu, base),
+                        prior_rows)
+    return apply_drift(mu, shift), shift
+
+
 # ── Evaluation ─────────────────────────────────────────────────────
 
 def _paired(a, b) -> tuple:
@@ -293,6 +411,7 @@ def score_block(y, mus: dict, alphas: dict) -> dict:
     for k, mu in mus.items():
         out[f"nll_{k}"] = float(nll[k].mean())
         out[f"mean_mu_{k}"] = float(np.mean(mu))
+        out[f"bias_{k}"] = float(np.mean(mu) - np.mean(y))
         for line in (1.5, 2.5):
             pm = _prob_metrics(y, mu, alphas[k], line)
             tag = str(line).replace(".", "")
@@ -300,35 +419,66 @@ def score_block(y, mus: dict, alphas: dict) -> dict:
             out[f"ece{tag}_{k}"] = pm["ece"]
             out[f"meanp{tag}_{k}"] = pm["mean_p"]
             out[f"rate{tag}"] = pm["rate"]
-    for b in ("B1", "B0"):
-        if "M" in nll and b in nll:
-            out[f"diff_M_{b}"], out[f"se_M_{b}"] = _paired(nll["M"], nll[b])
+    _paired_diffs(out, nll)
     return out
 
 
-def gate(pooled: dict, folds: list) -> dict:
-    """The pre-registered gate (module docstring)."""
-    wins_b1 = sum(f["nll_M"] < f["nll_B1"] for f in folds)
-    wins_b0 = sum(f["nll_M"] < f["nll_B0"] for f in folds)
-    nll_ok = pooled["diff_M_B1"] <= -GATE_SE * pooled["se_M_B1"]
+def _paired_diffs(out: dict, nll: dict) -> None:
+    """Paired NLL differences (and SEs) of each model key vs B1 and B0,
+    and M2 - M1 when both variants are present."""
+    for m in ("M", "M1", "M2"):
+        for b in ("B1", "B0"):
+            if m in nll and b in nll:
+                out[f"diff_{m}_{b}"], out[f"se_{m}_{b}"] = _paired(nll[m], nll[b])
+    if "M1" in nll and "M2" in nll:
+        out["diff_M2_M1"], out["se_M2_M1"] = _paired(nll["M2"], nll["M1"])
+
+
+def gate(pooled: dict, folds: list, key: str = "M") -> dict:
+    """The pre-registered gate (module docstring) for model `key`."""
+    wins_b1 = sum(f[f"nll_{key}"] < f["nll_B1"] for f in folds)
+    wins_b0 = sum(f[f"nll_{key}"] < f["nll_B0"] for f in folds)
+    nll_ok = pooled[f"diff_{key}_B1"] <= -GATE_SE * pooled[f"se_{key}_B1"]
     folds_ok = wins_b1 >= GATE_MIN_FOLDS
-    ece_ok = pooled["ece25_M"] <= GATE_ECE
+    ece_ok = pooled[f"ece25_{key}"] <= GATE_ECE
     return {"nll_by_2se": bool(nll_ok), "folds_won_vs_B1": int(wins_b1),
             "folds_ok": bool(folds_ok), "ece25_ok": bool(ece_ok),
             "folds_won_vs_B0": int(wins_b0),
-            "b0_nll_by_2se": bool(pooled["diff_M_B0"]
-                                  <= -GATE_SE * pooled["se_M_B0"]),
+            "b0_nll_by_2se": bool(pooled[f"diff_{key}_B0"]
+                                  <= -GATE_SE * pooled[f"se_{key}_B0"]),
             "passed": bool(nll_ok and folds_ok and ece_ok)}
 
 
+def drift_decision(pooled: dict, folds: list) -> dict:
+    """The pre-registered v2 decision rule (STATUS): M2 replaces M1 only if
+    (a) M2 passes the v1 gate vs B1, (b) pooled NLL(M2) <= NLL(M1), and
+    (c) the mean over folds of |mean predicted - actual SOG| is lower."""
+    g2 = gate(pooled, folds, "M2")
+    abs_bias = {k: float(np.mean([abs(f[f"bias_{k}"]) for f in folds]))
+                for k in ("M1", "M2")}
+    a = g2["passed"]
+    b = pooled["nll_M2"] <= pooled["nll_M1"]
+    c = abs_bias["M2"] < abs_bias["M1"]
+    return {"a_m2_passes_gate": bool(a), "b_nll_not_worse": bool(b),
+            "c_bias_lower": bool(c),
+            "mean_abs_bias_M1": abs_bias["M1"],
+            "mean_abs_bias_M2": abs_bias["M2"],
+            "adopt_m2": bool(a and b and c)}
+
+
 def run_props(register: bool = False, frame: pd.DataFrame = None,
-              params=None) -> dict:
+              params=None, drift_correct_m: bool | None = None) -> dict:
     """Walk-forward evaluation of M, B1 and B0 (module docstring).
+    Both booster variants are scored from the same fitted booster: M1 (v1,
+    no correction) and M2 (in-season drift correction); "M" — the model the
+    gate and the output speak for — is M2 when drift_correct_m (default
+    DRIFT_CORRECT), else M1.
     register=True raises: there is no registry entry for this model."""
     if register:
         raise RuntimeError(
             "props_sog registration is disabled: the model has no price-"
-            "based evaluation yet (no prop prices on this database). Run "
+            "based evaluation yet (it has not been checked against prop "
+            "prices). Run "
             "with register=False.")
     from features.player_shots import FEATURES
 
@@ -341,10 +491,16 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
                 f"{len(FEATURES)} features, {len(folds)} folds "
                 f"(purge {PURGE_DAYS}d)")
 
-    oof = {k: np.full(len(df), np.nan) for k in ("M", "B1", "B0")}
+    if drift_correct_m is None:
+        drift_correct_m = DRIFT_CORRECT
+    active = "M2" if drift_correct_m else "M1"
+    oof = {k: np.full(len(df), np.nan) for k in ("M", "M1", "M2", "B1", "B0")}
     oof_alpha = {k: np.full(len(df), np.nan) for k in oof}
+    oof_shift = np.full(len(df), np.nan)
     fold_metrics = []
     b0_all = np.clip(df["b0_mean"].to_numpy(float), *MU_CLIP)
+    seasons = df["season"].to_numpy()
+    dates = df["date"].to_numpy()
 
     for fold in folds:
         tr, val = fold.train_idx, fold.val_idx
@@ -353,11 +509,19 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         base = np.clip(exposure_baseline(df["shrunk_sog60"], df["exp_toi"],
                                          ratio), *MU_CLIP)
         fm = fit_fold(X, y, base, tr, df["date"], params)
-        mu = {"M": predict(fm, X[val], base[val]),
-              "B1": base[val], "B0": b0_all[val]}
-        mu_tr = {"M": predict(fm, X[tr], base[tr]),
-                 "B1": base[tr], "B0": b0_all[tr]}
+        m1_val = predict(fm, X[val], base[val])
+        m1_tr = predict(fm, X[tr], base[tr])
+        # M2: the booster's running same-season adjustment (earlier dates
+        # only) divided out — on the validation season, and within each
+        # training season from the in-sample predictions (for the alpha)
+        m2_val, shift_val = drift_correct(m1_val, base[val], seasons[val],
+                                          dates[val])
+        m2_tr, _ = drift_correct(m1_tr, base[tr], seasons[tr], dates[tr])
+        oof_shift[val] = shift_val
+        mu = {"M1": m1_val, "M2": m2_val, "B1": base[val], "B0": b0_all[val]}
+        mu_tr = {"M1": m1_tr, "M2": m2_tr, "B1": base[tr], "B0": b0_all[tr]}
         alphas = {k: fit_nb_alpha(y[tr], mu_tr[k]) for k in mu}
+        mu["M"], alphas["M"] = mu[active], alphas[active]
         for k, v in mu.items():
             oof[k][val] = v
             oof_alpha[k][val] = alphas[k]
@@ -365,6 +529,8 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         m = {"val_season": int(fold.val_season), "n_train": len(tr),
              "iters": int(fm["iters"]), "train_sog60": round(train_mean, 4),
              "mean_drift_ratio": float(ratio[val].mean()),
+             "mean_log_c": float(shift_val.mean()),
+             "last_log_c": float(shift_val[-1]),
              **{f"alpha_{k}": round(v, 4) for k, v in alphas.items()},
              **score_block(y[val], mu, alphas)}
         if fold is folds[-1]:
@@ -379,7 +545,9 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             f"B1={m['nll_B1']:.4f} B0={m['nll_B0']:.4f} | M-B1 "
             f"{m['diff_M_B1']:+.4f} (se {m['se_M_B1']:.4f}) | ECE>2.5 "
             f"M={m['ece25_M']:.4f} | alpha M={alphas['M']:.3f} "
-            f"| iters={m['iters']} drift={m['mean_drift_ratio']:.3f}")
+            f"| iters={m['iters']} drift={m['mean_drift_ratio']:.3f} | "
+            f"M1={m['nll_M1']:.5f} M2={m['nll_M2']:.5f} bias M1 "
+            f"{m['bias_M1']:+.3f} M2 {m['bias_M2']:+.3f}")
 
     scored = ~np.isnan(oof["M"])
     ys = y[scored]
@@ -393,6 +561,7 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             sel = a_rows == a
             nll[k][sel] = nb_nll(ys[sel], oof[k][scored][sel], a)
         pooled[f"nll_{k}"] = float(nll[k].mean())
+        pooled[f"bias_{k}"] = float(oof[k][scored].mean() - ys.mean())
         for line in (1.5, 2.5):
             p = np.empty(len(ys))
             for a in np.unique(a_rows):
@@ -402,10 +571,13 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             tag = str(line).replace(".", "")
             pooled[f"brier{tag}_{k}"] = float(np.mean((p - hit) ** 2))
             pooled[f"ece{tag}_{k}"] = expected_calibration_error(hit, p)
-    for b in ("B1", "B0"):
-        pooled[f"diff_M_{b}"], pooled[f"se_M_{b}"] = _paired(nll["M"], nll[b])
+    _paired_diffs(pooled, nll)
+    pooled["model"] = active
     pooled["gate"] = gate(pooled, fold_metrics)
     pooled["gate_passed"] = pooled["gate"]["passed"]
+    pooled["gate_M1"] = gate(pooled, fold_metrics, "M1")
+    pooled["gate_M2"] = gate(pooled, fold_metrics, "M2")
+    pooled["drift_decision"] = drift_decision(pooled, fold_metrics)
 
     logger.info(
         f"POOLED OOF ({pooled['n']} player-games): NLL M={pooled['nll_M']:.4f} "
@@ -413,13 +585,16 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         f"{pooled['diff_M_B1']:+.5f} (se {pooled['se_M_B1']:.5f}) M-B0 "
         f"{pooled['diff_M_B0']:+.5f} (se {pooled['se_M_B0']:.5f}) | ECE>2.5 "
         f"M={pooled['ece25_M']:.4f} | GATE "
-        f"{'PASSED' if pooled['gate_passed'] else 'FAILED'} {pooled['gate']}")
+        f"{'PASSED' if pooled['gate_passed'] else 'FAILED'} {pooled['gate']} "
+        f"(M = {active}) | M2-M1 {pooled['diff_M2_M1']:+.5f} "
+        f"(se {pooled['se_M2_M1']:.5f}) | decision {pooled['drift_decision']}")
 
     out = df.loc[scored, ["player_id", "game_id", "season", "date",
                           "pos_group", "sog"]].copy()
     for k in oof:
         out[f"mu_{k}"] = oof[k][scored]
         out[f"alpha_{k}"] = oof_alpha[k][scored]
+    out["log_c"] = oof_shift[scored]
     return {"folds": fold_metrics, "pooled": pooled, "oof": out}
 
 
