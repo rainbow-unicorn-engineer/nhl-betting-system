@@ -143,7 +143,11 @@ python -m ingestion.odds_history reparse                     # load paid_unparse
 `--cap-total` (all logged purchases together) or leave fewer than
 `--reserve` credits on the account (default 6,000). It reads the account's
 remaining credits from the free `/sports` endpoint first and from every
-response after. Every paid response is also kept, gzipped, in
+response after; when that first read fails it does not start (pass
+`--allow-unknown-remaining` to rely on `--max-credits` alone). A call that
+comes back without credit headers (a timeout or a dropped connection) is
+counted at its full expected cost, since the API may have billed it, and
+a run stops after 5 failed calls in a row. Every paid response is also kept, gzipped, in
 `data/odds_history/` (git-ignored), so the data survives a database loss.
 A paid call that fails after payment (its response could not be parsed or
 stored) is still logged, as status `paid_unparsed` with the credits it

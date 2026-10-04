@@ -59,7 +59,10 @@ Budget: `fetch` stops before a call that would take this run's spending
 past --max-credits, the fetch log's all-time total past --cap-total, or
 the account's x-requests-remaining below --reserve (default 6,000, kept
 for the live jobs). It reads the remaining credits from the free /sports
-endpoint before the first call and from every response's headers.
+endpoint before the first call (and will not start when it cannot, unless
+--allow-unknown-remaining) and from every response's headers; a response
+without those headers is counted at its full expected cost. It also stops
+after 5 failed calls in a row.
 
 A paid call that cannot be parsed or stored is still logged, as
 'paid_unparsed' with its credits, and counts as bought; its raw copy is
@@ -122,6 +125,7 @@ MORNING_TZ = ZoneInfo("America/Chicago")
 MORNING_TIME = (10, 0)
 DEFAULT_RESERVE = 6000
 STOP_STATUSES = (401, 403, 429)          # bad key, plan/quota, rate limit after a retry
+MAX_CONSECUTIVE_ERRORS = 5               # a run stops after this many failed calls in a row
 _SIDES_H2H = ("home", "away")
 _MARKET_KEYS = {"h2h": "h2h", "totals": "totals"}
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "odds_history"
@@ -788,14 +792,24 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
               saver: Callable = store, raw_dir: Optional[Path] = None,
               max_minutes: Optional[float] = None, limit: Optional[int] = None,
               pause: float = PAUSE_S) -> RunReport:
-    """Buy the plan's snapshots in order until done or a cap is reached."""
+    """Buy the plan's snapshots in order until done or a cap is reached.
+
+    Stops early after MAX_CONSECUTIVE_ERRORS failed calls in a row. A
+    response without credit headers (a timeout, a dropped connection) is
+    counted as having cost the full expected price, against this run's cap
+    and the account's remaining credits, since the API may have billed it."""
     cost = call_cost(markets, bookmakers)
     report = RunReport()
     started = time.monotonic()
+    streak = 0                           # failed calls in a row
     for p in plan:
         if is_covered(p.requested_ts, done):
             report.skipped += 1
             continue
+        if streak >= MAX_CONSECUTIVE_ERRORS:
+            report.stopped = (f"{streak} failed calls in a row: stopping before "
+                              f"{iso_z(p.requested_ts)} (see the log)")
+            break
         if limit is not None and report.calls >= limit:
             report.stopped = f"--limit {limit} calls reached"
             break
@@ -812,9 +826,14 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
         report.calls += 1
         charged = _int_header(headers, "x-requests-last")
         remaining = _int_header(headers, "x-requests-remaining")
+        if charged is None:
+            charged = cost
+            logger.warning(f"No x-requests-last header for {iso_z(p.requested_ts)}: "
+                           f"counting the expected {cost} credits as spent")
         if remaining is not None:
             budget.remaining = remaining
-        charged = charged if charged is not None else (cost if body is not None else 0)
+        elif budget.remaining is not None:
+            budget.remaining -= charged
         budget.spent += charged
         report.credits += charged
         fetch = {"requested_ts": _naive(p.requested_ts), "purpose": p.purpose,
@@ -823,6 +842,7 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
                  "n_events": 0, "n_rows": 0, "status": "error"}
         if body is None or not isinstance(body, dict):
             report.errors += 1
+            streak += 1
             saver([], fetch)
             if status in STOP_STATUSES:
                 report.stopped = f"HTTP {status}: every further call would fail"
@@ -842,6 +862,7 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
             saver(rows, fetch)
         except Exception as e:
             report.errors += 1
+            streak += 1
             fetch.update(n_rows=0, status="paid_unparsed")
             logger.error(f"{p.purpose} {p.season} {iso_z(p.requested_ts)}: the paid response "
                          f"could not be parsed or stored ({type(e).__name__}: "
@@ -857,11 +878,13 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
             continue
         if fetch["status"] == "error":
             report.errors += 1
+            streak += 1
             logger.error(f"{p.purpose} {p.season} {iso_z(p.requested_ts)}: the response has "
                          f"no snapshot timestamp; logged as error ({charged} credits), "
                          f"to be retried")
             continue
         done.append(fetch)
+        streak = 0
         report.rows += len(rows)
         agg = report.by_purpose.setdefault(f"{p.purpose} {p.season}",
                                            {"calls": 0, "credits": 0, "rows": 0})
@@ -927,6 +950,10 @@ def main(argv=None) -> int:
                    help=f"stop when the account would drop below this many credits "
                         f"(default {DEFAULT_RESERVE})")
     f.add_argument("--max-minutes", type=float, default=8.0)
+    f.add_argument("--allow-unknown-remaining", action="store_true",
+                   help="fetch even when the account's remaining credits cannot be "
+                        "read first (the --reserve floor is then unchecked until a "
+                        "response reports it)")
     f.add_argument("--limit", type=int, default=None, help="most calls this run")
     f.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR),
                    help="where to keep a gzipped copy of every paid response")
@@ -979,6 +1006,12 @@ def main(argv=None) -> int:
                     remaining=remaining_credits())
     print(f"Account credits remaining before the run: "
           f"{budget.remaining if budget.remaining is not None else 'unknown'}")
+    if budget.remaining is None and not args.allow_unknown_remaining:
+        print("Not fetching: the account's remaining credits could not be read (no key, "
+              "no connection, or no x-requests-remaining header), so the --reserve "
+              "floor cannot be checked. Fix that, or pass --allow-unknown-remaining "
+              "to rely on --max-credits alone.")
+        return 2
     report = run_fetch(plan, markets, bookmakers, budget, games, done,
                        raw_dir=Path(args.raw_dir), max_minutes=args.max_minutes,
                        limit=args.limit)

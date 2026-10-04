@@ -320,6 +320,42 @@ class TestRunFetch:
         report2, saved2 = self.run(_plan(1), getter, oh.Budget(max_credits=100), done)
         assert report2.calls == 1 and saved2[0][1]["status"] == "ok"
 
+    def test_stops_after_five_failed_calls_in_a_row(self, body):
+        calls = []
+
+        def timeout(path, params):              # no response, no headers
+            calls.append(params["date"])
+            return None, {}, None
+
+        budget = oh.Budget(max_credits=1000, remaining=10000)
+        report, saved = self.run(_plan(8), timeout, budget)
+        assert report.calls == len(calls) == oh.MAX_CONSECUTIVE_ERRORS == 5
+        assert "5 failed calls in a row" in report.stopped
+        # no credit headers: the expected cost is counted as spent
+        assert report.credits == budget.spent == 100 and budget.remaining == 9900
+        assert [f["credits"] for _, f in saved] == [20] * 5
+        assert {f["status"] for _, f in saved} == {"error"}
+
+    def test_errors_that_are_not_in_a_row_do_not_stop(self, body):
+        n = {"i": 0}
+        ok = _Getter(body)
+
+        def flaky(path, params):
+            n["i"] += 1
+            if n["i"] % 2:
+                return None, {"x-requests-last": "0"}, 500
+            return ok(path, params)
+
+        report, _ = self.run(_plan(12), flaky, oh.Budget(max_credits=10000))
+        assert report.calls == 12 and report.errors == 6 and report.stopped is None
+
+    def test_missing_headers_count_against_the_cap(self, body):
+        def no_headers(path, params):
+            return json.loads(json.dumps(body)), {}, 200
+
+        report, saved = self.run(_plan(5), no_headers, oh.Budget(max_credits=50))
+        assert report.calls == 2 and report.credits == 40 and "cap of 50" in report.stopped
+
     def test_limit_and_raw_copy(self, body, tmp_path):
         report, _ = self.run(_plan(3), _Getter(body), oh.Budget(max_credits=1000),
                              limit=1, raw_dir=tmp_path)
@@ -481,6 +517,37 @@ def test_help_runs_nothing(monkeypatch, capsys):
         oh.main(["--help"])
     assert exc.value.code == 0
     assert "historical" in capsys.readouterr().out
+
+
+class TestFetchStart:
+    """`fetch` will not start when the account's remaining credits are
+    unknown, unless told to."""
+
+    def setup(self, monkeypatch, remaining):
+        calls = []
+        monkeypatch.setattr(oh, "ensure_tables", lambda: None)
+        monkeypatch.setattr(oh, "load_games", lambda seasons: [g(1, "2025-01-11T00:00")])
+        monkeypatch.setattr(oh, "load_done", lambda *a, **k: [])
+        monkeypatch.setattr(oh, "credits_logged", lambda: 0)
+        monkeypatch.setattr(oh, "remaining_credits", lambda: remaining)
+        monkeypatch.setattr(oh, "run_fetch",
+                            lambda *a, **k: calls.append(a[3]) or oh.RunReport())
+        return calls
+
+    def test_refuses_when_remaining_is_unknown(self, monkeypatch, capsys):
+        calls = self.setup(monkeypatch, None)
+        assert oh.main(["fetch", "--max-credits", "100"]) == 2
+        assert calls == [] and "could not be read" in capsys.readouterr().out
+
+    def test_allow_unknown_remaining(self, monkeypatch):
+        calls = self.setup(monkeypatch, None)
+        assert oh.main(["fetch", "--max-credits", "100", "--allow-unknown-remaining"]) == 0
+        assert len(calls) == 1 and calls[0].remaining is None
+
+    def test_known_remaining_starts(self, monkeypatch):
+        calls = self.setup(monkeypatch, 9000)
+        assert oh.main(["fetch", "--max-credits", "100"]) == 0
+        assert calls[0].remaining == 9000
 
 
 def test_fetch_requires_a_credit_cap(monkeypatch, capsys):
