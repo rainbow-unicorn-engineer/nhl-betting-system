@@ -221,23 +221,29 @@ def test_news_is_non_fatal_and_passes_due(monkeypatch, caplog):
     from betting import news
 
     seen = []
-    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
-    monkeypatch.setattr(news, "run_news", lambda due: seen.append(due))
+    monkeypatch.setattr(news, "run_news",
+                        lambda due, network_ready: seen.append((due, network_ready)))
     pipeline.news(due=True)
     pipeline.news()
-    assert seen == [True, False]
+    assert seen == [(True, pipeline._wait_for_network), (False, pipeline._wait_for_network)]
 
-    def boom(due):
+    def boom(due, network_ready):
         raise RuntimeError("database gone")
     monkeypatch.setattr(news, "run_news", boom)
     pipeline.news(due=True)
     assert "News monitor failed (non-fatal)" in caplog.text
 
 
-def test_news_waits_for_network(monkeypatch):
+def test_news_checks_whether_it_is_due_before_waiting_for_the_network(monkeypatch):
+    """`news --due` runs every 15 minutes all day: outside the window it must
+    not block on (or log an error about) a missing network."""
     from betting import news
-    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: False)
-    monkeypatch.setattr(news, "run_news", lambda due: pytest.fail("no network, no run"))
+    import config.migrate
+    monkeypatch.setattr(config.migrate, "ensure_schema", lambda: None)
+    monkeypatch.setattr(news, "ensure_table", lambda: None)
+    monkeypatch.setattr(news, "todays_games", lambda: [])          # no game today
+    monkeypatch.setattr(pipeline, "_wait_for_network",
+                        lambda: pytest.fail("waited for the network before the due check"))
     pipeline.news(due=True)
 
 

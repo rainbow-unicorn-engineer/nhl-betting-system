@@ -217,12 +217,12 @@ def news(due: bool = False):
     compared with the previous run; changes go to raw.news_events, and
     starter news on a game without a pick re-scores that game's date.
     due=True (`news --due`, every 15 minutes): only on a game day from
-    NEWS_START_HOUR (8:00) local until the last puck drop."""
-    if not _wait_for_network():
-        return
+    NEWS_START_HOUR (8:00) local until the last puck drop. It waits for the
+    network only after deciding the run is due, so the runs outside the
+    window never block or log a network error."""
     try:
         from betting.news import run_news
-        run_news(due=due)
+        run_news(due=due, network_ready=_wait_for_network)
     except Exception as e:
         logger.error(f"News monitor failed (non-fatal): {e}")
 

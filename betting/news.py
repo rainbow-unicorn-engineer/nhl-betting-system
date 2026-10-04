@@ -711,8 +711,12 @@ def rescore(events: List[dict], games: List[dict], now: datetime) -> None:
 
 # ── The run ────────────────────────────────────────────────────────
 
-def run_news(due: bool = False) -> int:
-    """One news check. Returns the number of events written."""
+def run_news(due: bool = False, network_ready=None) -> int:
+    """One news check. Returns the number of events written.
+    network_ready: called (when given) only once the run is due and there
+    are games, so a scheduled run outside the window never waits for the
+    network; False from it ends the run (pipeline.py passes its
+    _wait_for_network)."""
     from config.migrate import ensure_schema
     ensure_schema()
     ensure_table()
@@ -726,6 +730,8 @@ def run_news(due: bool = False) -> int:
         logger.info(f"news --due: checking, {why}")
     if not games:
         logger.info("News: no game today; nothing checked")
+        return 0
+    if network_ready is not None and not network_ready():
         return 0
     now = datetime.now(timezone.utc)
     with engine.begin() as conn:

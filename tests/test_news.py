@@ -327,8 +327,26 @@ def test_due_run_outside_the_window_touches_nothing(monkeypatch, caplog):
     monkeypatch.setattr(news, "local_now", lambda: at(6, 0))
     for step in ("check_starters", "check_lineups", "check_injuries", "rescore"):
         monkeypatch.setattr(news, step, lambda *a, **k: pytest.fail("ran outside the window"))
-    assert news.run_news(due=True) == 0
+    assert news.run_news(due=True, network_ready=lambda: pytest.fail(
+        "waited for the network outside the window")) == 0
     assert "news --due: nothing to do, before 08:00" in caplog.text
+
+
+def test_due_run_without_network_touches_nothing(monkeypatch):
+    import config.migrate
+    monkeypatch.setattr(config.migrate, "ensure_schema", lambda: None)
+    monkeypatch.setattr(news, "ensure_table", lambda: None)
+    monkeypatch.setattr(news, "todays_games", lambda: [
+        {"game_id": 1, "date": DAY, "start_time_utc": at(19), "home_team": "BOS",
+         "away_team": "MTL", "started": False}])
+    monkeypatch.setattr(news, "last_run_start", lambda: None)
+    monkeypatch.setattr(news, "local_now", lambda: at(10, 0))
+    monkeypatch.setattr(news, "engine", None)          # no run row written either
+    for step in ("check_starters", "check_lineups", "check_injuries", "rescore"):
+        monkeypatch.setattr(news, step, lambda *a, **k: pytest.fail("ran without network"))
+    asked = []
+    assert news.run_news(due=True, network_ready=lambda: asked.append(1) or False) == 0
+    assert asked == [1]
 
 
 # ── End to end on a disposable database ────────────────────────────
