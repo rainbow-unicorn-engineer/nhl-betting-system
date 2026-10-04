@@ -147,6 +147,95 @@ Evaluation (walk-forward, expanding season folds, purge gap):
   carries DraftKings closing O/U prices for most of 2025-26, but
   ingestion/espn_odds.py doesn't keep them), so there is no payout
   backtest for totals: the strategy proof starts at paper trading.
+
+v3 experiment: market offset + Dixon-Coles (2026-10-04, PRE-REGISTERED
+before any variant ran; code run_totals_v3, opt-in)
+- Why: v2 has no edge over the environment and its over/under log loss at
+  the DraftKings line is worse than the no-vig market (0.6959 vs 0.6882,
+  n=1,010). The moneyline model only became useful when it was boosted
+  FROM the market (models/lgbm.py). Two-way over/under prices now exist for
+  every past season, so the same trick can be tried for totals.
+- T0 was reproduced first, unchanged: 2.1801 vs 2.1787 (the v2 numbers).
+- Market prices (→ one fair P(over) per game at the market's main line,
+  market_over_probs over the union of these quotes; no-vig → the book's
+  fee taken out; closing → the last price before puck drop):
+  (a) raw.odds_snapshots, each book's last pre-game quote (live, 2026-27);
+  (b) raw.odds_history (2024-25, 10 books incl. Pinnacle): each book's
+      LAST snapshot strictly before puck drop, over and under from that one
+      snapshot; consensus = median no-vig P(over) across the books at the
+      line most of them quote;
+  (c) ESPN's DraftKings closing over/under (2025-26);
+  (d) ESPN's Unibet closing over/under (2020-21 to 2023-24), kept only
+      when the line is 5.5, the overround (→ the two sides' implied
+      probabilities summed, minus 1: the book's fee) is 3.5%-6.5%, the
+      no-vig P(over) is 0.25-0.80, and both of the game's Unibet moneyline
+      prices are under 1000 in size. Those are in-play markers: 2023-24
+      has lines from 2.0 to 13.0, moneylines of +/-1000 to 10000, and a
+      175-game block with 6.5%-9.8% margins whose log loss is too good for
+      a pre-game price (0.6545 vs 0.6654 for a constant). Data check done
+      before this pre-registration (prices vs outcomes only, no model):
+      Unibet's 5.5 is a real line, not the old placeholder. Its no-vig
+      P(over 5.5) is calibrated in every bin from 0.40 to 0.70 (0.576
+      predicted vs 0.584 actual in the 0.55-0.60 bin) and beats a constant
+      by 0.003-0.008 log loss in 2020-21 to 2022-23. At 5.5 overtime cannot
+      change the result (a regulation tie has an even total). Kept: 926 /
+      1,378 / 1,359 / 1,069 games.
+- Variants:
+  T0  v2 as committed (environment offset, margin weights, drift
+      correction, goalie variant A features).
+  T1  market offset. For a priced game, the market rates are the
+      environment rates (the home/away split stays the environment's)
+      times one common factor, solved so that the model's own PMF
+      machinery (the fold's margin weights; T2/T3 also rho) gives
+      P(over line | no push) = the no-vig market P(over) (market_lambdas).
+      A second booster (variant A features, same params) is trained ONLY on
+      priced training games with init_score = log(market rate), the
+      models/lgbm.py pattern, early-stopped on the priced regular-season
+      tail. Its season drift relative to the market rates is removed with
+      v2's drift_shift rule. Unpriced games: T0 unchanged.
+  T2  T1 + a Dixon-Coles rho (→ one number that moves probability between
+      the 0-0 / 1-1 and the 1-0 / 0-1 regulation scores, i.e. low-score
+      dependence between the two teams). Joint = independent x margin
+      weight x tau(h, a; rate_h, rate_a, rho), renormalized. rho is fitted
+      by maximum likelihood on each fold's training games with the
+      environment PMFs and that fold's margin weights (fitted first),
+      bounded to [-0.2, 0.2]. It is used everywhere the PMF is: the market
+      inversion, both boosters' scoring, the baseline.
+  T3  T2 + goalie-role variant C features (features/goalie_role.py) in
+      both boosters.
+  M   reference only, never adoptable: the market rates through the PMF
+      with no booster (environment baseline where unpriced). It copies the
+      market at the posted line, so the market check cannot fail it; it
+      shows what the market alone is worth to the NLL.
+- Metrics, all pooled out-of-fold over the 5 walk-forward folds:
+  - NLL vs the MATCHED environment baseline: the environment rates
+    through the variant's own joint machinery (T0, T1: margin weights,
+    i.e. 2.1787; T2, T3: margin weights + rho). A structural fix goes to
+    both sides, as in the hardened gate. Paired SE and folds won.
+  - NLL vs T0 (paired difference and SE).
+  - Calibration: predicted vs actual regulation tie rate; the total-goals
+    distribution, mean predicted P(total = t) vs the observed share for
+    t = 0..10 and 11+, with the largest gap and a chi-square (→ the sum
+    over those buckets of (observed - expected)^2 / expected; smaller is
+    better calibrated); push rates P(total = 5, 6, 7) (→ a push is a tie
+    with a whole-number line: the stake is refunded).
+  - Market check (market_check): over/under log loss at the main line vs
+    the no-vig P(over), pushes dropped, pooled over all priced scored
+    games, also reported per source.
+- Pass rule, fixed now. A T1-T3 variant passes when ALL hold:
+  (1) pooled NLL below its matched baseline by >= 2 paired SEs;
+  (2) below that baseline in >= 4 of the 5 folds;
+  (3) the market check is NOT WORSE at 95%: diff - 1.96 SE <= 0 (diff =
+      model minus market log loss) over >= 200 priced games.
+  Several pass: the lowest pooled NLL, unless a simpler passing variant
+  (lower number) is within 1 paired SE of it; then the simpler one.
+- Consequences, fixed now. The passing variant becomes the default:
+  MODEL_VERSION "v3", with the production scorer switched to it. GATE_PASSED
+  flips to True only if that variant ALSO BEATS the market: diff + 1.96 SE
+  < 0 over the pooled priced games. Reason: GATE_PASSED lets the bet
+  checker give totals legs a BET verdict, and a model that is merely "not
+  worse" than the market has no proven edge, so it would bet noise. If no
+  variant passes, v2 stays the default and GATE_PASSED stays False.
 """
 import logging
 
