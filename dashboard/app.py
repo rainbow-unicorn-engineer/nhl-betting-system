@@ -222,6 +222,9 @@ with tab_backtest:
         c[2].metric("Kelly ROI", f"{r.roi:+.2%}")
         c[3].metric("Flat ROI", f"{r.flat_roi:+.2%}")
         c[4].metric("Max drawdown", f"{r.max_drawdown:.1%}")
+        st.caption(f"Caps used: {r.max_stake_pct * 100:g}% of the bankroll a bet and "
+                   f"{r.max_daily_pct * 100:g}% a day, the locked rules (a cap → the "
+                   f"most the strategy may stake), not the .env ones the live picks use.")
         st.line_chart(r.bets.set_index("date")["bankroll"])
         st.dataframe(r.bets.sort_values("edge", ascending=False).head(25),
                      use_container_width=True)

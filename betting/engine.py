@@ -152,11 +152,14 @@ class BetDecision:
 
 def evaluate_market(model_home_prob: float, fair_home_prob: float,
                     home_price: Optional[float], away_price: Optional[float],
-                    edge_min: float = EDGE_MIN_ML) -> Optional[BetDecision]:
+                    edge_min: float = EDGE_MIN_ML,
+                    max_stake_pct: Optional[float] = None) -> Optional[BetDecision]:
     """The one decision function, line-shopping form: edge is measured
     against a fair (no-vig) probability that may come from a consensus of
     books, while each side is priced at the best available price (possibly
-    from different books). A side with no price is not bettable."""
+    from different books). A side with no price is not bettable.
+    max_stake_pct: the per-bet cap; None = MAX_STAKE_PCT (the .env one)."""
+    cap = MAX_STAKE_PCT if max_stake_pct is None else max_stake_pct
     for side, p_model, p_fair, price in (
             ("HOME", model_home_prob, fair_home_prob, home_price),
             ("AWAY", 1.0 - model_home_prob, 1.0 - fair_home_prob, away_price)):
@@ -168,7 +171,7 @@ def evaluate_market(model_home_prob: float, fair_home_prob: float,
         kelly = kelly_fraction(p_model, price)
         if kelly <= 0.0:      # +edge vs no-vig can still be -EV vs the vig
             continue
-        stake_pct = min(kelly * KELLY_FRACTION, MAX_STAKE_PCT)
+        stake_pct = min(kelly * KELLY_FRACTION, cap)
         return BetDecision(side=side, price=int(price),
                            model_prob=p_model, market_prob=p_fair,
                            edge=edge, kelly=kelly, stake_pct=stake_pct)
@@ -177,12 +180,13 @@ def evaluate_market(model_home_prob: float, fair_home_prob: float,
 
 def evaluate_moneyline(model_home_prob: float,
                        home_ml: float, away_ml: float,
-                       edge_min: float = EDGE_MIN_ML) -> Optional[BetDecision]:
+                       edge_min: float = EDGE_MIN_ML,
+                       max_stake_pct: Optional[float] = None) -> Optional[BetDecision]:
     """Single-book form: fair probability and prices from one two-sided
     line. The backtest uses this; the daily job uses evaluate_market."""
     fair_home, _ = no_vig_probs(home_ml, away_ml)
     return evaluate_market(model_home_prob, fair_home, home_ml, away_ml,
-                           edge_min)
+                           edge_min, max_stake_pct)
 
 
 def game_cap_reason(stake: float, bets_on_game: int, staked_on_game: float,
