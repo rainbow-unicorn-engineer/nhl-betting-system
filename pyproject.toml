@@ -24,6 +24,12 @@ ml = [
     "optuna>=3.6",
     "matplotlib>=3.8",            # calibration_plot in models/baseline.py (reached from lgbm + backtest)
 ]
+# Only for experiments/tabpfn (the TabPFN moneyline trial). Install the
+# CUDA build of torch first on the GPU machine, see experiments/tabpfn/README.md.
+tabpfn = [
+    "tabpfn==9.1.0",              # code Apache-2.0; uses the TabPFN-2 weights (Prior Labs License)
+    "torch>=2.5",
+]
 dashboard = [
     "streamlit>=1.32",
     "plotly>=5.20",
