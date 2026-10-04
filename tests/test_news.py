@@ -524,6 +524,51 @@ class TestRunOnDatabase:
         assert "Waiting for today's daily run" in ev[0]["market_note"]
         assert self.recs == []
 
+    def _feed_row(self, minutes_ago, home=-150, away=130):
+        when = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).replace(tzinfo=None)
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO raw.nhl_feed_snapshots (captured_at, game_id, source, book,
+                                                    market, home_price, away_price)
+                VALUES (:c, :g, 'partner-US', 'draftkings', 'ml', :h, :a)"""),
+                {"c": when, "g": self.GAME, "h": home, "a": away})
+
+    def test_an_old_feed_price_is_not_this_runs_price(self, monkeypatch):
+        """This run's free snapshot fails; a feed price from an earlier run
+        (before the news) must not count as "the market has not moved"."""
+        from ingestion import nhl_odds
+        self._paid_snapshot(minutes_ago=180)
+        self._feed_row(minutes_ago=60)                  # an earlier news run's price
+        news.run_news()
+
+        def down(skip_when_idle=False):
+            raise RuntimeError("feed down")
+        monkeypatch.setattr(nhl_odds, "snapshot", down)
+        self.goalies["BOS"] = ("Joonas Korpisalo", "Confirmed")
+        news.run_news()
+        ev = [e for e in self._events() if e["kind"] == "STARTER_CHANGED"]
+        assert len(ev) == 1 and ev[0]["market_moved"] is None
+        assert "no free NHL-feed price from this run" in ev[0]["market_note"]
+        assert ev[0]["new_pick"] is False
+        assert self.recs == [(self.today, set())]
+
+    def test_the_before_price_must_be_taken_with_the_paid_snapshot(self):
+        """A feed price from long before the paid snapshot is not its pair."""
+        when = (datetime.now(timezone.utc) - timedelta(minutes=60)).replace(tzinfo=None)
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO raw.odds_snapshots (game_id, captured_at, book_name, market_type,
+                                                home_price, away_price)
+                VALUES (:g, :c, 'draftkings', 'ml', -150, 130)"""), {"g": self.GAME, "c": when})
+        self._feed_row(minutes_ago=60 * 48)             # two days earlier
+        since = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._feed_row(minutes_ago=-1)                  # this run's price
+        moved, note = news.market_check(self.GAME, since=since)
+        assert moved is None and "taken with the last paid odds snapshot" in note
+        self._feed_row(minutes_ago=55, home=-110, away=-110)   # the real pair
+        moved, note = news.market_check(self.GAME, since=since)
+        assert moved is True
+
     def test_no_paid_snapshot_means_no_new_pick(self):
         news.run_news()
         self.goalies["BOS"] = ("Jeremy Swayman", "Confirmed")

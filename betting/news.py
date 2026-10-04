@@ -42,8 +42,10 @@ from NEWS_START_HOUR (8:00) local time until the day's last puck drop, it:
      it takes a free snapshot of the NHL's own odds feed
      (ingestion/nhl_odds.py) and compares each book's fair chance now with
      the same book's fair chance at the last paid odds snapshot
-     (raw.odds_snapshots). A move of NEWS_MOVE_PTS (1.0) percentage points
-     or more counts as moved;
+     (raw.odds_snapshots). Only a price from this run's snapshot counts as
+     now, and only one taken with the paid snapshot as then; without both
+     the move can't be ruled out. A move of NEWS_MOVE_PTS (1.0) percentage
+     points or more counts as moved;
   4. re-scores those games' date through the normal recommend path when a
      game has no moneyline pick yet and today's daily run has finished
      (raw.pipeline_runs, config/runs.py). Before that, last night's box
@@ -538,9 +540,23 @@ def check_injuries(games_by_team: dict, now: datetime) -> List[dict]:
 
 # ── Re-scoring after starter news ──────────────────────────────────
 
-def market_check(game_id: int) -> Tuple[Optional[bool], str]:
+# A free-feed price counts as "at the paid snapshot" when it was taken from
+# this long before it until PAIRED_AFTER after it (the odds and close
+# chains take one within a minute or two of every paid snapshot)
+PAIRED_BEFORE = timedelta(minutes=30)
+PAIRED_AFTER = timedelta(minutes=10)
+
+
+def market_check(game_id: int, since: Optional[datetime] = None
+                 ) -> Tuple[Optional[bool], str]:
     """Compare the NHL feed's prices now with its prices at the last paid
-    odds snapshot of this game (raw.odds_snapshots, moneyline)."""
+    odds snapshot of this game (raw.odds_snapshots, moneyline).
+    since: when this news run started (naive UTC, like captured_at). Only
+    a feed price taken since then counts as "now": an older one, from an
+    earlier run, may predate the news, so it can't show the market has not
+    reacted. "Before" is a feed price from PAIRED_BEFORE before the paid
+    snapshot to PAIRED_AFTER after it. Without since, "now" is any feed
+    price after that window."""
     with engine.connect() as conn:
         last_paid = conn.execute(text("""
             SELECT MAX(captured_at) FROM raw.odds_snapshots
@@ -549,22 +565,30 @@ def market_check(game_id: int) -> Tuple[Optional[bool], str]:
         if last_paid is None:
             return None, ("no paid odds snapshot for this game yet, so there is no "
                           "stored price to bet at")
-        edge = last_paid + timedelta(minutes=10)
+        lo, edge = last_paid - PAIRED_BEFORE, last_paid + PAIRED_AFTER
         rows = conn.execute(text("""
-            SELECT source, book, captured_at, home_price, away_price,
-                   captured_at <= :edge AS at_paid
+            SELECT source, book, captured_at, home_price, away_price
             FROM raw.nhl_feed_snapshots
             WHERE game_id = :g AND market = 'ml'
               AND home_price IS NOT NULL AND away_price IS NOT NULL
+              AND captured_at >= :lo
             ORDER BY captured_at
-        """), {"g": game_id, "edge": edge}).fetchall()
+        """), {"g": game_id, "lo": lo}).fetchall()
     before, now = {}, {}
-    for source, book, _, home, away, at_paid in rows:
-        key = f"{book} ({source})"
-        (before if at_paid else now)[key] = (int(home), int(away))
+    for source, book, captured_at, home, away in rows:
+        key, prices = f"{book} ({source})", (int(home), int(away))
+        if captured_at <= edge:
+            before[key] = prices              # the latest in the window wins
+        if captured_at > edge if since is None else captured_at >= since:
+            now[key] = prices
     if not now:
-        return None, ("no free NHL-feed price since the last paid odds snapshot, "
+        return None, ("no free NHL-feed price from this run, so a move can't be "
+                      "ruled out" if since is not None else
+                      "no free NHL-feed price since the last paid odds snapshot, "
                       "so a move can't be ruled out")
+    if not before:
+        return None, ("no free NHL-feed price taken with the last paid odds "
+                      "snapshot, so a move can't be ruled out")
     return price_move(before, now)
 
 
@@ -603,10 +627,13 @@ def rescore(events: List[dict], games: List[dict], now: datetime) -> None:
         nhl_snapshot(skip_when_idle=True)       # free: api-web.nhle.com
     except Exception as e:
         logger.error(f"NHL feed snapshot for the market check failed (non-fatal): {e}")
+    # only feed prices taken by this run count as "now" (naive UTC, like
+    # raw.nhl_feed_snapshots.captured_at)
+    since = now.astimezone(timezone.utc).replace(tzinfo=None)
     moves = {}
     for gid in news_games:
         try:
-            moves[gid] = market_check(gid)
+            moves[gid] = market_check(gid, since=since)
         except Exception as e:
             moves[gid] = (None, f"market check failed: {e}")
         logger.info(f"Market check, game {gid}: {moves[gid][1]}")
