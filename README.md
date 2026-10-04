@@ -312,7 +312,13 @@ On a machine that already runs the pipeline, also reinstall with `python -m pip 
 
 ## Looking at the results
 
-The dashboard shows pending picks and the next few days' games with start times in your local time, the bettors' real bets and balances (My bets), the model registry, the backtest, and the paper bankroll. `python -m betting.settle --report` prints CLV and ROI, and how many settled bets have a CLV. For anything else, query PostgreSQL from the repo folder:
+The dashboard shows pending picks and the next few days' games with start times in your local time, the bettors' real bets and balances (My bets), the model registry, the backtest, and the paper bankroll.
+
+The **📅 Today** tab ([dashboard/today.py](dashboard/today.py)) has three parts:
+
+- **Pending picks**: for each pick, the book and price to take, the bet spelled as the team ("TOR win"), puck drop in your time zone, the model's and the market's chances, the edge in percentage points, and the stake in dollars.
+- **Stake limits in use**: the per-bet, per-day and per-game caps as a share of `BANKROLL` and in dollars, with a warning when they contradict each other.
+- **Prices by book**: for each upcoming game and side, every book's latest price before puck drop from `raw.odds_snapshots` (no older than `MAX_ODDS_AGE_HOURS`). It marks the best price anywhere and the best at each bettor's own books, and gives the market's fair chance (the median across books, with the margin removed). Each game opens to its full list of books. Each bettor's books come from `BETTOR_<N>_BOOKS` in `.env` (N is the bettor's place in `BETTORS`, from 1), or else `BETTABLE_BOOKS`, or else every book. `python -m betting.settle --report` prints CLV and ROI, and how many settled bets have a CLV. For anything else, query PostgreSQL from the repo folder:
 
 ```bash
 docker compose exec db psql -U nhl -d nhl_betting
@@ -432,6 +438,7 @@ Settings come from `.env`. `.env.example` sets the first four rows and lists the
 | `NHL_SEASON` | the season containing today's local date | Pins the season as eight digits, such as `20252026`. The default rolls over on July 1, so set this only to finish a playoff run that goes past July 1, then remove it. A value that isn't eight digits with the second year one after the first logs an error and the default is used |
 | `BACKFILL_FIRST_SEASON` | `20202021` | The first season `backfill` loads. It loads every season from this one through the current one. A malformed value logs an error and `20202021` is used. A first season later than the current one (or an `NHL_SEASON` pinned before it) logs an error, and only the current season is loaded |
 | `BETTORS` | `bettor 1,bettor 2` | Comma-separated labels for the people whose real bets the ledger records (My bets tab). Keep real names out of the repo; `.env` is private |
+| `BETTOR_1_BOOKS`, `BETTOR_2_BOOKS`, … | `BETTABLE_BOOKS`, else every book | The Odds API book keys each bettor can bet at, comma-separated, numbered in `BETTORS` order from 1, such as `BETTOR_1_BOOKS=kalshi,polymarket`. The Today tab's "Prices by book" marks the best price at each bettor's books. They don't change the system's picks, which use `BETTABLE_BOOKS` |
 | `PLATFORMS` | unset | Comma-separated platform names offered first in the My bets tab. Any other name can be typed in |
 | `BANKROLL` | `1000` | Fixed bankroll that stakes are sized against, and the paper ledger's starting balance. Changing it restates the whole paper ledger on the next settle run |
 | `EDGE_MIN_ML` | `0.025` | Moneyline edge threshold for the recommendation job only. The checker and backtest keep the 2.5 in `betting/engine.py` |
@@ -571,6 +578,7 @@ models/                baseline, lgbm (moneyline), totals; artifacts/ holds cali
 betting/               engine, recommend, settle, backtest, checker, alerts, promo, ledger (real bets)
 dashboard/app.py       Streamlit control room: Today, Check a bet, My bets, Model, Backtest and Bankroll tabs
 dashboard/my_bets.py   The My bets tab: record real bets and parlays, results, balances
+dashboard/today.py     The Today tab: pending picks, stake limits in use, prices by book
 ops/launchd/           launchd job templates for the Mac: daily, odds, close, props, props-due
 ops/windows/           Task Scheduler registration script for Windows: -Role all, picks or props
 pipeline.py            Master command-line entry point
