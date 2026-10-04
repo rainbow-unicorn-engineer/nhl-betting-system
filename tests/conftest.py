@@ -139,6 +139,17 @@ def _guard(environ: MutableMapping[str, str] = os.environ,
 
 _MESSAGE = _guard()
 
+# The exposure limits are read from the environment (and .env) when
+# betting.engine is imported. The tests check the locked defaults, so a
+# machine whose .env raises the limits must not change their numbers:
+# blank them here (a blank value means "use the default", and .env never
+# overrides a variable already set). Tests of the settings themselves
+# pass their own values to a fresh interpreter.
+LIMIT_SETTINGS = ("MAX_STAKE_PCT", "MAX_DAILY_PCT", "MAX_GAME_STAKE_PCT",
+                  "MAX_BETS_PER_GAME")
+for _name in LIMIT_SETTINGS:
+    os.environ[_name] = ""
+
 
 def pytest_report_header(config):
     return _MESSAGE

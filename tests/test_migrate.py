@@ -147,7 +147,11 @@ def test_tables_hold_only_new_tables_with_their_ddl():
     assert names == [("raw", "nhl_feed_snapshots"), ("raw", "injuries"),
                      ("raw", "prop_odds_hist"), ("raw", "prop_odds_fetches"),
                      ("raw", "prop_snapshots"), ("raw", "odds_history"),
-                     ("raw", "odds_history_fetches")]
+                     ("raw", "odds_history_fetches"), ("raw", "lineups"),
+                     ("raw", "lineup_fetches"), ("raw", "news_events"),
+                     ("raw", "news_state"), ("raw", "news_runs"),
+                     ("raw", "pipeline_runs"), ("betting", "slips"),
+                     ("betting", "slip_legs"), ("betting", "bankroll_txns")]
     for schema, table, statements in migrate.TABLES:
         create = _create_table(statements)
         assert f"CREATE TABLE IF NOT EXISTS {schema}.{table} (" in create
@@ -175,11 +179,12 @@ def test_every_new_index_is_in_schema_sql():
 def test_module_ddl_matches_migrate():
     """Each module applies its own copy of the DDL on first use; it must
     declare exactly what migrate and schema.sql declare."""
-    from ingestion import (espn_injuries, espn_odds, espn_props, nhl_odds, nhl_stats,
-                           odds_history, props_odds)
+    from betting import news
+    from ingestion import (dailyfaceoff_lines, espn_injuries, espn_odds, espn_props,
+                           nhl_odds, nhl_stats, odds_history, props_odds)
     by_table = {t: s for _, t, s in migrate.TABLES}
     for module_ddl in (nhl_odds.DDL, espn_injuries.DDL, espn_props.DDL, props_odds.DDL,
-                       odds_history.DDL):
+                       odds_history.DDL, dailyfaceoff_lines.DDL, news.DDL):
         for stmt in module_ddl:
             if "CREATE TABLE" in stmt:
                 table = re.search(r"CREATE TABLE IF NOT EXISTS raw\.(\w+)", stmt).group(1)

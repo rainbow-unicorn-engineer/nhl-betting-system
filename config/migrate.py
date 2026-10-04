@@ -75,6 +75,12 @@ COLUMNS = (
     # and faceoff columns (naive UTC). NULL = never, so those zeros are
     # defaults, not data
     ("raw", "skater_games", "stats_filled_at", "TIMESTAMP"),
+    # A slip whose result was set by hand (betting/ledger.settle_by_hand):
+    # a later leg correction must not overwrite it
+    ("betting", "slips", "settled_by_hand", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # After Daily Faceoff refuses a request (429/403): no request for the
+    # team before this time (ingestion/dailyfaceoff_lines.py)
+    ("raw", "lineup_fetches", "next_fetch_after", "TIMESTAMPTZ"),
 )
 
 # (schema, table, statements): tables added after db/schema.sql first
@@ -232,6 +238,153 @@ TABLES = (
         )""",
         "CREATE INDEX IF NOT EXISTS idx_odds_history_fetches_ts "
         "ON raw.odds_history_fetches(requested_ts)",
+    )),
+    # Daily Faceoff line combinations, a snapshot per change
+    # (ingestion/dailyfaceoff_lines.py), and its last fetch per team
+    ("raw", "lineups", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.lineups (
+            snapshot_ts         TIMESTAMPTZ NOT NULL,
+            team                VARCHAR(3) NOT NULL,
+            game_date           DATE NOT NULL,
+            unit                VARCHAR(6) NOT NULL,
+            slot                VARCHAR(6) NOT NULL,
+            player_name         VARCHAR(80) NOT NULL,
+            player_id           INTEGER,
+            df_player_id        INTEGER,
+            position            VARCHAR(2),
+            injury_status       VARCHAR(12),
+            game_time_decision  BOOLEAN NOT NULL DEFAULT FALSE,
+            source_updated_at   TIMESTAMPTZ,
+            PRIMARY KEY (snapshot_ts, team, unit, slot)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_lineups_team ON raw.lineups(team, snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_lineups_player ON raw.lineups(player_id, game_date)",
+    )),
+    ("raw", "lineup_fetches", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.lineup_fetches (
+            team                VARCHAR(3) PRIMARY KEY,
+            fetched_at          TIMESTAMPTZ NOT NULL,
+            source_updated_at   TIMESTAMPTZ,
+            lines_hash          VARCHAR(64),
+            status              VARCHAR(12) NOT NULL,
+            next_fetch_after    TIMESTAMPTZ
+        )""",
+    )),
+    # The news monitor (betting/news.py): what changed, the last state seen
+    # per source and team, and one row per run
+    ("raw", "news_events", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.news_events (
+            event_id        BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL,
+            game_id         BIGINT REFERENCES raw.games(game_id),
+            game_date       DATE,
+            team            VARCHAR(3) NOT NULL,
+            kind            VARCHAR(20) NOT NULL CHECK (kind IN ('STARTER_CONFIRMED', 'STARTER_CHANGED', 'PLAYER_OUT', 'PLAYER_IN', 'LINE_CHANGE', 'PP_UNIT_CHANGE')),
+            source          VARCHAR(20) NOT NULL,
+            player_name     VARCHAR(80),
+            player_id       INTEGER,
+            detail          TEXT,
+            previous        TEXT,
+            current         TEXT,
+            rescored        BOOLEAN,
+            new_pick        BOOLEAN,
+            market_moved    BOOLEAN,
+            market_note     TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_news_events_ts ON raw.news_events(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_news_events_game ON raw.news_events(game_id)",
+    )),
+    ("raw", "news_state", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.news_state (
+            source          VARCHAR(20) NOT NULL,
+            team            VARCHAR(3) NOT NULL,
+            state           JSONB NOT NULL,
+            updated_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (source, team)
+        )""",
+    )),
+    ("raw", "news_runs", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.news_runs (
+            run_id          BIGSERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL,
+            finished_at     TIMESTAMPTZ,
+            events          INTEGER,
+            notes           TEXT
+        )""",
+    )),
+    # Finished pipeline jobs, one row per job and local date (config/runs.py).
+    # The news monitor makes no pick before today's 'daily' row exists
+    ("raw", "pipeline_runs", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.pipeline_runs (
+            job             VARCHAR(20) NOT NULL,
+            run_date        DATE NOT NULL,
+            finished_at     TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (job, run_date)
+        )""",
+    )),
+    # The bet ledger (betting/ledger.py): real bets as slips (a single bet
+    # or a parlay) with their legs, and each bettor's deposits,
+    # withdrawals and bonuses per platform. slips comes before slip_legs,
+    # which references it
+    ("betting", "slips", (
+        """
+        CREATE TABLE IF NOT EXISTS betting.slips (
+            slip_id         BIGSERIAL PRIMARY KEY,
+            bettor          VARCHAR(40) NOT NULL,
+            platform        VARCHAR(40) NOT NULL,
+            placed_at       TIMESTAMP NOT NULL,
+            stake           NUMERIC(10,2) NOT NULL CHECK (stake > 0),
+            price_american  INTEGER NOT NULL,
+            is_parlay       BOOLEAN NOT NULL DEFAULT FALSE,
+            is_bonus_bet    BOOLEAN NOT NULL DEFAULT FALSE,
+            status          VARCHAR(10) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'WON', 'LOST', 'PUSH', 'VOID', 'CASHED_OUT')),
+            payout          NUMERIC(10,2),
+            settled_at      TIMESTAMP,
+            notes           TEXT,
+            is_paper        BOOLEAN NOT NULL DEFAULT FALSE,
+            settled_by_hand BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_slips_who ON betting.slips(bettor, platform)",
+        "CREATE INDEX IF NOT EXISTS idx_slips_status ON betting.slips(status)",
+    )),
+    ("betting", "slip_legs", (
+        """
+        CREATE TABLE IF NOT EXISTS betting.slip_legs (
+            slip_id         BIGINT NOT NULL REFERENCES betting.slips(slip_id) ON DELETE CASCADE,
+            leg_no          SMALLINT NOT NULL,
+            game_id         BIGINT REFERENCES raw.games(game_id),
+            market          VARCHAR(10) NOT NULL CHECK (market IN ('ml', 'pl', 'total', 'prop_sog', 'other')),
+            side            VARCHAR(80) NOT NULL,
+            line            NUMERIC(5,1),
+            price_american  INTEGER,
+            player_id       INTEGER,
+            rec_id          BIGINT REFERENCES betting.recommendations(rec_id),
+            result          VARCHAR(5) CHECK (result IN ('WIN', 'LOSS', 'PUSH', 'VOID')),
+            settled_at      TIMESTAMP,
+            PRIMARY KEY (slip_id, leg_no)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_slip_legs_game ON betting.slip_legs(game_id)",
+    )),
+    ("betting", "bankroll_txns", (
+        """
+        CREATE TABLE IF NOT EXISTS betting.bankroll_txns (
+            txn_id          BIGSERIAL PRIMARY KEY,
+            bettor          VARCHAR(40) NOT NULL,
+            platform        VARCHAR(40) NOT NULL,
+            ts              TIMESTAMP NOT NULL,
+            kind            VARCHAR(10) NOT NULL CHECK (kind IN ('DEPOSIT', 'WITHDRAWAL', 'BONUS', 'ADJUSTMENT')),
+            amount          NUMERIC(10,2) NOT NULL,
+            note            TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_bankroll_txns_who "
+        "ON betting.bankroll_txns(bettor, platform)",
     )),
 )
 

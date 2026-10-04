@@ -3,12 +3,16 @@ dashboard/app.py — Streamlit control room (Phase 3).
 
 Run:  .venv/bin/streamlit run dashboard/app.py
 
-Five tabs:
-- Today: pending recommendations + upcoming slate (live during the season)
+Six tabs:
+- Today: pending picks (book, price, team, puck drop, edge, stake),
+  the stake limits in use, and every book's price on the upcoming games
+  (dashboard/today.py)
 - Check a bet: a bet or parlay you enter, run through betting/checker.py
+- My bets: the bettors' real bets (singles and parlays), their results,
+  and the balance on every platform (dashboard/my_bets.py, betting/ledger.py)
 - Model: registry, walk-forward metrics, calibration plots
 - Backtest: strategy simulation on true-price (DraftKings-era) games
-- Bankroll: placed bets, PnL curve, CLV once live betting starts
+- Bankroll: the system's paper bets, PnL curve, CLV
 """
 from pathlib import Path
 
@@ -17,9 +21,10 @@ import streamlit as st
 from sqlalchemy import text
 
 from betting.checker import EDGE_MIN_TOTAL, Leg, evaluate_parlay
-from betting.engine import EDGE_MIN_ML
+from betting.engine import EDGE_MIN_ML, MAX_STAKE_PCT, pct_text
 from config.migrate import ensure_schema
-from config.settings import engine, local_today, to_local
+from config.settings import engine, local_today
+from dashboard import my_bets, today
 from features.util import american_implied_prob
 
 st.set_page_config(page_title="NHL Betting System", page_icon="🏒",
@@ -56,13 +61,6 @@ def q(sql: str, params: dict = None) -> pd.DataFrame:
         return pd.read_sql(text(sql), conn, params=params or {})
 
 
-def local_start(ts) -> str:
-    """Puck drop in the user's local zone (LOCAL_TIMEZONE)."""
-    if ts is None or pd.isna(ts):
-        return "TBD"
-    return to_local(pd.Timestamp(ts).to_pydatetime()).strftime("%a %I:%M %p %Z")
-
-
 def pct(x) -> str:
     return "—" if x is None else f"{x:.1%}"
 
@@ -92,37 +90,15 @@ def slip_legs(slip: pd.DataFrame, games: dict) -> tuple:
     return legs, problems
 
 
-tab_today, tab_check, tab_model, tab_backtest, tab_bankroll = st.tabs(
-    ["📅 Today", "🔍 Check a bet", "🧠 Model", "🧪 Backtest", "💰 Bankroll"])
+tab_today, tab_check, tab_mine, tab_model, tab_backtest, tab_bankroll = st.tabs(
+    ["📅 Today", "🔍 Check a bet", "📒 My bets", "🧠 Model", "🧪 Backtest",
+     "💰 Bankroll"])
 
 with tab_today:
-    st.subheader("Pending recommendations")
-    recs = q("""
-        SELECT g.date, g.start_time_utc, g.away_team || ' @ ' || g.home_team AS game,
-               r.side, r.best_price AS price, r.model_prob, r.implied_prob_novig,
-               r.edge_pct, r.recommended_stake, r.status
-        FROM betting.recommendations r JOIN raw.games g USING (game_id)
-        WHERE r.status = 'PENDING' ORDER BY r.created_at DESC LIMIT 50""")
-    if recs.empty:
-        st.info("No pending recommendations — either the slate is empty "
-                "(off-season) or no game cleared the edge threshold.")
-    else:
-        recs.insert(1, "start (local)", recs.pop("start_time_utc").map(local_start))
-        st.dataframe(recs, use_container_width=True)
-
-    st.subheader("Upcoming games")
-    # "Today" is the user's local date (the DB clock is UTC); the NHL API
-    # marks upcoming games FUT/PRE, never SCHEDULED
-    slate = q("""
-        SELECT date, start_time_utc, away_team, home_team FROM raw.games
-        WHERE game_state NOT IN ('FINAL', 'OFF')
-          AND date BETWEEN :today AND :today + 2
-        ORDER BY date, start_time_utc LIMIT 30""", {"today": local_today()})
-    if not slate.empty:
-        slate.insert(1, "start (local)", slate.pop("start_time_utc").map(local_start))
-        st.dataframe(slate, use_container_width=True)
-    else:
-        st.caption("No games in the next 48h.")
+    try:
+        today.render(st, q)
+    except Exception as e:
+        st.error(f"The Today tab could not load: {e}")
 
 with tab_check:
     st.subheader("Check a bet or parlay")
@@ -155,6 +131,7 @@ with tab_check:
                     required=True),
             },
             num_rows="dynamic", hide_index=True, key="slip")
+        st.session_state["checker_slip"] = slip     # My bets can copy these rows
         c1, c2 = st.columns(2)
         boost = c1.number_input("Boosted parlay odds (optional)", value=None,
                                 step=1, help="Only if the book offers a "
@@ -198,11 +175,19 @@ with tab_check:
                                 f"${stake * bankroll:,.2f}" if bankroll
                                 else f"{stake:.2%} of bankroll",
                                 help="A quarter of the Kelly-formula bet "
-                                     "size, capped at 2% of bankroll")
+                                     "size, capped at "
+                                     f"{pct_text(MAX_STAKE_PCT)} of bankroll "
+                                     "(MAX_STAKE_PCT)")
                 banner, meaning = VERDICTS[r["verdict"]]
                 banner(meaning)
                 for n in r["notes"]:
                     st.warning(n)
+
+with tab_mine:
+    try:
+        my_bets.render(st)
+    except Exception as e:
+        st.error(f"The bet ledger could not load: {e}")
 
 with tab_model:
     st.subheader("Model registry")
@@ -237,6 +222,9 @@ with tab_backtest:
         c[2].metric("Kelly ROI", f"{r.roi:+.2%}")
         c[3].metric("Flat ROI", f"{r.flat_roi:+.2%}")
         c[4].metric("Max drawdown", f"{r.max_drawdown:.1%}")
+        st.caption(f"Caps used: {r.max_stake_pct * 100:g}% of the bankroll a bet and "
+                   f"{r.max_daily_pct * 100:g}% a day, the locked rules (a cap → the "
+                   f"most the strategy may stake), not the .env ones the live picks use.")
         st.line_chart(r.bets.set_index("date")["bankroll"])
         st.dataframe(r.bets.sort_values("edge", ascending=False).head(25),
                      use_container_width=True)

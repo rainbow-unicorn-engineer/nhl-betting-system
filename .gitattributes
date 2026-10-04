@@ -1,0 +1,4 @@
+# Batch files keep Windows line endings on every checkout: cmd.exe can
+# misread labels in a batch file with bare LF line endings
+*.bat text eol=crlf
+*.ico binary

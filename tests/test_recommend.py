@@ -770,3 +770,65 @@ class TestTotalsGateSwitch:
         assert calls["totals_scored"] == 1 and calls["totals_written"] == 1
         assert [r["game_id"] for r in calls["recs"]] == [1]
         assert "market_type" not in recs or set(recs["market_type"]) <= {"ml"}
+
+
+class TestOnlyGames:
+    """generate_recommendations(only_games=...) (the news monitor's
+    re-score): every game is scored and its prediction written, but only
+    the listed games may get a new pick. Everything else is faked."""
+
+    @pytest.fixture()
+    def run(self, monkeypatch):
+        import betting.recommend as R
+        seen = {"recs": [], "predicted": []}
+        slate = pd.DataFrame({"game_id": [1, 2], "season": [20262027] * 2,
+                              "date": [SIM_DATE] * 2,
+                              "home_team": ["BOS", "NYR"],
+                              "away_team": ["TOR", "PHI"]})
+        monkeypatch.setattr(R, "ensure_schema", lambda: None)
+        monkeypatch.setattr(R, "load_slate", lambda d, simulate=False: slate)
+        monkeypatch.setattr(R, "build_slate_vectors", lambda s, d, asof=None: s[["game_id"]])
+        # both games clear the minimum edge on the home side
+        monkeypatch.setattr(R, "score_slate", lambda v, cutoff_date=None: pd.DataFrame(
+            {"game_id": [1, 2], "prob_home": [0.60, 0.60], "market_available": [1.0, 1.0]}))
+        monkeypatch.setattr(R, "load_market", lambda ids, asof=None: pd.DataFrame({
+            "game_id": [1, 2], "fair_home_prob": [0.5, 0.5], "n_books": [3, 3],
+            "home_price": [-105, -105], "home_book": ["b", "b"],
+            "home_priced_at": [None] * 2, "away_price": [-110, -110],
+            "away_book": ["b", "b"], "away_priced_at": [None] * 2}))
+        monkeypatch.setattr(R, "load_issued_picks", lambda d, conn=None: pd.DataFrame(
+            columns=["game_id", "market_type", "status", "recommended_stake", "voided"]))
+
+        def predictions(scored):
+            seen["predicted"].append(sorted(scored["game_id"]))
+            return {1: 11, 2: 12}
+        monkeypatch.setattr(R, "write_predictions", predictions)
+
+        def write_recs(recs, ids, slate_date=None, bankroll=None):
+            seen["recs"].append(sorted(r["game_id"] for r in recs))
+            return len(recs)
+        monkeypatch.setattr(R, "write_recommendations", write_recs)
+        monkeypatch.setattr(R, "score_totals", lambda *a, **k: pd.DataFrame(
+            {"game_id": [1, 2], "expected_total": [6.0, 6.0]}))
+        monkeypatch.setattr(R, "load_total_lines", lambda ids, asof=None:
+                            pd.DataFrame(columns=["game_id", "line"]))
+        monkeypatch.setattr(R, "write_total_predictions", lambda s, l: len(s))
+
+        def go(only_games):
+            recs = R.generate_recommendations(SIM_DATE, bankroll=1000, edge_min=0.025,
+                                              only_games=only_games)
+            return recs, seen
+        return go
+
+    def test_default_lets_every_game_pick(self, run):
+        recs, seen = run(None)
+        assert sorted(recs["game_id"]) == [1, 2] and seen["recs"] == [[1, 2]]
+
+    def test_only_the_listed_games_may_pick(self, run):
+        recs, seen = run({2})
+        assert list(recs["game_id"]) == [2]
+        assert seen["recs"] == [[2]] and seen["predicted"] == [[1, 2]]
+
+    def test_an_empty_list_scores_but_picks_nothing(self, run):
+        recs, seen = run(set())
+        assert recs.empty and seen["recs"] == [[]] and seen["predicted"] == [[1, 2]]

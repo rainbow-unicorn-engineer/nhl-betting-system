@@ -2,19 +2,22 @@
 
 Templates for the Mac's scheduled runs. launchd is the job scheduler built into macOS; each job is a small XML file (a plist) in `~/Library/LaunchAgents`. These files are templates. Nothing installs them, and the live Mac's existing `com.nhlbetting.daily` and `com.nhlbetting.odds` plists are not replaced automatically. On Windows, use [ops/windows/](../windows/) instead.
 
-**The Mac runs every job (2026-10-01).** Each machine has its own `.env`, its own Odds API key and its own database, and the owner runs every job on both the Mac and the Windows PC (`register-tasks.ps1 -Role all`, see [ops/windows/](../windows/)). On the Mac that means all five templates below: the picks jobs (`daily`, the optional `odds`, `close`) and the props jobs (`props`, `props-due`). The free steps (an NHL-feed snapshot after each odds snapshot, power-play stats and the ESPN injury list) run inside `daily`, `odds` and `close`, so there is no separate `refresh` job. A Mac that only makes picks can skip the two props files.
+**The Mac runs every job (2026-10-01).** Each machine has its own `.env`, its own Odds API key and its own database, and the owner runs every job on both the Mac and the Windows PC (`register-tasks.ps1 -Role all`, see [ops/windows/](../windows/)). On the Mac that means all six templates below: the picks jobs (`daily`, the optional `odds`, `close`, `news`) and the props jobs (`props`, `props-due`). The free steps (an NHL-feed snapshot after each odds snapshot, power-play stats and the ESPN injury list) run inside `daily`, `odds` and `close`, so there is no separate `refresh` job. A Mac that only makes picks can skip the two props files.
 
 | File | Runs | When | Credits a run |
 |---|---|---|---|
 | `com.nhlbetting.daily.plist` | `python pipeline.py daily` | 9:00 | 3 |
 | `com.nhlbetting.odds.plist` (optional) | `python pipeline.py odds` | 13:00 | 3 |
 | `com.nhlbetting.close.plist` | `python pipeline.py close --due` | every 15 minutes | 1 when a game is about to start, otherwise 0 |
+| `com.nhlbetting.news.plist` | `python pipeline.py news --due` | every 15 minutes | 0: never calls The Odds API |
 | `com.nhlbetting.props.plist` | `python pipeline.py props` | 10:00 | 1 per game starting in the next 24 hours, per market returned |
 | `com.nhlbetting.props-due.plist` | `python pipeline.py props --due` | every 15 minutes | 1 per game per market when a game is about to start, otherwise 0 |
 
 The credits are for the default `ODDS_BOOKMAKERS`: ten named books bill as one region, half the old `us,us2` cost of 6 and 2.
 
 Times are the Mac's local time, and the defaults suit a Mac on Central time. Every snapshot run makes no Odds API request, and costs nothing, when no game starts in the next 24 hours. `close --due` takes its 1-credit moneyline snapshot only when some game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old; the other runs log one line and exit. So every start time gets one close, in the last 15-minute run before puck drop, afternoon games included, and the close job has no times to adjust. Those two limits are defaults, set by `CLOSE_LEAD_MINUTES` and `CLOSE_MIN_GAP_MINUTES` in `.env`.
+
+`news --due` is the news monitor (`betting/news.py`, see [ops/windows/](../windows/) for what it does). It works only on a game day from 8:00 local time until the last puck drop, and the other runs log one line and exit. Its requests go to Daily Faceoff, ESPN and the NHL's free odds feed, never to The Odds API.
 
 **Credits:** at the defaults, the closes average about 4 credits a game day, so the daily run plus the close job comes to at most about 228 credits in any month of the 2026-27 schedule, under the free plan's 500. The midday `odds` run adds about 93 in a full month, so it fits too. The two props jobs add 308 to 464 a month for one market (see [ops/windows/](../windows/)), so a Mac running every job needs a paid key. [Snapshot schedule](../../README.md#snapshot-schedule) in the main README has the numbers.
 
@@ -30,7 +33,7 @@ Each job starts in the repo folder, and a relative `DATA_DIR` such as `./data` f
 ```bash
 REPO="$HOME/nhl-betting-system"            # the repo's absolute path
 PY="$REPO/.venv/bin/python"
-JOB=close                                  # daily, odds, or close
+JOB=close                                  # daily, odds, close, news, props or props-due
 mkdir -p "$REPO/logs"
 sed -e "s|__REPO__|$REPO|g" -e "s|__PYTHON__|$PY|g" \
     "$REPO/ops/launchd/com.nhlbetting.$JOB.plist" \
@@ -75,7 +78,7 @@ launchctl load "$HOME/Library/LaunchAgents/com.nhlbetting.daily.plist"
 
 ## Logs
 
-`logs/daily.log`, `logs/odds.log`, and `logs/close.log` grow without limit, so trim or delete them now and then. `grep "Credits remaining" logs/*.log | tail -3` shows the latest credit counts. Since 2026-09-28 the Odds API key never appears in these logs. Logs written by the older jobs may contain it.
+`logs/daily.log`, `logs/odds.log`, `logs/close.log` and `logs/news.log` grow without limit, so trim or delete them now and then. `grep "Credits remaining" logs/*.log | tail -3` shows the latest credit counts. Since 2026-09-28 the Odds API key never appears in these logs. Logs written by the older jobs may contain it.
 
 ## Two machines
 

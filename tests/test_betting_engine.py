@@ -4,9 +4,10 @@ Tests for betting/engine.py — every number here is hand-computed.
 import pytest
 
 from betting.engine import (
-    BetDecision, EDGE_MIN_ML, KELLY_FRACTION, MAX_BETS_PER_GAME,
-    MAX_GAME_STAKE_PCT, MAX_STAKE_PCT, decimal_odds, evaluate_moneyline,
-    game_cap_reason, kelly_fraction, no_vig_probs, settle,
+    BetDecision, DEFAULT_MAX_BETS_PER_GAME, DEFAULT_MAX_DAILY_PCT,
+    DEFAULT_MAX_GAME_STAKE_PCT, DEFAULT_MAX_STAKE_PCT, EDGE_MIN_ML,
+    KELLY_FRACTION, MAX_STAKE_PCT, cap_warnings, decimal_odds,
+    evaluate_moneyline, game_cap_reason, kelly_fraction, no_vig_probs, settle,
 )
 
 
@@ -76,8 +77,10 @@ class TestGameCaps:
     Bankroll 1000: 4% = 40 across every bet on one game."""
 
     def test_locked_defaults(self):
-        assert MAX_BETS_PER_GAME == 3
-        assert MAX_GAME_STAKE_PCT == pytest.approx(0.04)
+        assert DEFAULT_MAX_BETS_PER_GAME == 3
+        assert DEFAULT_MAX_GAME_STAKE_PCT == pytest.approx(0.04)
+        assert DEFAULT_MAX_STAKE_PCT == pytest.approx(0.02)
+        assert DEFAULT_MAX_DAILY_PCT == pytest.approx(0.10)
 
     def test_fits(self):
         assert game_cap_reason(10.0, 0, 0.0, 1000) is None
@@ -99,3 +102,71 @@ class TestGameCaps:
                                max_game_stake_pct=0.02) is not None
         assert game_cap_reason(25.0, 0, 0.0, 1000,
                                max_game_stake_pct=0.05) is None
+
+
+class TestLimitSettings:
+    """MAX_STAKE_PCT, MAX_DAILY_PCT and MAX_GAME_STAKE_PCT from the
+    environment (a fresh interpreter each, since they are read at import):
+    blank = the locked default; a share of bankroll above 0 and at most 1
+    is used; anything else logs an error naming the setting and falls
+    back, so a typo can't break the import (and the daily chain)."""
+
+    NAMES = ("MAX_STAKE_PCT", "MAX_DAILY_PCT", "MAX_GAME_STAKE_PCT")
+
+    def _read(self, **env):
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+        root = Path(__file__).parent.parent
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import betting.engine as e; "
+             "print(e.MAX_STAKE_PCT, e.MAX_DAILY_PCT, e.MAX_GAME_STAKE_PCT)"],
+            cwd=root, capture_output=True, text=True, check=True,
+            env={**os.environ, "PYTHONPATH": str(root), **env})
+        vals = out.stdout.strip().splitlines()[-1].split()
+        return tuple(float(v) for v in vals), out.stderr
+
+    def test_blank_means_the_defaults(self):
+        vals, err = self._read(**{n: "" for n in self.NAMES})
+        assert vals == (0.02, 0.10, 0.04) and "is not" not in err
+
+    def test_valid_values(self):
+        vals, err = self._read(MAX_STAKE_PCT=" 0.25 ", MAX_DAILY_PCT="1",
+                               MAX_GAME_STAKE_PCT="0.5")
+        assert vals == (0.25, 1.0, 0.5) and "is not" not in err
+
+    @pytest.mark.parametrize("bad", ["0", "-0.1", "1.5", "nan", "inf", "2%",
+                                     "abc"])
+    def test_bad_values_fall_back_with_an_error(self, bad):
+        vals, err = self._read(**{n: bad for n in self.NAMES})
+        assert vals == (0.02, 0.10, 0.04)
+        for n in self.NAMES:
+            assert f"{n}={bad!r} is not a fraction of bankroll" in err
+
+    def test_contradicting_limits_warn(self):
+        _, err = self._read(MAX_STAKE_PCT="0.3", MAX_DAILY_PCT="0.2",
+                            MAX_GAME_STAKE_PCT="0.5")
+        assert "MAX_STAKE_PCT (30%) is above MAX_DAILY_PCT (20%)" in err
+
+
+class TestCapWarnings:
+    def test_consistent_limits(self):
+        assert cap_warnings(0.02, 0.10, 0.04) == []
+        assert cap_warnings(0.25, 1.0, 0.5) == []
+
+    def test_per_bet_above_day_and_game(self):
+        w = cap_warnings(0.05, 0.04, 0.03)
+        assert len(w) == 2
+        assert "MAX_DAILY_PCT (4%)" in w[0] and "skipped" in w[0]
+        assert "MAX_GAME_STAKE_PCT (3%)" in w[1]
+
+    def test_fractional_limits_are_not_rounded_away(self):
+        from betting.engine import game_cap_reason, pct_text
+        assert [pct_text(x) for x in (0.02, 0.025, 0.1, 0.07, 1 / 3, 1.0)] == [
+            "2%", "2.5%", "10%", "7%", "33.33%", "100%"]
+        w = cap_warnings(0.025, 0.02, 0.015)
+        assert "MAX_STAKE_PCT (2.5%)" in w[0] and "MAX_GAME_STAKE_PCT (1.5%)" in w[1]
+        why = game_cap_reason(30, 0, 0, 1000, max_bets=3, max_game_stake_pct=0.025)
+        assert "(2.5% of bankroll)" in why

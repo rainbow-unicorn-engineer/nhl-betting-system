@@ -20,6 +20,10 @@ Honesty notes baked in:
   availability and payout.
 - A flat-stake (1 unit) variant is reported alongside Kelly so the
   conclusion doesn't hinge on staking.
+- The caps are the locked rules (2% a bet, 10% a day: engine.py's
+  DEFAULT_ values), not the .env overrides the live picks use, so the
+  result stays comparable with the documented one. run_backtest takes
+  other caps as arguments, and the result reports the caps it used.
 """
 import logging
 from dataclasses import dataclass, field
@@ -28,7 +32,8 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from betting.engine import MAX_DAILY_PCT, evaluate_moneyline, settle
+from betting.engine import (DEFAULT_MAX_DAILY_PCT, DEFAULT_MAX_STAKE_PCT,
+                            evaluate_moneyline, settle)
 from config.settings import engine as db
 
 logger = logging.getLogger("nhl.betting.backtest")
@@ -64,12 +69,17 @@ class BacktestResult:
     flat_roi: float
     avg_edge: float
     bets: pd.DataFrame = field(repr=False, default=None)
+    max_stake_pct: float = DEFAULT_MAX_STAKE_PCT     # the caps this run used
+    max_daily_pct: float = DEFAULT_MAX_DAILY_PCT
 
 
 def run_backtest(oof: pd.DataFrame = None,
-                 start_bankroll: float = START_BANKROLL) -> BacktestResult:
+                 start_bankroll: float = START_BANKROLL,
+                 max_stake_pct: float = DEFAULT_MAX_STAKE_PCT,
+                 max_daily_pct: float = DEFAULT_MAX_DAILY_PCT) -> BacktestResult:
     """oof: DataFrame with game_id + prob_home (walk-forward OOF). If None,
-    the lgbm walk-forward is run to produce it."""
+    the lgbm walk-forward is run to produce it. The caps default to the
+    locked rules, whatever .env sets for the live picks."""
     if oof is None:
         from models.lgbm import run_lgbm
         oof = run_lgbm(register=False)["oof"]
@@ -84,13 +94,14 @@ def run_backtest(oof: pd.DataFrame = None,
     rows = []
 
     for g in games.itertuples():
-        d = evaluate_moneyline(g.prob_home, g.home_ml, g.away_ml)
+        d = evaluate_moneyline(g.prob_home, g.home_ml, g.away_ml,
+                               max_stake_pct=max_stake_pct)
         if d is None:
             continue
         if g.date != cur_day:
             cur_day, day_spend = g.date, 0.0
         stake = bankroll * d.stake_pct
-        if day_spend + stake > bankroll * MAX_DAILY_PCT:
+        if day_spend + stake > bankroll * max_daily_pct:
             continue                      # daily exposure cap
         day_spend += stake
 
@@ -121,7 +132,7 @@ def run_backtest(oof: pd.DataFrame = None,
         flat_pnl_units=float(flat_pnl),
         flat_roi=float(flat_pnl / n) if n else 0.0,
         avg_edge=float(bets["edge"].mean()) if n else 0.0,
-        bets=bets)
+        bets=bets, max_stake_pct=max_stake_pct, max_daily_pct=max_daily_pct)
 
     logger.info(
         f"BACKTEST: {result.n_bets} bets over {result.n_games} priced games "
@@ -129,7 +140,8 @@ def run_backtest(oof: pd.DataFrame = None,
         f"| pnl {result.pnl:+.2f}u | ROI {result.roi:+.3%} "
         f"| flat-stake ROI {result.flat_roi:+.3%} "
         f"| max drawdown {result.max_drawdown:.1%} "
-        f"| avg edge {result.avg_edge:.3f}")
+        f"| avg edge {result.avg_edge:.3f} "
+        f"| caps {max_stake_pct:.1%} a bet, {max_daily_pct:.1%} a day")
     return result
 
 

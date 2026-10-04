@@ -65,7 +65,6 @@ dress rehearsal for the 2026-27 paper-trading season.
 """
 import argparse
 import logging
-import math
 import os
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
@@ -75,11 +74,10 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from betting.engine import (MAX_BETS_PER_GAME as _DEFAULT_BETS_PER_GAME,
-                            MAX_DAILY_PCT,
-                            MAX_GAME_STAKE_PCT as _DEFAULT_GAME_STAKE_PCT,
-                            decimal_odds, evaluate_market, EDGE_MIN_ML,
-                            game_cap_reason)
+# The exposure limits (.env-overridable, validated) are read in engine.py
+from betting.engine import (MAX_BETS_PER_GAME, MAX_DAILY_PCT,
+                            MAX_GAME_STAKE_PCT, decimal_odds, evaluate_market,
+                            EDGE_MIN_ML, game_cap_reason)
 from config.migrate import ensure_schema
 from config.settings import engine as db, local_today
 
@@ -93,35 +91,6 @@ RECENT_TEAM_GAMES = 10          # starter projection window
 BETTABLE_BOOKS = frozenset(b.strip().lower() for b in
                            os.getenv("BETTABLE_BOOKS", "").split(",")
                            if b.strip())
-
-
-def _limit_setting(name: str, default, parse, valid, what: str):
-    """An exposure limit from the environment. Unset or blank = default; a
-    malformed or out-of-range value logs an error and uses the default, so
-    a typo in .env can't abort the import, and with it the daily chain."""
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = parse(raw)
-        if not valid(value):
-            raise ValueError(raw)
-        return value
-    except (ValueError, OverflowError):
-        logger.error(f"{name}={raw!r} is not {what} — using the default, "
-                     f"{default:g}")
-        return default
-
-
-# Per-game limits (PROJECT_CONTEXT §7: max 3 correlated bets per game),
-# every market counted. Defaults are betting/engine.py's.
-MAX_BETS_PER_GAME = _limit_setting(
-    "MAX_BETS_PER_GAME", _DEFAULT_BETS_PER_GAME, int, lambda v: v >= 1,
-    "a whole number of bets, 1 or more")
-MAX_GAME_STAKE_PCT = _limit_setting(
-    "MAX_GAME_STAKE_PCT", _DEFAULT_GAME_STAKE_PCT, float,
-    lambda v: math.isfinite(v) and 0 < v <= 1,
-    "a fraction of bankroll above 0 and at most 1 (0.04 = 4%)")
 
 
 # ── Slate ──────────────────────────────────────────────────────────
@@ -757,10 +726,15 @@ def write_recommendations(recs: list, slate_game_ids: list, slate_date=None,
 
 def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
                              edge_min: float = None, dry_run: bool = False,
-                             simulate: bool = False) -> pd.DataFrame:
+                             simulate: bool = False,
+                             only_games=None) -> pd.DataFrame:
     """Score the slate, decide bets through the engine, persist. Returns
     the frame of NEW recommendations (possibly empty); games that already
-    have a pick keep it and are not re-decided."""
+    have a pick keep it and are not re-decided.
+    only_games: when given (a set of game ids, possibly empty), every
+    slate game is still scored and its prediction written, but only these
+    games may get a new pick. The news monitor (betting/news.py) passes
+    the games whose stored price it could confirm is still the market's."""
     ensure_schema()
     target_date = target_date or local_today()
     if edge_min is None:
@@ -804,10 +778,17 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
     def _price(p):
         return None if p is None or pd.isna(p) else p
 
+    if only_games is not None:
+        only_games = {int(g) for g in only_games}
+        logger.info(f"Only {len(only_games)} game(s) may get a new pick this "
+                    f"run: " + (", ".join(map(str, sorted(only_games))) or "none"))
+
     candidates = []
     for g in merged.itertuples():
         if pd.isna(g.fair_home_prob):
             continue                      # no line -> never bet
+        if only_games is not None and int(g.game_id) not in only_games:
+            continue
         d = evaluate_market(g.prob_home, g.fair_home_prob,
                             _price(g.home_price), _price(g.away_price),
                             edge_min)

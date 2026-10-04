@@ -13,10 +13,15 @@
                     not refresh, which daily already covers.
 
       -Role picks   Moneyline picks and closing lines only (mirrors the
-                    Mac's daily, odds and close agents). Registers:
+                    Mac's daily, odds, close and news agents). Registers:
                       daily      python pipeline.py daily        at -DailyTime (9:00)
                       odds       python pipeline.py odds         at -OddsTime (13:00), only with -IncludeOdds
                       close      python pipeline.py close --due  every 15 minutes
+                      news       python pipeline.py news --due   every 15 minutes: team news
+                                                                 (starting goalies, lines,
+                                                                 injuries) from 8:00 until
+                                                                 the last puck drop on game
+                                                                 days; free, no Odds API request
 
       -Role props   Player-props lines only, no picks. Registers:
                       refresh    python pipeline.py refresh      at -DailyTime (9:00): schedule,
@@ -48,9 +53,9 @@
 
 .PARAMETER Role
     Required (except with -Unregister). "all": every job, the picks tasks
-    plus props and props-due. "picks": daily, close --due every 15 minutes
-    and, with -IncludeOdds, the midday odds run; moneyline picks and closing
-    lines. "props": refresh, a morning props snapshot and props --due every
+    plus props and props-due. "picks": daily, close --due and news --due
+    every 15 minutes and, with -IncludeOdds, the midday odds run; moneyline
+    picks, closing lines and team news. "props": refresh, a morning props snapshot and props --due every
     15 minutes; player-props lines, no picks.
 
 .PARAMETER RepoPath
@@ -101,10 +106,12 @@
 [CmdletBinding(DefaultParameterSetName = "Register")]
 param(
     [Parameter(Mandatory = $true, ParameterSetName = "Register",
-        HelpMessage = "all = every job; picks = moneyline picks and closes (daily, close --due, optional odds); props = player-props lines (refresh, props, props --due)")]
+        HelpMessage = "all = every job; picks = moneyline picks, closes and news (daily, close --due, news --due, optional odds); props = player-props lines (refresh, props, props --due)")]
     [ValidateSet("all", "picks", "props")]
     [string]$Role,
-    [string]$RepoPath = (Join-Path $PSScriptRoot "..\.."),
+    # Resolved below: Windows PowerShell 5.1 leaves $PSScriptRoot empty in
+    # an advanced script's parameter defaults
+    [string]$RepoPath = "",
     [string]$PythonPath = "",
     [Parameter(ParameterSetName = "Register")]
     [switch]$IncludeOdds,
@@ -119,10 +126,10 @@ param(
 $ErrorActionPreference = "Stop"
 $TaskFolder = "\NHLBetting\"
 $RoleTasks = @{
-    "picks" = @("daily", "odds", "close")
+    "picks" = @("daily", "odds", "close", "news")
     "props" = @("refresh", "props", "props-due")
     # refresh is a subset of daily, so all never schedules both
-    "all"   = @("daily", "odds", "close", "props", "props-due")
+    "all"   = @("daily", "odds", "close", "news", "props", "props-due")
 }
 $AllTasks = $RoleTasks["picks"] + $RoleTasks["props"]
 $DoesPicks = $Role -in @("all", "picks")
@@ -147,6 +154,9 @@ if ($IncludeOdds -and -not $DoesPicks) {
     throw "-IncludeOdds adds the midday moneyline odds run, which belongs to -Role all or picks. The props role makes no picks."
 }
 
+if (-not $RepoPath) {
+    $RepoPath = Join-Path $PSScriptRoot "..\.."
+}
 $RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
 if (-not $PythonPath) {
     $PythonPath = Join-Path $RepoPath ".venv\Scripts\python.exe"
@@ -249,6 +259,15 @@ if ($DoesPicks) {
     Register-PipelineTask "close" (New-QuarterHourTrigger) `
         (New-PipelineAction "close --due" "close") `
         "python pipeline.py close --due every 15 minutes"
+
+    # news --due every 15 minutes, all day: on a game day from 8:00 local
+    # until the last puck drop it refreshes Daily Faceoff's starters and
+    # lines and ESPN's injury list, records what changed, and re-scores a
+    # game whose starter changed (no Odds API request, so no credits);
+    # outside that window a run logs one line and exits
+    Register-PipelineTask "news" (New-QuarterHourTrigger) `
+        (New-PipelineAction "news --due" "news") `
+        "python pipeline.py news --due every 15 minutes"
 } else {
     # refresh: schedule and box scores (props are matched to raw.games),
     # power-play stats and the ESPN injury list. Free: no Odds API request

@@ -15,12 +15,14 @@ prints that command's options and runs nothing):
     python pipeline.py props [--due]                # Player-props snapshot (the props machine)
     python pipeline.py nhl-odds                     # Free snapshot of the NHL's own odds feed
     python pipeline.py compare-feeds [--date D]     # NHL feed vs The Odds API, stored prices
+    python pipeline.py settle                       # Settle paper picks + the bettors' recorded bets
     python pipeline.py injuries                     # ESPN injury list snapshot (free)
+    python pipeline.py news [--due]                 # Team news: starters, lines, injuries (free)
     python pipeline.py nhl-stats [--season S]       # Power-play, penalty-kill, faceoff stats (free)
 
 Machine roles: each machine has its own .env, Odds API key and database.
-The picks jobs are daily, odds and close; the props jobs are props and
-props --due (plus refresh on a machine without daily). The owner runs
+The picks jobs are daily, odds, close and news --due; the props jobs are
+props and props --due (plus refresh on a machine without daily). The owner runs
 every job on both the Mac and the Windows PC. ops/launchd/ and
 ops/windows/ (-Role all) schedule them.
 
@@ -66,6 +68,8 @@ def db_status():
         "Skater games with PP stats": "SELECT COUNT(*) FROM raw.skater_games "
                                       "WHERE stats_filled_at IS NOT NULL",
         "Injury list rows": "SELECT COUNT(*) FROM raw.injuries",
+        "Lineup rows (Daily Faceoff)": "SELECT COUNT(*) FROM raw.lineups",
+        "News events": "SELECT COUNT(*) FROM raw.news_events",
         "Prop lines (live, Odds API)": "SELECT COUNT(*) FROM raw.prop_snapshots",
         "Prop lines (history, ESPN)": "SELECT COUNT(*) FROM raw.prop_odds_hist",
         "Players": "SELECT COUNT(*) FROM raw.players",
@@ -161,6 +165,17 @@ def settle():
         logger.error(f"Paper settlement failed (non-fatal): {e}")
 
 
+def settle_ledger():
+    """Settle the bet ledger's open slips (real bets recorded on the
+    dashboard's My bets tab) from final scores and box scores
+    (non-fatal)."""
+    try:
+        from betting.ledger import settle_slips
+        settle_slips()
+    except Exception as e:
+        logger.error(f"Bet-ledger settlement failed (non-fatal): {e}")
+
+
 def recommend():
     """Score today's slate through the betting engine and write
     betting.recommendations (no-op when there are no games)."""
@@ -194,6 +209,22 @@ def injuries():
         ingest_injuries()
     except Exception as e:
         logger.error(f"ESPN injury snapshot failed (non-fatal): {e}")
+
+
+def news(due: bool = False):
+    """The news monitor (betting/news.py, non-fatal, no Odds API request):
+    Daily Faceoff starters and line combinations and ESPN's injury list,
+    compared with the previous run; changes go to raw.news_events, and
+    starter news on a game without a pick re-scores that game's date.
+    due=True (`news --due`, every 15 minutes): only on a game day from
+    NEWS_START_HOUR (8:00) local until the last puck drop. It waits for the
+    network only after deciding the run is due, so the runs outside the
+    window never block or log a network error."""
+    try:
+        from betting.news import run_news
+        run_news(due=due, network_ready=_wait_for_network)
+    except Exception as e:
+        logger.error(f"News monitor failed (non-fatal): {e}")
 
 
 def nhl_stats(season=None):
@@ -298,7 +329,8 @@ def daily():
     from ingestion.odds_api import snapshot_odds
     from config.settings import CURRENT_SEASON
 
-    logger.info(f"DAILY REFRESH — {local_today()} (season {CURRENT_SEASON})")
+    run_date = local_today()
+    logger.info(f"DAILY REFRESH — {run_date} (season {CURRENT_SEASON})")
     if not _wait_for_network():
         return
     daily_refresh()
@@ -325,9 +357,18 @@ def daily():
     # full-history inside the build)
     features(season=CURRENT_SEASON)
     settle()        # yesterday's finals + closing snapshots are in
+    settle_ledger() # the bettors' recorded bets, from the same finals and box scores
     starters()
     injuries()      # ESPN keeps no history: save today's list before picks
     recommend()
+    # The marker the news monitor waits for: before it, today's data is not
+    # loaded, so news makes no pick (betting/news.py, config/runs.py)
+    try:
+        from config.runs import mark_finished
+        mark_finished("daily", run_date)
+    except Exception as e:
+        logger.error(f"Could not record the finished daily run (non-fatal; news "
+                     f"makes no pick today until it is recorded): {e}")
     logger.info("DAILY REFRESH COMPLETE")
 
 
@@ -402,7 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python pipeline.py",
         description="NHL Betting System pipeline. `<command> --help` prints a "
                     "command's options and runs nothing.",
-        epilog="Machine roles: the picks jobs are daily, odds and close; the "
+        epilog="Machine roles: the picks jobs are daily, odds, close and news; the "
                "props jobs are props and props --due (plus refresh where daily "
                "doesn't run). The owner runs every job on both machines. Each "
                "machine has its own .env, Odds API key and database.")
@@ -432,7 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "moneyline snapshot is under CLOSE_MIN_GAP_MINUTES (16) old")
     add("recommend", "Score today's slate into betting.recommendations")
     add("starters", "Starting goalies from Daily Faceoff")
-    add("settle", "Settle paper bets and rebuild the bankroll and CLV ledger")
+    add("settle", "Settle paper bets and rebuild the bankroll and CLV ledger, "
+                  "then settle the bettors' recorded bets (the bet ledger)")
     add("refresh", "The props machine's daily run: schedule and box scores, "
                    "power-play stats, ESPN injuries. No odds request, no picks")
     p = add("props", "Player-props snapshot from The Odds API into "
@@ -453,6 +495,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="schedule date (default: today's local date)")
     p.add_argument("--detail", action="store_true", help="also list every paired price")
     add("injuries", "Save today's ESPN injury list into raw.injuries (free)")
+    p = add("news", "Team news: refresh Daily Faceoff starters and lines and ESPN "
+                    "injuries, record what changed in raw.news_events, re-score "
+                    "games with starter news and no pick yet (free, no Odds API "
+                    "request)")
+    p.add_argument("--due", action="store_true",
+                   help="scheduled form, every 15 minutes: only on a game day from "
+                        "NEWS_START_HOUR (8:00) local until the last puck drop")
     p = add("nhl-stats", "Fill power-play / penalty-kill ice time, power-play "
                          "points and faceoffs in raw.skater_games (free)")
     p.add_argument("--season", type=_season_value, default=None, metavar="YYYYYYYY",
@@ -497,6 +546,7 @@ def main(argv=None) -> int:
         starters()
     elif cmd == "settle":
         settle()
+        settle_ledger()
     elif cmd == "refresh":
         refresh()
     elif cmd == "props":
@@ -509,6 +559,8 @@ def main(argv=None) -> int:
         print(format_report(compare_feeds(args.date), detail=args.detail))
     elif cmd == "injuries":
         injuries()
+    elif cmd == "news":
+        news(due=args.due)
     elif cmd == "nhl-stats":
         nhl_stats(args.season)
     return 0
