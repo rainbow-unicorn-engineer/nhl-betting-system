@@ -111,6 +111,19 @@ class TestBettableBooks:
         # the engine treats an unpriced side as not bettable
         assert evaluate_market(0.90, m.loc[2, "fair_home_prob"], None, None) is None
 
+    def test_exchange_quote_is_ranked_after_its_fee(self):
+        # Kalshi +102 (contract 0.495) beats fanduel +100 on the quote, but
+        # after the 0.07 * p * (1 - p) fee it pays 1.932 < 2.0: fanduel wins
+        snaps = _snaps([(4, "kalshi", T1, -110, 102),
+                        (4, "fanduel", T1, -120, 100)])
+        m = summarize_market(snaps, NO_HIST).set_index("game_id")
+        assert m.loc[4, "away_book"] == "fanduel" and m.loc[4, "away_price"] == 100
+        # a big enough price gap still goes to the exchange
+        snaps = _snaps([(5, "kalshi", T1, -110, 110),
+                        (5, "fanduel", T1, -120, 100)])
+        m = summarize_market(snaps, NO_HIST).set_index("game_id")
+        assert m.loc[5, "away_book"] == "kalshi"
+
     def test_historical_reference_line_is_not_filtered(self):
         hist = pd.DataFrame([(3, "ESPN BET", -140, 120)], columns=NO_HIST.columns)
         m = summarize_market(_snaps([]), hist,

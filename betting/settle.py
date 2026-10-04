@@ -266,7 +266,8 @@ def settle_paper() -> int:
 
             decision = BetDecision(side=r.side, price=int(r.best_price),
                                    model_prob=0.0, market_prob=0.0,
-                                   edge=0.0, kelly=0.0, stake_pct=0.0)
+                                   edge=0.0, kelly=0.0, stake_pct=0.0,
+                                   book=r.best_book)   # exchange fee on a win
             pnl = engine_settle(decision, bool(r.home_won), stake)
             closing_price, closing_implied = closing_quote(
                 r.game_id, r.best_book, r.side, priced_at)

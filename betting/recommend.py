@@ -76,7 +76,8 @@ from sqlalchemy import text
 
 # The exposure limits (.env-overridable, validated) are read in engine.py
 from betting.engine import (MAX_BETS_PER_GAME, MAX_DAILY_PCT,
-                            MAX_GAME_STAKE_PCT, decimal_odds, evaluate_market,
+                            MAX_GAME_STAKE_PCT, effective_decimal,
+                            evaluate_market,
                             EDGE_MIN_ML, game_cap_reason)
 from config.migrate import ensure_schema
 from config.settings import engine as db, local_today
@@ -316,8 +317,14 @@ def summarize_market(snaps: pd.DataFrame, hist: pd.DataFrame,
                "away_price": None, "away_book": None, "away_priced_at": None}
         shop = g[g["bettable"].astype(bool)]
         if not shop.empty:
-            best_h = shop.loc[shop["home_price"].map(decimal_odds).idxmax()]
-            best_a = shop.loc[shop["away_price"].map(decimal_odds).idxmax()]
+            # ranked after exchange taker fees: a Kalshi or Polymarket
+            # quote is only "best" if it still pays most once its fee is paid
+            eff_h = [effective_decimal(p, b) for p, b in
+                     zip(shop["home_price"], shop["book_name"])]
+            eff_a = [effective_decimal(p, b) for p, b in
+                     zip(shop["away_price"], shop["book_name"])]
+            best_h = shop.iloc[int(np.argmax(eff_h))]
+            best_a = shop.iloc[int(np.argmax(eff_a))]
             row.update({
                 "home_price": int(best_h["home_price"]),
                 "home_book": best_h["book_name"],
@@ -789,9 +796,12 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
             continue                      # no line -> never bet
         if only_games is not None and int(g.game_id) not in only_games:
             continue
+        # the books let an exchange price (Kalshi, Polymarket) carry its
+        # taker fee into Kelly and the stake (betting/engine.py)
         d = evaluate_market(g.prob_home, g.fair_home_prob,
                             _price(g.home_price), _price(g.away_price),
-                            edge_min)
+                            edge_min, home_book=_price(g.home_book),
+                            away_book=_price(g.away_book))
         if d is None:
             continue
         if d.side == "HOME":
