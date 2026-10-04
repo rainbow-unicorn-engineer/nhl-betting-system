@@ -65,22 +65,28 @@ and the Phase 3 priority.
 
 The free sources above give one line per game, and for 2024-25 only the
 favourite's price. Two-way prices (→ a bet with two outcomes, overtime
-and shootout included, which is what the models price) from several books,
-with the time each price was taken, come from The Odds API's paid
-historical endpoint. `ingestion/odds_history.py` buys them into
-`raw.odds_history` and logs every purchase in `raw.odds_history_fetches`.
+and shootout included, which is what the models price) from several books
+(→ sportsbooks), with the time each price was taken, come from The Odds
+API's paid historical endpoint (→ the part of the API that serves past
+prices). `ingestion/odds_history.py` buys them into `raw.odds_history` and
+logs every purchase in `raw.odds_history_fetches`. The markets bought are
+the moneyline (`h2h` in the API → who wins) and the total (→ over or under
+the combined goals line).
 
 **Endpoint facts, confirmed against the v4 docs and live calls:**
 
 - `GET /v4/historical/sports/icehockey_nhl/odds?date=<ISO time>` returns
-  the snapshot taken at or just before `date`, wrapped as `timestamp`,
+  the snapshot (→ every book's prices for every listed game at one
+  moment) taken at or just before `date`, wrapped as `timestamp`,
   `previous_timestamp`, `next_timestamp` and `data` (the events). A
   snapshot holds every game listed at that moment: later games that day,
-  the next days, and games already in play (those are dropped on load).
+  the next days, and games already in play (→ already started, priced
+  live; those are dropped on load).
 - Snapshots every 10 minutes from June 2020, every 5 minutes from
   September 2022 (seen: 23:40:38, 23:45:38, 23:50:38 on 2024-12-10).
   `icehockey_nhl` history starts 2020-06-29. Paid plans only.
-- Cost: 10 credits x markets x regions, where up to 10 named
+- Cost: 10 credits (→ The Odds API's billing unit) x markets x regions
+  (→ the API's groups of books, such as `us`), where up to 10 named
   `bookmakers` bill as one region. The first call (h2h, `regions=us`)
   read `x-requests-last: 10`; every h2h + totals call with 10 named books
   read 20. An empty response costs nothing. Credits are reported in the
@@ -92,16 +98,31 @@ historical endpoint. `ingestion/odds_history.py` buys them into
 **Books (10 = one region):** pinnacle (the sharpest reference price),
 draftkings, fanduel, betmgm, betrivers and espnbet (also in the live
 default list, so history and live compare book for book), williamhill_us
-(Caesars), and the offshore books lowvig, betonlineag and bovada, priced
-in every season. Four probe calls (40 credits) on 2022-12-13 and
-2024-12-10 showed which books each era had: 2022-23 also had pointsbetus,
+(Caesars), and the offshore books (→ sportsbooks licensed outside the
+US) lowvig, betonlineag and bovada, priced in every season. Four probe
+calls (→ one-off test calls, 40 credits) on 2022-12-13 and 2024-12-10
+showed which books each era had: 2022-23 also had pointsbetus,
 barstool, unibet_us, twinspires, wynnbet, superbook, foxbet and
 sugarhouse (since closed or renamed); espnbet starts in November 2023.
 In the 2024-25 data lowvig and betonlineag quoted the same price 99.2% of
 the time, so for 2023-24 and 2022-23 swap betonlineag for another book
 (for example `mybookieag`, or `pointsbetus` in 2022-23) with
-`--bookmakers`. A snapshot already bought with other books is never
-bought again.
+`--bookmakers`, and name the seasons with `--steps` so the run buys only
+those:
+
+```bash
+BOOKS=pinnacle,draftkings,fanduel,betmgm,williamhill_us,betrivers,espnbet,lowvig,mybookieag,bovada
+python -m ingestion.odds_history plan  --steps close:20232024,close:20222023 --bookmakers $BOOKS
+python -m ingestion.odds_history fetch --steps close:20232024,close:20222023 --bookmakers $BOOKS --max-credits 2000
+```
+
+By default a snapshot already bought with other books counts as bought,
+so the 2024-25 snapshots are skipped whatever `--bookmakers` says. **Do not
+add `--same-books-only` to this command:** that flag counts a snapshot as
+bought only when it was bought with exactly the same books, so every
+snapshot bought with the old list would be bought again (all of 2024-25
+is 13,960 credits). For that reason `--same-books-only` refuses to run
+without explicit `--steps`.
 
 **The plan, and what was bought on 2026-10-04 (14,000 credits including
 the probes; 6,000 left on the account for the live jobs):**
@@ -115,16 +136,20 @@ the probes; 6,000 left on the account for the live jobs):**
 
 - **close** → for each game date the start times are grouped into
   clusters (a cluster takes every start within 75 minutes of its first
-  one) and one snapshot is bought at the cluster's first puck drop minus
-  10 minutes. The last price stored before a game is a median 14 minutes
+  one) and one snapshot is bought at the cluster's first puck drop (→ the
+  game's start) minus 10 minutes. The closing price (→ the last price
+  before the game starts, the market's sharpest opinion) is what closing
+  line value is measured against. The last price stored before a game is a median 14 minutes
   before its scheduled start, at most 89.
 - **morning** → one snapshot per game date at 10:00 Central, for the
   bet-timing study (does the price move between the morning and the
   close?). A plan the budget cuts short is bought in a spread order
-  (bit-reversed), so the 149 dates cover the whole season, not its first
-  five months.
-- Sanity check: the closing no-vig home probability → the book's chance
-  with its margin removed scores a log loss of 0.657 to 0.658 against
+  (bit-reversed → a fixed order that takes the first date, then the
+  middle one, then the quarter points, and so on), so the 149 dates cover
+  the whole season, not its first five months.
+- Sanity check: the closing no-vig home probability (→ the book's chance
+  with its margin removed) scores a log loss (→ how far probabilities
+  are from what happened; lower is better) of 0.657 to 0.658 against
   2024-25 results at every book; the average margin (→ the book's
   built-in fee) is 2.6% at Pinnacle and 4.0 to 4.8% at the US books.
   Pinnacle's closing total was 5.5 or 6.0 in 1,044 of 1,398 games.
@@ -136,11 +161,39 @@ python -m ingestion.odds_history starts 20232024 20222023    # free: fill old se
 python -m ingestion.odds_history plan                        # what is left to buy, and its cost
 python -m ingestion.odds_history fetch --max-credits 2000 --reserve 6000 --max-minutes 8
 python -m ingestion.odds_history rematch                     # match stored rows whose game was missing
+python -m ingestion.odds_history reparse                     # load paid_unparsed calls from their raw copies (no API call)
 ```
 
 `fetch` stops before a call that would pass `--max-credits` (this run),
 `--cap-total` (all logged purchases together) or leave fewer than
 `--reserve` credits on the account (default 6,000). It reads the account's
 remaining credits from the free `/sports` endpoint first and from every
-response after. Every paid response is also kept, gzipped, in
-`data/odds_history/` (git-ignored), so the data survives a database loss.
+response after; when that first read fails it does not start (pass
+`--allow-unknown-remaining` to rely on `--max-credits` alone). A call that
+comes back without credit headers (a timeout or a dropped connection) is
+counted at its full expected cost, since the API may have billed it, and
+a run stops after 5 failed calls in a row. Every paid response is also
+kept, gzipped, in `data/odds_history/` (git-ignored), so the data
+survives a database loss.
+A paid call that fails after payment (its response could not be parsed or
+stored) is still logged, as status `paid_unparsed` with the credits it
+cost, and counts as bought, so it is never paid for twice; `reparse`
+loads it later from the raw copy without another call.
+A copy is named `<purpose>_<requested time>_<hash>.json.gz`, where the
+hash is a short fingerprint of the markets and the book list, so the same
+time bought with other books gets its own file; an existing file is never
+overwritten (a repeat gets `_2`, `_3`, ...). The 698 copies from the
+2024-25 purchase predate the hash and are named
+`<purpose>_<requested time>.json.gz`.
+
+**The fetch log** (`raw.odds_history_fetches`, one line per call):
+
+| status | Meaning | Counts as bought? |
+|---|---|---|
+| `ok` | a snapshot with games, rows stored | yes |
+| `empty` | a snapshot with no games listed (costs nothing) | yes |
+| `paid_unparsed` | paid for, but parsing or storing failed; raw copy kept for `reparse` | yes |
+| `error` | the call failed, or the response had no snapshot `timestamp`; its credits are logged | no: the next run retries it |
+| `probe` | the four test calls of 2026-10-04, logged by hand (purpose `probe` too), not by `fetch` | no |
+
+Every line's credits, the probes' included, count toward `--cap-total`.

@@ -49,7 +49,9 @@ The plan needs raw.games.start_time_utc; seasons loaded before that column
 existed have none, so `starts` fills it from the free NHL schedule API.
 
 Never bought twice: before a call, a logged fetch (holding every requested
-market, whatever its books; --same-books-only to require the same books)
+market, whatever its books; --same-books-only to require the same books,
+which re-buys snapshots bought with other books and so needs explicit
+--steps)
 whose snapshot covers the requested time (snapshot_ts <= t <
 next_timestamp, or the same requested time) means the API would return the
 same snapshot, so the call is skipped. Re-runs resume where the last one
@@ -59,10 +61,20 @@ Budget: `fetch` stops before a call that would take this run's spending
 past --max-credits, the fetch log's all-time total past --cap-total, or
 the account's x-requests-remaining below --reserve (default 6,000, kept
 for the live jobs). It reads the remaining credits from the free /sports
-endpoint before the first call and from every response's headers.
+endpoint before the first call (and will not start when it cannot, unless
+--allow-unknown-remaining) and from every response's headers; a response
+without those headers is counted at its full expected cost. It also stops
+after 5 failed calls in a row.
+
+A paid call that cannot be parsed or stored is still logged, as
+'paid_unparsed' with its credits, and counts as bought; its raw copy is
+kept, and `reparse` loads it later without another call.
 
 Every paid response is also saved, gzipped, under --raw-dir (default
 data/odds_history/, git-ignored), so paid data survives a database loss.
+A copy is named <purpose>_<requested time>_<hash>.json.gz, where the hash
+is a short fingerprint of the markets and book list, and never overwrites
+an existing file (a second copy of the same request gets _2, _3, ...).
 
 The API key never reaches the logs (odds_api._redact on everything
 logged; exceptions from requests, whose messages carry the URL, are never
@@ -70,6 +82,7 @@ logged themselves).
 """
 import argparse
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -114,6 +127,7 @@ MORNING_TZ = ZoneInfo("America/Chicago")
 MORNING_TIME = (10, 0)
 DEFAULT_RESERVE = 6000
 STOP_STATUSES = (401, 403, 429)          # bad key, plan/quota, rate limit after a retry
+MAX_CONSECUTIVE_ERRORS = 5               # a run stops after this many failed calls in a row
 _SIDES_H2H = ("home", "away")
 _MARKET_KEYS = {"h2h": "h2h", "totals": "totals"}
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "odds_history"
@@ -145,7 +159,7 @@ DDL = [
     CREATE TABLE IF NOT EXISTS raw.odds_history_fetches (
         id              BIGSERIAL PRIMARY KEY,
         requested_ts    TIMESTAMP NOT NULL,            -- the date= asked for, naive UTC
-        purpose         VARCHAR(12) NOT NULL,          -- close, morning, probe
+        purpose         VARCHAR(12) NOT NULL,          -- close, morning; probe = hand-logged test call
         season          INTEGER,
         markets         VARCHAR(60) NOT NULL,
         bookmakers      VARCHAR(200) NOT NULL,
@@ -154,7 +168,7 @@ DDL = [
         credits         INTEGER NOT NULL DEFAULT 0,    -- x-requests-last
         n_events        INTEGER NOT NULL DEFAULT 0,
         n_rows          INTEGER NOT NULL DEFAULT 0,
-        status          VARCHAR(10) NOT NULL,          -- ok, empty, error
+        status          VARCHAR(16) NOT NULL,          -- ok, empty, error, paid_unparsed; probe = hand-logged
         fetched_at      TIMESTAMP NOT NULL DEFAULT now()
     )
     """,
@@ -164,10 +178,21 @@ DDL = [
 
 
 def ensure_tables(db=None) -> None:
-    """Create raw.odds_history and raw.odds_history_fetches when missing."""
+    """Create raw.odds_history and raw.odds_history_fetches when missing,
+    and widen the fetch log's status from its first VARCHAR(10) to
+    VARCHAR(16) ('paid_unparsed' is 13 characters). Widening a VARCHAR is a
+    catalog change in PostgreSQL, with no table rewrite, and runs once."""
     with (db or engine).begin() as conn:
         for stmt in DDL:
             conn.execute(text(stmt))
+        width = conn.execute(text("""
+            SELECT character_maximum_length FROM information_schema.columns
+            WHERE table_schema = 'raw' AND table_name = 'odds_history_fetches'
+              AND column_name = 'status'
+        """)).scalar()
+        if width is not None and width < 16:
+            conn.execute(text("ALTER TABLE raw.odds_history_fetches "
+                              "ALTER COLUMN status TYPE VARCHAR(16)"))
 
 
 # ── Pure helpers ──────────────────────────────────────────────────
@@ -412,9 +437,13 @@ def load_games(seasons: Sequence[int], db=None) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+BOUGHT_STATUSES = ("ok", "empty", "paid_unparsed")
+
+
 def covering_fetches(rows: Iterable[dict], markets: str, bookmakers: str,
                      same_books: bool = False) -> List[dict]:
-    """The logged fetches (ok or empty) that count as already bought for
+    """The logged fetches (ok, empty, or paid_unparsed: paid for, its raw
+    copy kept, waiting for `reparse`) that count as already bought for
     a request of these markets: every requested market was in the bought
     call. By default the book list is ignored, so changing the books never
     re-buys a stored snapshot; same_books=True counts only identical lists
@@ -422,7 +451,7 @@ def covering_fetches(rows: Iterable[dict], markets: str, bookmakers: str,
     want, books = set(_key_list(markets)), _key_list(bookmakers)
     out = []
     for r in rows:
-        if r.get("status") not in ("ok", "empty"):
+        if r.get("status") not in BOUGHT_STATUSES:
             continue
         if not want <= set(_key_list(r.get("markets", ""))):
             continue
@@ -484,10 +513,37 @@ def store(rows: List[dict], fetch: dict, db=None) -> None:
         conn.execute(INSERT_FETCH, fetch)
 
 
+def season_of(t: datetime) -> int:
+    """The NHL season a moment falls in: August onwards starts a season
+    (2024-10-04 -> 20242025, 2025-03-01 -> 20242025)."""
+    y = t.year if t.month >= 8 else t.year - 1
+    return y * 10000 + y + 1
+
+
+def rematch_pairs(events: Iterable[dict], games: List[dict]) -> Dict[str, int]:
+    """{event_id: game_id} for stored events that had no game, by the same
+    rule as a fetch (home team, start within 6 hours). events: dicts with
+    event_id, home_name, away_name, commence_time (naive UTC or aware);
+    games: as load_games returns. Pure. Events with no commence_time, an
+    unknown team or no game in reach are left out."""
+    out: Dict[str, int] = {}
+    for e in events:
+        commence = _aware(e.get("commence_time"))
+        if commence is None:
+            continue
+        ev = {"home_team": e.get("home_name") or "", "away_team": e.get("away_name") or "",
+              "commence_time": iso_z(commence)}
+        game_id, _ = match_event(ev, _candidates(games, commence),
+                                 commence - timedelta(seconds=1))
+        if game_id:
+            out[e["event_id"]] = game_id
+    return out
+
+
 def rematch_unmatched(db=None) -> int:
-    """Give stored rows with no game_id one, by the same rule as a fetch
-    (home team, start within 6 hours): for events bought before their game
-    was in raw.games or had a start time. Returns the rows updated."""
+    """Give stored rows with no game_id one (rematch_pairs): for events
+    bought before their game was in raw.games or had a start time.
+    Returns the rows updated."""
     db = db or engine
     with db.connect() as conn:
         events = [dict(r) for r in conn.execute(text("""
@@ -496,50 +552,84 @@ def rematch_unmatched(db=None) -> int:
         """)).mappings()]
     if not events:
         return 0
-    seasons = set()
-    for e in events:
-        if e["commence_time"] is not None:
-            y = e["commence_time"].year if e["commence_time"].month >= 8 else e["commence_time"].year - 1
-            seasons.add(y * 10000 + y + 1)
-    games = load_games(sorted(seasons), db=db)
+    seasons = {season_of(e["commence_time"]) for e in events if e["commence_time"] is not None}
+    pairs = rematch_pairs(events, load_games(sorted(seasons), db=db))
     n = 0
     with db.begin() as conn:
-        for e in events:
-            commence = _aware(e["commence_time"])
-            if commence is None:
-                continue
-            ev = {"home_team": e["home_name"] or "", "away_team": e["away_name"] or "",
-                  "commence_time": iso_z(commence)}
-            game_id, _ = match_event(ev, _candidates(games, commence),
-                                     commence - timedelta(seconds=1))
-            if game_id:
-                n += conn.execute(text("""
-                    UPDATE raw.odds_history SET game_id = :g
-                    WHERE event_id = :e AND game_id IS NULL
-                """), {"g": game_id, "e": e["event_id"]}).rowcount or 0
+        for event_id, game_id in pairs.items():
+            n += conn.execute(text("""
+                UPDATE raw.odds_history SET game_id = :g
+                WHERE event_id = :e AND game_id IS NULL
+            """), {"g": game_id, "e": event_id}).rowcount or 0
     logger.info(f"Matched {n} stored row(s) that had no game")
     return n
 
 
-# ── Start times for older seasons (free NHL schedule API) ────────
+UPDATE_FETCH = text("""
+    UPDATE raw.odds_history_fetches
+    SET snapshot_ts = :snapshot_ts, next_ts = :next_ts, n_events = :n_events,
+        n_rows = :n_rows, status = :status
+    WHERE id = :id AND status = 'paid_unparsed'
+""")
 
-def fill_start_times(season: int, db=None, fetch_week=None) -> int:
-    """Fill raw.games.start_time_utc where it is NULL for one season, from
-    the NHL weekly schedule (free). Only that column is written, and only
-    where empty. Returns the number of games filled."""
-    from ingestion.nhl_api import _parse_start_time
-    if fetch_week is None:
-        from ingestion.nhl_api import client
-        fetch_week = lambda d: client.schedule.weekly_schedule(date=d)   # noqa: E731
+
+def reparse_file(path: Path, requested: datetime, games: List[dict]) -> Tuple[List[dict], dict]:
+    """(rows, fetch-log fields) from a raw copy, as a fetch would have
+    stored them."""
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        body = json.load(f)
+    if not isinstance(body, dict):
+        raise ValueError(f"{Path(path).name} does not hold a historical response")
+    rows, update, _stats = parse_body(body, requested, games)
+    return rows, update
+
+
+def reparse_unparsed(raw_dir: Path = DEFAULT_RAW_DIR, db=None) -> Dict[str, int]:
+    """Load every paid_unparsed fetch from its raw copy: store its rows and
+    set its log line to what the fetch would have written (ok or empty).
+    A fetch whose copy is missing or still fails stays paid_unparsed."""
     db = db or engine
     with db.connect() as conn:
-        lo, hi = conn.execute(text("""
-            SELECT MIN(date), MAX(date) FROM raw.games
-            WHERE season = :s AND start_time_utc IS NULL
-        """), {"s": season}).one()
-    if lo is None:
-        logger.info(f"Season {season}: every game already has a start time")
-        return 0
+        fetches = [dict(r) for r in conn.execute(text("""
+            SELECT id, requested_ts, purpose, season, markets, bookmakers
+            FROM raw.odds_history_fetches WHERE status = 'paid_unparsed' ORDER BY id
+        """)).mappings()]
+    out = {"unparsed": len(fetches), "loaded": 0, "missing": 0, "failed": 0, "rows": 0}
+    if not fetches:
+        return out
+    games = load_games(sorted({f["season"] for f in fetches if f["season"]}), db=db)
+    for f in fetches:
+        stem = raw_stem(f["purpose"], f["requested_ts"], f["markets"], f["bookmakers"])
+        path = find_raw(raw_dir, stem)
+        if path is None:
+            out["missing"] += 1
+            logger.warning(f"No raw copy {stem}*.json.gz in {raw_dir} for fetch {f['id']}")
+            continue
+        try:
+            rows, update = reparse_file(path, f["requested_ts"], games)
+            with db.begin() as conn:
+                if rows:
+                    conn.execute(INSERT_ROW, rows)
+                conn.execute(UPDATE_FETCH, {**update, "id": f["id"]})
+        except Exception as e:
+            out["failed"] += 1
+            logger.error(f"Fetch {f['id']} ({path.name}) still fails: "
+                         f"{type(e).__name__}: {_redact(e)[:300]}")
+            continue
+        out["loaded"] += 1
+        out["rows"] += len(rows)
+    logger.info(f"Reparse: {out}")
+    return out
+
+
+# ── Start times for older seasons (free NHL schedule API) ────────
+
+def collect_start_times(lo: date, hi: date, fetch_week: Callable,
+                        pause: float = 0.3) -> Dict[int, datetime]:
+    """{game_id: puck drop (aware UTC)} from the NHL weekly schedule, one
+    fetch_week(YYYY-MM-DD) call per 7 days from lo while <= hi. A week that
+    fails is skipped with a warning."""
+    from ingestion.nhl_api import _parse_start_time
     found: Dict[int, datetime] = {}
     d = lo
     while d <= hi:
@@ -554,7 +644,28 @@ def fill_start_times(season: int, db=None, fetch_week=None) -> int:
                 if g.get("id") and t is not None:
                     found[int(g["id"])] = t
         d += timedelta(days=7)
-        time.sleep(0.3)
+        if pause:
+            time.sleep(pause)
+    return found
+
+
+def fill_start_times(season: int, db=None, fetch_week=None, pause: float = 0.3) -> int:
+    """Fill raw.games.start_time_utc where it is NULL for one season, from
+    the NHL weekly schedule (free). Only that column is written, and only
+    where empty and in that season. Returns the number of games filled."""
+    if fetch_week is None:
+        from ingestion.nhl_api import client
+        fetch_week = lambda d: client.schedule.weekly_schedule(date=d)   # noqa: E731
+    db = db or engine
+    with db.connect() as conn:
+        lo, hi = conn.execute(text("""
+            SELECT MIN(date), MAX(date) FROM raw.games
+            WHERE season = :s AND start_time_utc IS NULL
+        """), {"s": season}).one()
+    if lo is None:
+        logger.info(f"Season {season}: every game already has a start time")
+        return 0
+    found = collect_start_times(lo, hi, fetch_week, pause)
     with db.begin() as conn:
         n = 0
         for gid, t in found.items():
@@ -642,19 +753,90 @@ def build_plan(steps: Sequence[Tuple[str, int]], games: List[dict]) -> List[Plan
     return plan
 
 
+def raw_stem(purpose: str, requested: datetime, markets: str, bookmakers: str) -> str:
+    """The raw copy's file name without its extension:
+    close_2024-10-04T165000Z_1a2b3c4d, the last part a short hash of the
+    markets and the book list (order-blind), so copies of the same time
+    bought with different books never share a name."""
+    key = (",".join(sorted(_key_list(markets))) + "|"
+           + ",".join(sorted(_key_list(bookmakers))))
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return f"{purpose}_{iso_z(requested).replace(':', '')}_{digest}"
+
+
+def save_raw(raw_dir: Path, stem: str, body: dict) -> Path:
+    """Write body gzipped as <stem>.json.gz, or <stem>_2.json.gz, _3, ...
+    when that name is taken: an existing copy is never overwritten (the
+    file is opened in exclusive-create mode)."""
+    raw_dir = Path(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        path = raw_dir / (f"{stem}.json.gz" if n == 1 else f"{stem}_{n}.json.gz")
+        try:
+            with gzip.open(path, "xt", encoding="utf-8") as f:
+                json.dump(body, f)
+            return path
+        except FileExistsError:
+            n += 1
+
+
+def find_raw(raw_dir: Path, stem: str) -> Optional[Path]:
+    """The newest raw copy saved under this stem (the highest _N), or None."""
+    best, best_n = None, 0
+    for path in Path(raw_dir).glob(f"{stem}*.json.gz"):
+        rest = path.name[len(stem):-len(".json.gz")]
+        if rest == "":
+            n = 1
+        elif rest.startswith("_") and rest[1:].isdigit():
+            n = int(rest[1:])
+        else:
+            continue
+        if n > best_n:
+            best, best_n = path, n
+    return best
+
+
+def parse_body(body: dict, requested: datetime, games: List[dict]) -> Tuple[List[dict], dict, dict]:
+    """(rows, fetch-log fields, stats) for one paid response: the rows for
+    raw.odds_history and the snapshot_ts, next_ts, n_events, n_rows and
+    status to log. Used by a fetch and by `reparse` on a raw copy.
+
+    Status: ok (events listed), empty (a snapshot with no events), or error
+    when the response has no snapshot `timestamp`: that is not a snapshot
+    at all, so it is not counted as bought and a later run retries it."""
+    snap = parse_commence(body.get("timestamp"))
+    rows, stats = parse_snapshot(body, requested, _candidates(games, snap) if snap else [])
+    status = "error" if snap is None else "ok" if body.get("data") else "empty"
+    update = {"snapshot_ts": _naive(snap),
+              "next_ts": _naive(parse_commence(body.get("next_timestamp"))),
+              "n_events": stats["events"], "n_rows": len(rows), "status": status}
+    return rows, update, stats
+
+
 def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: Budget,
               games: List[dict], done: List[dict], getter: Callable = http_get,
               saver: Callable = store, raw_dir: Optional[Path] = None,
               max_minutes: Optional[float] = None, limit: Optional[int] = None,
               pause: float = PAUSE_S) -> RunReport:
-    """Buy the plan's snapshots in order until done or a cap is reached."""
+    """Buy the plan's snapshots in order until done or a cap is reached.
+
+    Stops early after MAX_CONSECUTIVE_ERRORS failed calls in a row. A
+    response without credit headers (a timeout, a dropped connection) is
+    counted as having cost the full expected price, against this run's cap
+    and the account's remaining credits, since the API may have billed it."""
     cost = call_cost(markets, bookmakers)
     report = RunReport()
     started = time.monotonic()
+    streak = 0                           # failed calls in a row
     for p in plan:
         if is_covered(p.requested_ts, done):
             report.skipped += 1
             continue
+        if streak >= MAX_CONSECUTIVE_ERRORS:
+            report.stopped = (f"{streak} failed calls in a row: stopping before "
+                              f"{iso_z(p.requested_ts)} (see the log)")
+            break
         if limit is not None and report.calls >= limit:
             report.stopped = f"--limit {limit} calls reached"
             break
@@ -671,9 +853,14 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
         report.calls += 1
         charged = _int_header(headers, "x-requests-last")
         remaining = _int_header(headers, "x-requests-remaining")
+        if charged is None:
+            charged = cost
+            logger.warning(f"No x-requests-last header for {iso_z(p.requested_ts)}: "
+                           f"counting the expected {cost} credits as spent")
         if remaining is not None:
             budget.remaining = remaining
-        charged = charged if charged is not None else (cost if body is not None else 0)
+        elif budget.remaining is not None:
+            budget.remaining -= charged
         budget.spent += charged
         report.credits += charged
         fetch = {"requested_ts": _naive(p.requested_ts), "purpose": p.purpose,
@@ -682,25 +869,49 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
                  "n_events": 0, "n_rows": 0, "status": "error"}
         if body is None or not isinstance(body, dict):
             report.errors += 1
+            streak += 1
             saver([], fetch)
             if status in STOP_STATUSES:
                 report.stopped = f"HTTP {status}: every further call would fail"
                 break
             continue
-        snap = parse_commence(body.get("timestamp"))
+        # The credits are spent: keep the raw copy first, then parse and
+        # store. Whatever fails after this point, the call is logged.
         if raw_dir is not None:
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            name = f"{p.purpose}_{iso_z(p.requested_ts).replace(':', '')}.json.gz"
-            with gzip.open(raw_dir / name, "wt", encoding="utf-8") as f:
-                json.dump(body, f)
-        rows, stats = parse_snapshot(body, p.requested_ts,
-                                     _candidates(games, snap) if snap else [])
-        fetch.update(snapshot_ts=_naive(snap),
-                     next_ts=_naive(parse_commence(body.get("next_timestamp"))),
-                     n_events=stats["events"], n_rows=len(rows),
-                     status="ok" if body.get("data") else "empty")
-        saver(rows, fetch)
+            try:
+                save_raw(raw_dir, raw_stem(p.purpose, p.requested_ts, markets, bookmakers), body)
+            except Exception as e:
+                logger.error(f"Raw copy of {iso_z(p.requested_ts)} not saved: "
+                             f"{type(e).__name__}: {_redact(e)[:300]}")
+        try:
+            rows, update, stats = parse_body(body, p.requested_ts, games)
+            fetch.update(update)
+            saver(rows, fetch)
+        except Exception as e:
+            report.errors += 1
+            streak += 1
+            fetch.update(n_rows=0, status="paid_unparsed")
+            logger.error(f"{p.purpose} {p.season} {iso_z(p.requested_ts)}: the paid response "
+                         f"could not be parsed or stored ({type(e).__name__}: "
+                         f"{_redact(e)[:300]}); logged as paid_unparsed with {charged} "
+                         f"credits, and `reparse` loads it from the raw copy")
+            try:
+                saver([], fetch)
+            except Exception:
+                logger.error("The fetch log could not be written either: stopping, so no "
+                             "further call is bought without being logged")
+                raise
+            done.append(fetch)
+            continue
+        if fetch["status"] == "error":
+            report.errors += 1
+            streak += 1
+            logger.error(f"{p.purpose} {p.season} {iso_z(p.requested_ts)}: the response has "
+                         f"no snapshot timestamp; logged as error ({charged} credits), "
+                         f"to be retried")
+            continue
         done.append(fetch)
+        streak = 0
         report.rows += len(rows)
         agg = report.by_purpose.setdefault(f"{p.purpose} {p.season}",
                                            {"calls": 0, "credits": 0, "rows": 0})
@@ -750,13 +961,14 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("plan", "fetch"):
         p = sub.add_parser(name)
-        p.add_argument("--steps", default=DEFAULT_STEPS, type=parse_steps,
+        p.add_argument("--steps", default=None, type=parse_steps,
                        help=f"purpose:season pairs in priority order (default {DEFAULT_STEPS})")
         p.add_argument("--markets", default=DEFAULT_MARKETS)
         p.add_argument("--bookmakers", default=",".join(DEFAULT_BOOKMAKERS))
         p.add_argument("--same-books-only", action="store_true",
                        help="count a snapshot as bought only if it was bought with "
-                            "exactly these books (default: any books)")
+                            "exactly these books (default: any books). Re-buys every "
+                            "snapshot bought with other books, so it needs explicit --steps")
     f = sub.choices["fetch"]
     f.add_argument("--max-credits", type=int, required=True,
                    help="most credits this run may spend")
@@ -766,21 +978,43 @@ def main(argv=None) -> int:
                    help=f"stop when the account would drop below this many credits "
                         f"(default {DEFAULT_RESERVE})")
     f.add_argument("--max-minutes", type=float, default=8.0)
+    f.add_argument("--allow-unknown-remaining", action="store_true",
+                   help="fetch even when the account's remaining credits cannot be "
+                        "read first (the --reserve floor is then unchecked until a "
+                        "response reports it)")
     f.add_argument("--limit", type=int, default=None, help="most calls this run")
     f.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR),
                    help="where to keep a gzipped copy of every paid response")
     s = sub.add_parser("starts")
     s.add_argument("seasons", nargs="+", type=int)
     sub.add_parser("rematch", help="match stored rows that have no game yet")
+    r = sub.add_parser("reparse", help="load paid_unparsed fetches from their raw copies "
+                                       "(no API call)")
+    r.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR))
     args = parser.parse_args(argv)
 
-    ensure_tables()
-    if args.cmd == "starts":
+    if args.cmd == "starts":             # writes raw.games only
         for season in args.seasons:
             fill_start_times(season)
         return 0
+    if args.cmd in ("plan", "fetch"):
+        if args.same_books_only and args.steps is None:
+            parser.error("--same-books-only re-buys every snapshot already bought with "
+                         "other books, so it needs explicit --steps naming only the "
+                         "seasons to buy (e.g. --steps close:20232024)")
+        if args.steps is None:
+            args.steps = parse_steps(DEFAULT_STEPS)
+    ensure_tables()
     if args.cmd == "rematch":
         print(f"Matched {rematch_unmatched()} row(s)")
+        return 0
+    if args.cmd == "reparse":
+        out = reparse_unparsed(Path(args.raw_dir))
+        print(f"paid_unparsed fetches {out['unparsed']}: loaded {out['loaded']} "
+              f"({out['rows']} rows), raw copy missing {out['missing']}, "
+              f"still failing {out['failed']}")
+        if out["rows"]:
+            rematch_unmatched()
         return 0
 
     bookmakers = ",".join(_key_list(args.bookmakers))
@@ -807,6 +1041,12 @@ def main(argv=None) -> int:
                     remaining=remaining_credits())
     print(f"Account credits remaining before the run: "
           f"{budget.remaining if budget.remaining is not None else 'unknown'}")
+    if budget.remaining is None and not args.allow_unknown_remaining:
+        print("Not fetching: the account's remaining credits could not be read (no key, "
+              "no connection, or no x-requests-remaining header), so the --reserve "
+              "floor cannot be checked. Fix that, or pass --allow-unknown-remaining "
+              "to rely on --max-credits alone.")
+        return 2
     report = run_fetch(plan, markets, bookmakers, budget, games, done,
                        raw_dir=Path(args.raw_dir), max_minutes=args.max_minutes,
                        limit=args.limit)

@@ -353,7 +353,7 @@ CREATE INDEX IF NOT EXISTS idx_odds_history_snapshot ON raw.odds_history(snapsho
 CREATE TABLE IF NOT EXISTS raw.odds_history_fetches (
     id              BIGSERIAL PRIMARY KEY,
     requested_ts    TIMESTAMP NOT NULL,            -- the date= asked for, naive UTC
-    purpose         VARCHAR(12) NOT NULL,          -- close, morning, probe
+    purpose         VARCHAR(12) NOT NULL,          -- close, morning; probe = hand-logged test call
     season          INTEGER,
     markets         VARCHAR(60) NOT NULL,
     bookmakers      VARCHAR(200) NOT NULL,
@@ -362,7 +362,7 @@ CREATE TABLE IF NOT EXISTS raw.odds_history_fetches (
     credits         INTEGER NOT NULL DEFAULT 0,    -- x-requests-last
     n_events        INTEGER NOT NULL DEFAULT 0,
     n_rows          INTEGER NOT NULL DEFAULT 0,
-    status          VARCHAR(10) NOT NULL,          -- ok, empty, error, probe
+    status          VARCHAR(16) NOT NULL,          -- ok, empty, error, paid_unparsed; probe = hand-logged
     fetched_at      TIMESTAMP NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_odds_history_fetches_ts ON raw.odds_history_fetches(requested_ts);
