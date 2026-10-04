@@ -365,7 +365,8 @@ CREATE TABLE IF NOT EXISTS raw.lineup_fetches (
     fetched_at          TIMESTAMPTZ NOT NULL,
     source_updated_at   TIMESTAMPTZ,
     lines_hash          VARCHAR(64),
-    status              VARCHAR(12) NOT NULL       -- new, same, broken, failed
+    status              VARCHAR(12) NOT NULL,      -- new, same, broken, failed, refused
+    next_fetch_after    TIMESTAMPTZ                -- after a refusal (429/403): no request before this
 );
 
 -- Team news found by the news monitor (betting/news.py, `pipeline.py news`)

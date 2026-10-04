@@ -78,6 +78,9 @@ COLUMNS = (
     # A slip whose result was set by hand (betting/ledger.settle_by_hand):
     # a later leg correction must not overwrite it
     ("betting", "slips", "settled_by_hand", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # After Daily Faceoff refuses a request (429/403): no request for the
+    # team before this time (ingestion/dailyfaceoff_lines.py)
+    ("raw", "lineup_fetches", "next_fetch_after", "TIMESTAMPTZ"),
 )
 
 # (schema, table, statements): tables added after db/schema.sql first
@@ -218,7 +221,8 @@ TABLES = (
             fetched_at          TIMESTAMPTZ NOT NULL,
             source_updated_at   TIMESTAMPTZ,
             lines_hash          VARCHAR(64),
-            status              VARCHAR(12) NOT NULL
+            status              VARCHAR(12) NOT NULL,
+            next_fetch_after    TIMESTAMPTZ
         )""",
     )),
     # The news monitor (betting/news.py): what changed, the last state seen

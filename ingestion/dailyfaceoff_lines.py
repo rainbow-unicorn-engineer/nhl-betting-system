@@ -38,14 +38,20 @@ footer links only a privacy policy). This module:
   - makes at most one request per team per run, for teams with a game
     today only, LINEUPS_PAUSE_SECONDS (2) apart;
   - names itself in the User-Agent header;
-  - skips a team fetched less than LINEUPS_MIN_GAP_MINUTES (14) ago, or
+  - skips a team fetched less than LINEUPS_MIN_GAP_MINUTES (29) ago, or
     LINEUPS_FAR_GAP_MINUTES (55) ago while its puck drop is more than
-    LINEUPS_NEAR_HOURS (3) away, so a slate of 16 games costs about 32
-    requests an hour in the morning and 128 in the last hours;
+    LINEUPS_NEAR_HOURS (3) away, so with a run every 15 minutes a slate of
+    16 games costs about 32 requests an hour in the morning and 64 in the
+    last hours;
+  - stops at once when the site refuses a request (HTTP 429 → too many
+    requests, or 403 → forbidden): no other team is asked that run, and
+    no team is asked again for LINEUPS_REFUSED_BACKOFF_MINUTES (60), or
+    for as long as the site's Retry-After header says if that is longer;
   - stores a new snapshot only when the lines changed (the fetch itself
     is recorded in raw.lineup_fetches).
 The site serves pages from a cache: one fetch on 2026-10-04 was an hour
-old (Age: 3593), so a change can reach us up to about an hour late.
+old (Age: 3593), so a change can reach us up to about an hour late, and
+fetching a team more often than every half hour mostly gets the same copy.
 
 Storage:
   raw.lineups         one row per (snapshot_ts, team, unit, slot): unit F1-F4,
@@ -58,9 +64,11 @@ Storage:
                       even-strength slot, else NULL), injury status and the
                       game-time-decision flag.
   raw.lineup_fetches  one row per team: when it was last fetched, Daily
-                      Faceoff's updatedAt, a hash of the lines and how the
-                      fetch went. It drives the politeness gap and the
-                      "store only on change" rule.
+                      Faceoff's updatedAt, a hash of the lines, how the
+                      fetch went (new, same, broken, failed, refused) and,
+                      after a refusal, the time before which it is not
+                      fetched again (next_fetch_after). It drives the
+                      politeness gap and the "store only on change" rule.
 
 CLI: python -m ingestion.dailyfaceoff_lines [--team BOS ...] [--force]
      (default: the teams with a game today that has not started).
@@ -73,6 +81,7 @@ import os
 import re
 import time
 from datetime import date as date_cls, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Callable, Dict, Iterable, List, Optional
 
 import requests
@@ -134,7 +143,8 @@ DDL = [
         fetched_at          TIMESTAMPTZ NOT NULL,
         source_updated_at   TIMESTAMPTZ,
         lines_hash          VARCHAR(64),
-        status              VARCHAR(12) NOT NULL
+        status              VARCHAR(12) NOT NULL,
+        next_fetch_after    TIMESTAMPTZ
     )
     """,
 ]
@@ -143,11 +153,14 @@ _table_ready = False
 
 
 def ensure_table() -> None:
-    """Create raw.lineups and raw.lineup_fetches if missing (once per
-    process)."""
+    """Create raw.lineups and raw.lineup_fetches if missing, and add any
+    column a table created by an older version lacks (config/migrate;
+    once per process)."""
     global _table_ready
     if _table_ready:
         return
+    from config.migrate import ensure_schema
+    ensure_schema()
     with engine.begin() as conn:
         for stmt in DDL:
             conn.execute(text(stmt))
@@ -258,13 +271,50 @@ MIN_DRESSED = 12
 
 # ── Politeness ─────────────────────────────────────────────────────
 
+class SiteRefused(Exception):
+    """Daily Faceoff answered 429 (too many requests) or 403 (forbidden):
+    stop asking. retry_after: seconds from its Retry-After header, if any."""
+
+    def __init__(self, status: int, retry_after: Optional[float] = None):
+        self.status, self.retry_after = status, retry_after
+        super().__init__(f"Daily Faceoff refused the request (HTTP {status})"
+                         + (f", Retry-After {retry_after:.0f} s" if retry_after else ""))
+
+
+def retry_after_seconds(value, now: Optional[datetime] = None) -> Optional[float]:
+    """A Retry-After header (seconds, or an HTTP date) -> seconds from now;
+    None when missing or unreadable."""
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(str(value))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - (now or datetime.now(timezone.utc))).total_seconds())
+
+
+def refused_until(now: datetime, retry_after: Optional[float],
+                  backoff_minutes: float = None) -> datetime:
+    """When the next request may go out after a refusal: the longer of
+    LINEUPS_REFUSED_BACKOFF_MINUTES (60) and the site's Retry-After."""
+    backoff = (_number("LINEUPS_REFUSED_BACKOFF_MINUTES", 60)
+               if backoff_minutes is None else backoff_minutes)
+    return now + max(timedelta(minutes=backoff), timedelta(seconds=retry_after or 0))
+
+
 def fetch_gap(start_utc: Optional[datetime], now: datetime,
               near_gap: float = None, far_gap: float = None,
               near_hours: float = None) -> timedelta:
     """How long since the team's last fetch before it may be fetched again:
     LINEUPS_FAR_GAP_MINUTES while its puck drop is more than
     LINEUPS_NEAR_HOURS away, else LINEUPS_MIN_GAP_MINUTES."""
-    near_gap = _number("LINEUPS_MIN_GAP_MINUTES", 14) if near_gap is None else near_gap
+    near_gap = _number("LINEUPS_MIN_GAP_MINUTES", 29) if near_gap is None else near_gap
     far_gap = _number("LINEUPS_FAR_GAP_MINUTES", 55) if far_gap is None else far_gap
     near_hours = (_number("LINEUPS_NEAR_HOURS", 3) if near_hours is None
                   else near_hours)
@@ -275,12 +325,17 @@ def fetch_gap(start_utc: Optional[datetime], now: datetime,
 
 def teams_to_fetch(starts: Dict[str, Optional[datetime]],
                    last_fetch: Dict[str, datetime], now: datetime,
-                   force: bool = False, **gaps) -> List[str]:
-    """Pure: the teams (from {team: its puck drop}) due a fetch now."""
+                   force: bool = False, not_before: Dict[str, datetime] = None,
+                   **gaps) -> List[str]:
+    """Pure: the teams (from {team: its puck drop}) due a fetch now.
+    not_before: {team: time} after a refusal; force ignores it too."""
     due = []
     for team in sorted(starts):
         if team not in DF_SLUGS:
             logger.warning(f"No Daily Faceoff page known for {team!r}; extend DF_SLUGS")
+            continue
+        hold = (not_before or {}).get(team)
+        if not force and hold is not None and now < hold:
             continue
         last = last_fetch.get(team)
         if force or last is None or now - last >= fetch_gap(starts[team], now, **gaps):
@@ -293,6 +348,9 @@ def teams_to_fetch(starts: Dict[str, Optional[datetime]],
 def fetch_page(team: str) -> str:
     resp = requests.get(PAGE_URL.format(slug=DF_SLUGS[team]),
                         headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT_S)
+    if resp.status_code in (403, 429):
+        raise SiteRefused(resp.status_code,
+                          retry_after_seconds(resp.headers.get("Retry-After")))
     resp.raise_for_status()
     return resp.text
 
@@ -320,23 +378,39 @@ def todays_teams(on_date: Optional[date_cls] = None) -> Dict[str, Optional[datet
 def _last_fetches() -> Dict[str, dict]:
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT team, fetched_at, lines_hash FROM raw.lineup_fetches
+            SELECT team, fetched_at, lines_hash, next_fetch_after
+            FROM raw.lineup_fetches
         """)).fetchall()
-    return {t: {"fetched_at": f, "lines_hash": h} for t, f, h in rows}
+    return {t: {"fetched_at": f, "lines_hash": h, "next_fetch_after": n}
+            for t, f, h, n in rows}
 
 
-def _record_fetch(conn, team: str, now: datetime, updated_at, digest, status: str):
+def _record_fetch(conn, team: str, now: datetime, updated_at, digest, status: str,
+                  not_before: Optional[datetime] = None):
     conn.execute(text("""
         INSERT INTO raw.lineup_fetches (team, fetched_at, source_updated_at,
-                                        lines_hash, status)
-        VALUES (:t, :now, :u, :h, :s)
+                                        lines_hash, status, next_fetch_after)
+        VALUES (:t, :now, :u, :h, :s, :nb)
         ON CONFLICT (team) DO UPDATE SET
             fetched_at = EXCLUDED.fetched_at,
             source_updated_at = COALESCE(EXCLUDED.source_updated_at,
                                          raw.lineup_fetches.source_updated_at),
             lines_hash = COALESCE(EXCLUDED.lines_hash, raw.lineup_fetches.lines_hash),
-            status = EXCLUDED.status
-    """), {"t": team, "now": now, "u": updated_at, "h": digest, "s": status})
+            status = EXCLUDED.status,
+            next_fetch_after = EXCLUDED.next_fetch_after
+    """), {"t": team, "now": now, "u": updated_at, "h": digest, "s": status,
+           "nb": not_before})
+
+
+def _hold(conn, team: str, now: datetime, until: datetime):
+    """After a refusal: no request for `team` before `until`. A team with
+    no fetch yet gets a 'refused' row; an existing row keeps its last
+    fetch and only gets the hold."""
+    conn.execute(text("""
+        INSERT INTO raw.lineup_fetches (team, fetched_at, status, next_fetch_after)
+        VALUES (:t, :now, 'refused', :nb)
+        ON CONFLICT (team) DO UPDATE SET next_fetch_after = EXCLUDED.next_fetch_after
+    """), {"t": team, "now": now, "nb": until})
 
 
 def write_snapshot(team: str, game_date: date_cls, parsed: dict, now: datetime,
@@ -374,7 +448,9 @@ def ingest_lineups(teams: Optional[Dict[str, Optional[datetime]]] = None,
     """Fetch, parse and store the lines of each due team. teams: {team:
     puck drop} (default: today's teams whose game has not started).
     Returns {team: new | same | broken | failed | skipped}; a team that
-    fails is logged and the others carry on."""
+    fails is logged and the others carry on, except when the site refuses
+    a request (429 or 403): then no other team is asked (they are failed),
+    and every team waits until refused_until()."""
     ensure_table()
     fetch = fetch or fetch_page
     game_date = game_date or local_today()
@@ -387,7 +463,14 @@ def ingest_lineups(teams: Optional[Dict[str, Optional[datetime]]] = None,
     now = datetime.now(timezone.utc)
     last = _last_fetches()
     due = teams_to_fetch(teams, {t: v["fetched_at"] for t, v in last.items()},
-                         now, force=force)
+                         now, force=force,
+                         not_before={t: v.get("next_fetch_after") for t, v in last.items()})
+    held = [t for t, v in last.items() if t in teams and not force
+            and v.get("next_fetch_after") and now < v["next_fetch_after"]]
+    if held:
+        logger.info(f"Lineups: Daily Faceoff refused a request earlier; no request "
+                    f"before {max(last[t]['next_fetch_after'] for t in held):%H:%M} UTC "
+                    f"({len(held)} team(s) waiting)")
     result = {t: "skipped" for t in teams}
     if due and index is None:
         from ingestion.espn_injuries import load_player_index
@@ -405,6 +488,22 @@ def ingest_lineups(teams: Optional[Dict[str, Optional[datetime]]] = None,
             if result[team] == "broken":
                 logger.warning(f"Lineups {team}: only {dressed_count(parsed['rows'])} "
                                f"forwards and defencemen on the page; not stored")
+        except SiteRefused as e:
+            until = refused_until(fetched_at, e.retry_after)
+            rest = due[i + 1:]
+            for t in [team] + rest:
+                result[t] = "failed"
+            logger.error(f"Lineups {team}: {e}. Stopping: {len(rest)} other team(s) not "
+                         f"asked, and no request before {until:%H:%M} UTC")
+            try:
+                with engine.begin() as conn:
+                    _record_fetch(conn, team, fetched_at, None, None, "refused", until)
+                    for t in teams:
+                        if t != team and t in DF_SLUGS:
+                            _hold(conn, t, fetched_at, until)
+            except Exception as db_error:
+                logger.error(f"Lineups: could not record the refusal: {db_error}")
+            break
         except Exception as e:
             result[team] = "failed"
             logger.error(f"Lineups {team}: fetch or parse failed (non-fatal): {e}")

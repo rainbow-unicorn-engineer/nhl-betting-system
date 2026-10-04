@@ -130,7 +130,7 @@ class TestPoliteness:
         monkeypatch.setenv("LINEUPS_FAR_GAP_MINUTES", "90")
         monkeypatch.setenv("LINEUPS_MIN_GAP_MINUTES", "abc")      # bad: default
         assert dfl.fetch_gap(NOW + timedelta(hours=8), NOW) == timedelta(minutes=90)
-        assert dfl.fetch_gap(NOW + timedelta(hours=1), NOW) == timedelta(minutes=14)
+        assert dfl.fetch_gap(NOW + timedelta(hours=1), NOW) == timedelta(minutes=29)
 
     def test_teams_due(self):
         starts = {"BOS": NOW + timedelta(hours=6), "MTL": NOW + timedelta(hours=1),
@@ -140,6 +140,37 @@ class TestPoliteness:
         kw = {"near_gap": 14, "far_gap": 55, "near_hours": 3}
         assert dfl.teams_to_fetch(starts, last, NOW, **kw) == ["MTL", "TOR"]
         assert dfl.teams_to_fetch(starts, last, NOW, force=True, **kw) == ["BOS", "MTL", "TOR"]
+
+    def test_a_refusal_holds_teams_back_until_its_time(self):
+        starts = {"MTL": NOW + timedelta(hours=1), "TOR": NOW + timedelta(hours=1)}
+        kw = {"near_gap": 14, "far_gap": 55, "near_hours": 3}
+        hold = {"MTL": NOW + timedelta(minutes=5), "TOR": NOW - timedelta(minutes=1)}
+        assert dfl.teams_to_fetch(starts, {}, NOW, not_before=hold, **kw) == ["TOR"]
+        assert dfl.teams_to_fetch(starts, {}, NOW, force=True, not_before=hold,
+                                  **kw) == ["MTL", "TOR"]
+
+    def test_retry_after_and_the_back_off(self):
+        assert dfl.retry_after_seconds("120") == 120
+        assert dfl.retry_after_seconds(None) is None
+        assert dfl.retry_after_seconds("soon") is None
+        assert dfl.retry_after_seconds("Sat, 10 Oct 2026 16:00:00 GMT", now=NOW) == 7200
+        assert dfl.retry_after_seconds("Sat, 10 Oct 2026 13:00:00 GMT", now=NOW) == 0
+        assert dfl.refused_until(NOW, None, 60) == NOW + timedelta(minutes=60)
+        assert dfl.refused_until(NOW, 7200, 60) == NOW + timedelta(hours=2)
+        assert dfl.refused_until(NOW, 30, 60) == NOW + timedelta(minutes=60)
+
+    @pytest.mark.parametrize("status", [429, 403])
+    def test_fetch_page_raises_on_a_refusal(self, monkeypatch, status):
+        class Resp:
+            status_code, text = status, ""
+            headers = {"Retry-After": "120"}
+
+            def raise_for_status(self):
+                raise AssertionError("a refusal is not a plain HTTP error")
+        monkeypatch.setattr(dfl.requests, "get", lambda *a, **k: Resp())
+        with pytest.raises(dfl.SiteRefused) as e:
+            dfl.fetch_page("BOS")
+        assert (e.value.status, e.value.retry_after) == (status, 120)
 
 
 class TestIngestLoop:
@@ -192,6 +223,36 @@ class TestIngestLoop:
         assert got == {"BOS": "failed", "MTL": "new"}
         assert "Lineups BOS: fetch or parse failed (non-fatal)" in caplog.text
 
+    def test_a_refusal_stops_the_run_and_holds_every_team(self, stubbed, monkeypatch, caplog):
+        from contextlib import contextmanager
+        recorded, held, asked = [], [], []
+
+        class FakeEngine:
+            @contextmanager
+            def begin(self):
+                yield None
+        monkeypatch.setattr(dfl, "engine", FakeEngine())
+        monkeypatch.setattr(dfl, "_record_fetch", lambda conn, team, now, u, h, status,
+                            not_before=None: recorded.append((team, status, not_before)))
+        monkeypatch.setattr(dfl, "_hold", lambda conn, team, now, until: held.append(
+            (team, until)))
+        monkeypatch.setenv("LINEUPS_REFUSED_BACKOFF_MINUTES", "60")
+
+        def fetch(team):
+            asked.append(team)
+            raise dfl.SiteRefused(429, 7200)
+        soon = datetime.now(timezone.utc) + timedelta(hours=1)
+        teams = {"MTL": soon, "TOR": soon, "VAN": soon, "BOS": soon}
+        got = dfl.ingest_lineups(teams, fetch=fetch, pause_s=0, index=PlayerIndex([]))
+        assert asked == ["BOS"]                      # MTL, TOR and VAN not asked
+        assert got == {"BOS": "failed", "MTL": "failed", "TOR": "failed", "VAN": "failed"}
+        (team, status, until), = recorded
+        assert (team, status) == ("BOS", "refused")
+        assert timedelta(minutes=119) < until - datetime.now(timezone.utc) <= timedelta(hours=2)
+        assert sorted(t for t, _ in held) == ["MTL", "TOR", "VAN"]
+        assert all(u == until for _, u in held)
+        assert "Stopping: 3 other team(s) not asked" in caplog.text
+
     def test_a_page_with_too_few_players_is_not_stored(self, stubbed):
         thin = BOS.replace('"groupIdentifier": "f2"', '"groupIdentifier": "x2"') \
                   .replace('"groupIdentifier": "f3"', '"groupIdentifier": "x3"') \
@@ -235,6 +296,21 @@ def test_snapshot_is_stored_only_when_the_lines_change():
     assert fetch.status == "same" and fetch.fetched_at == t2 and fetch.lines_hash == digest
     latest = dfl.latest_lineups(["ZZZ"])["ZZZ"]
     assert len(latest) == 39
+
+    # a refusal holds the team back; the next good fetch clears the hold
+    until = t2 + timedelta(hours=1)
+    with engine.begin() as conn:
+        dfl._record_fetch(conn, "ZZZ", t2, None, None, "refused", until)
+    got = dfl._last_fetches()["ZZZ"]
+    assert got["next_fetch_after"] == until and got["lines_hash"] == digest
+    assert dfl.write_snapshot("ZZZ", date(2026, 10, 10), page,
+                              t2 + timedelta(hours=2), digest) == "same"
+    assert dfl._last_fetches()["ZZZ"]["next_fetch_after"] is None
+    # a hold on a team with an earlier fetch keeps that fetch
+    with engine.begin() as conn:
+        dfl._hold(conn, "ZZZ", t2 + timedelta(hours=3), until)
+    got = dfl._last_fetches()["ZZZ"]
+    assert got["fetched_at"] == t2 + timedelta(hours=2) and got["next_fetch_after"] == until
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM raw.lineups WHERE team = 'ZZZ'"))
         conn.execute(text("DELETE FROM raw.lineup_fetches WHERE team = 'ZZZ'"))
