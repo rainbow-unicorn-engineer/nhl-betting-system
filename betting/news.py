@@ -66,7 +66,8 @@ which keeps the day's first list (taken by the daily run): a list saved in
 the evening would hold injuries from that day's afternoon games under the
 same date, which a model must never see before those games. The day's
 changes are in raw.news_events with their times instead. When today has no
-list yet, the news run saves the first one.
+list yet, the news run saves the first one, but only before the day's
+first puck drop; after it, the list is compared and not saved.
 
 Settings (.env): NEWS_START_HOUR (8), NEWS_MIN_GAP_MINUTES (14, so a
 catch-up run right after a scheduled one does nothing), NEWS_MOVE_PTS
@@ -506,9 +507,19 @@ def check_lineups(games: List[dict], games_by_team: dict, now: datetime) -> List
     return save("dailyfaceoff_lines", states, events, games_by_team, now)
 
 
-def check_injuries(games_by_team: dict, now: datetime) -> List[dict]:
+def may_save_injuries(now: datetime, starts: Iterable[Optional[datetime]]) -> bool:
+    """Pure: whether a list fetched at `now` (aware) may become the day's
+    raw.injuries snapshot: only before the day's first puck drop. After
+    it, the list can hold injuries from that day's games, which a model
+    must never see under that date."""
+    starts = [s for s in starts if s is not None]
+    return not starts or now < min(starts)
+
+
+def check_injuries(games: List[dict], games_by_team: dict, now: datetime) -> List[dict]:
     """Fetch ESPN's injury list and diff it with the last run's. Saves it
-    as today's raw.injuries snapshot only when today has none yet."""
+    as today's raw.injuries snapshot only when today has none yet and the
+    day's first game has not started."""
     from ingestion import espn_injuries as espn
     rows = espn.parse_injuries(espn.fetch_injuries())
     if not rows:
@@ -522,8 +533,12 @@ def check_injuries(games_by_team: dict, now: datetime) -> List[dict]:
             "SELECT 1 FROM raw.injuries WHERE snapshot_date = :d LIMIT 1"),
             {"d": today}).first() is not None
     if not have_today:
-        espn.write_injuries(rows, today)
-        logger.info(f"ESPN injuries: saved today's first list ({len(rows)} players)")
+        if may_save_injuries(now, [g["start_time_utc"] for g in games]):
+            espn.write_injuries(rows, today)
+            logger.info(f"ESPN injuries: saved today's first list ({len(rows)} players)")
+        else:
+            logger.warning("ESPN injuries: today has no saved list, but the day's first "
+                           "game has started, so this list was compared, not saved")
     cur: Dict[str, dict] = {}
     for r in rows:
         if not r.get("team_abbrev"):
@@ -727,7 +742,7 @@ def run_news(due: bool = False) -> int:
     events, notes = [], []
     for label, step in (("starters", lambda: check_starters(games, games_by_team, now)),
                         ("lineups", lambda: check_lineups(games, games_by_team, now)),
-                        ("injuries", lambda: check_injuries(games_by_team, now))):
+                        ("injuries", lambda: check_injuries(games, games_by_team, now))):
         try:
             found = step()
             events += found
