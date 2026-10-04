@@ -58,6 +58,44 @@ it and nothing else is a variant):
 - player_shots_on_goal_alternate (DraftKings "N+" milestones, over only)
   cannot be de-vigged: reported separately, information only.
 
+v3 ADDITIONS (2026-10-04; written and committed before any v3 result,
+with the props_sog v3 pre-registration):
+- Model: the ADOPTED props_sog v3 variant (props_sog.DEFAULT_VARIANT
+  after its adoption rule), using its 2025-26 out-of-fold fold exactly as
+  above. Rows: every 2025-26 player_shots_on_goal row in
+  raw.prop_odds_hist now loaded, including the late playoffs (DraftKings
+  through the 2026 Final). The pairing, matching, primary test,
+  thresholds and bootstrap are unchanged.
+- The market check PASSES (and registration may be switched on) only if
+  the POOLED primary test beats the market (mean + 1.96 SE < 0, n >= 300)
+  AND every book with n >= 300 has a negative mean difference.
+- MARKET-MEAN DIAGNOSTIC (information only, not a gate). It asks whether
+  the model's misses against the market are in the LEVEL (the expected
+  number of shots) or in the SHAPE (how spread out the count is around
+  it). Per book, pooled, and per line group (0.5, 1.5, 2.5, 3.5+):
+  * mu_mkt, the market's implied mean: the mean m with
+    P_NB(SOG > line; m, alpha) = the no-vig over probability, where alpha
+    is the model's own fold dispersion (bisection on [0.02, 15]).
+  * mean SOG, mean mu_model and mean mu_mkt. The bias of each, mean(mu -
+    SOG), with its game-clustered SE.
+  * Paired count log loss: -log P_NB(actual SOG; mu_model, alpha) minus
+    the same at mu_mkt. This scores the two MEANS on the whole count, not
+    just one side of the line. Game-clustered SE.
+  * Information slope beta: OLS of (SOG - mu_mkt) on (mu_model - mu_mkt),
+    game-clustered SE. beta ~ 0: the model's disagreements with the
+    market carry no information. beta ~ 1: they are right on average.
+  * Level-only fix: mu_model times one constant per book (mean SOG / mean
+    mu_model on those props; fitted in-sample, so an upper bound), and
+    the primary log-loss gap re-computed.
+  * Shape-only fix: alpha* = the maximum-likelihood dispersion of the
+    actual SOG around mu_mkt on those props (in-sample), and the primary
+    gap re-computed from the model's own means with alpha*.
+  Reading rule: "level" if the level-only fix closes at least half of
+  the primary gap. "Shape" if the shape-only fix closes at least half.
+  Otherwise the gap is in the per-player means (which player-games the
+  model rates above or below the market), and beta says whether those
+  disagreements carry information (beta > 0 by 2 SE) or not.
+
 Usage: python -m models.props_market_check   (prints the report)
 """
 import argparse

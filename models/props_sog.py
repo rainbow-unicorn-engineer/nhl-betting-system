@@ -9,6 +9,106 @@ is disabled (run_props(register=True) raises), and nothing reads it. The
 price check (STATUS, "Market check") found that it does NOT beat the prop
 market.
 
+v3 PRE-REGISTRATION (2026-10-04). Written and committed before any v3
+variant was run. The market parts are in models/props_market_check.py.
+Disclosed: before writing this, ONE diagnostic of the existing baseline
+B1 was run (no booster, no new feature). It split B1's mean error per
+validation season into a rate part (B1's SOG/60 x the ACTUAL TOI, minus
+actual SOG) and an expected-TOI part. The TOI part is ~0 in every season
+(|.| <= 0.003 SOG a game). The rate part is all of it: -0.004, +0.049,
++0.050, +0.048, -0.000 for 2021-22 .. 2025-26. In 2024-25 B1 predicts
+5.86 SOG/60 at the actual TOI against an actual 5.69. The trailing-365-
+day league rate it rests on averaged 5.88 that season (the season before
+ran at 6.09), and the career-to-date player rates sat 3.6% above it. So
+the root cause is the LEVEL, in two parts. First, a trailing-365-day
+league rate lags a falling league. Second, career-to-date rates were
+earned in higher-shooting seasons, and the ratio to the training-window
+mean that re-levels them assumes each player's career has the training
+window's mix. P3's formula below follows from this reading. No P-variant
+result had been seen when it was written.
+
+Variants. Each one adds to the one before. All share the same rows,
+folds, eligibility (>= 5 prior appearances), LightGBM params, early
+stopping, NB dispersion fit, and the v2 in-season drift correction (M =
+M2 in every variant, relative to that variant's own offset):
+- P0 = v2 exactly (FEATURES, offset B1). It must reproduce v2's numbers
+  (pooled NLL M 1.57818, B1 1.58173). The 2026-27 games loaded since are
+  not a fold and come after every fold's rows, and every feature looks
+  backward only, so the reproduction should be exact.
+- P1 = P0 + power-play features (features/player_shots.py FEATURES_PP).
+  Each one uses only his appearances strictly before the game:
+    pp_toi_l5/l10/l20: mean power-play (PP → his team has more skaters
+      on the ice after an opponent's penalty) minutes per appearance
+      over his last 5/10/20 appearances;
+    pp_share_l5/l10/l20: his PP seconds / his team's PP seconds over
+      those same games. A game's team PP seconds = the sum of the team's
+      skaters' PP seconds / 5 (five skaters are on the ice in a 5-on-4);
+    pk_toi_l10/l20: mean penalty-kill (PK → his team is the one a
+      skater short) minutes per appearance;
+    pp_sog60_l20_rel, pp_sog60_season_rel: his shots on goal at power-
+      play strength per 60 PP minutes, over his last 20 appearances and
+      season to date, counting only games with shot data, divided by his
+      position's trailing league SOG/60. A PP shot is a raw.shots event
+      SHOT or GOAL whose strength (written from the shooter's side) gives
+      his team more skaters than the opponent, with the opponent at 4 or
+      fewer: 5v4, 5v3, 4v3, 6v4, 6v3;
+    nonpp_sog60_l20_rel: the rest of his SOG per 60 of his non-PP
+      minutes, same rules;
+    team_pp_l10: his team's PP minutes per game over its last 10 games;
+    opp_pk_l10: the opponent's PK minutes per game over its last 10
+      games (team PK seconds = the skaters' PK seconds / 4). This measures
+      how often the opponent takes penalties.
+  Unknown stats (stats_filled_at NULL) are missing, never zero.
+- P2 = P1 + usage proxies (FEATURES_USAGE):
+    es_toi_l10: mean even-strength minutes (TOI - PP - PK), last 10;
+    es_toi_rank_pct, toi_rank_pct: his rank on es_toi_l10 / toi_mean_l10
+      among his team's skaters of his position group (F or D) dressed
+      for this game, (rank - 1) / (n - 1): 0 = the most, 1 = the least;
+    pp_rank: his rank on pp_toi_l10 among all his team's skaters dressed
+      for this game (1 = the most; ranks 1-5 are roughly the first
+      power-play unit);
+    fo_l20: faceoffs taken per appearance over his last 20 (centres take
+      most of them); fo_win_l20: faceoffs won / taken over his last 20.
+  The ranks use who is dressed for this game. That is known at warm-ups
+  before puck drop, and it is the same information the model already
+  conditions on (it predicts given that he plays). They also use only
+  the pre-game values of every teammate.
+- P3 = P2 with the offset replaced by B3 (the baseline fix). Features
+  are P2's. B3 = index x L_env x expected TOI / 3600, with expected TOI
+  unchanged, where:
+    L_env(d, pos): this season's league SOG/60 for his position (F or
+    D), from the season's games dated strictly before d, shrunk toward
+    last year's level:
+        L_env = (S_sd + K_env x L_prev / 3600) / (T_sd + K_env) x 3600
+      S_sd, T_sd = SOG and TOI of every played player-game of that
+      position in the same season dated before d. L_prev = the
+      position's trailing-365-day rate on the season's first date
+      (league_pos_sog60 there). K_env = 100,000 minutes, about a fifth of
+      a season's forward minutes.
+    index (relative and time-decayed): over his earlier appearances j
+    (any season),
+        w_j   = 0.5 ^ ((d - d_j) / 365 days)
+        index = (sum_j w_j sog_j + K_p)
+                / (sum_j w_j toi_j x L_env(d_j, pos) / 3600 + K_p)
+      K_p = 300 minutes x L_env(d, pos) / 60, which is v2's shrinkage
+      (k = 300 TOI minutes) in expected-shot units. An index of 1 means
+      his position's league rate. Each past game is judged against the
+      league level of its own date, so a change in the league's level
+      cannot leak into the player's rate. No training-window ratio is
+      needed, so B3 is the same in every fold.
+GATE (as v1/v2, unchanged; each variant's M against B1, the v2 offset):
+pooled NLL(M) - NLL(B1) <= -2 paired SE; M beats B1 in >= 4 of 5 folds;
+pooled ECE of P(SOG > 2.5) <= 0.02.
+ADOPTION (decided before any run): start with A = P0. For k = 1, 2, 3 in
+that order, Pk replaces A if (a) Pk passes the gate, (b) pooled NLL(Pk) -
+NLL(A) <= -2 paired SE over the same player-games, and (c) Pk's NLL is
+lower than A's in >= 3 of 5 folds. The final A becomes the default
+(DEFAULT_VARIANT). If P0 stays, v3 = v2. Reported for information, not
+part of the rule: per-fold mean bias, per-fold ECE, and B3 against B1.
+MARKET: models/props_market_check.py is re-run for the adopted variant
+on every shots-on-goal price row now loaded. Registration stays disabled
+(run_props(register=True) raises) unless that check passes.
+
 Model M (the candidate), pre-registered before any results were seen:
 - One LightGBM regressor, objective poisson, predicting expected SOG.
   It trains with init_score = log(exposure baseline) — the same offset
