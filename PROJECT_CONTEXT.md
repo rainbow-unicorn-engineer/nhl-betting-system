@@ -2,7 +2,7 @@
 
 > **Purpose:** This file is the single source of truth for the NHL Sports Betting Predictive System. It captures locked architectural decisions, the technology stack, current phase status, and hard-won learnings so that any developer — or any AI assistant (e.g., Claude Code) — can pick up the project with full context. Keep this file updated as decisions change.
 
-**Last updated:** October 1, 2026
+**Last updated:** October 4, 2026
 **Project owner:** Gavin
 **Assistant role convention:** Chief Data Scientist / Chief Software AI Developer
 
@@ -115,11 +115,11 @@ Layer 5: INTERFACE   → dashboard/ → Streamlit (daily slate, bankroll, CLV re
 - **Layer D — Totals:** Convolve home/away goal PMFs → total-goals distribution → price any O/U line.
 - **Layer E — Props:** Goalie saves/GAA/shutout from PMF. Skater props via Poisson regression (later phase).
 
-### Database schema (4 namespaces, 26 tables)
+### Database schema (4 namespaces, 29 tables)
 - `raw.*` — games, teams, players, rosters, shots, team_games, skater_games, goalie_games, odds_snapshots, historical_odds, starting_goalies, shifts; since 2026-09-29 also nhl_feed_snapshots, injuries, prop_odds_hist, prop_odds_fetches, prop_snapshots (created on old databases by `config/migrate.ensure_schema`)
 - `features.*` — team_rolling, goalie_rolling, matchup, game_vector
 - `models.*` — model_registry, predictions
-- `betting.*` — recommendations, placed_bets, bankroll_log
+- `betting.*` — recommendations, placed_bets, bankroll_log (the system's paper trail); since 2026-10-04 also slips, slip_legs, bankroll_txns (the bet ledger: the bettors' real bets, parlays leg by leg, and deposits/withdrawals/bonuses per bettor and platform; `betting/ledger.py`, dashboard My bets tab)
 
 Full column definitions in `db/schema.sql`.
 
@@ -146,7 +146,7 @@ Full column definitions in `db/schema.sql`.
 | **Phase 3 (modeling half)** | Historical odds (99.5% coverage, free — `docs/historical_odds.md`) + market feature + LightGBM boosted from the market + temperature calibration | ✅ COMPLETE — **log loss 0.6607, ECE 0.0146** (`lgbm_market v2`, see `docs/phase3_results.md`) |
 | **Phase 3 (betting half)** | Edge engine + quarter-Kelly staking + payout backtest + Streamlit dashboard | ✅ COMPLETE — backtest says raise edge threshold to ~5-6% (validate via paper trading); PMF totals + daily recommendation job remain | 
 | **Phase 3 (remaining)** | Daily recommendation job, PMF totals model, bet checker + parlay evaluator, arb/middle alerts | ✅ COMPLETE (2026-07-17) — recs job simulated + verified vs stored vectors; **totals gate FAILED honestly** (predictions-only, betting off; see `models/totals.py` STATUS); strategy-layer isotonic deferred until pooled live predictions exist |
-| **Phase 4** | Live-season ops: **paper trading first** (validate the 5-6% edge threshold), cloud migration, Daily Faceoff confirmed starters, player props | 🔶 IN PROGRESS — paper settlement + CLV ledger (`betting/settle.py`) and Daily Faceoff starters (`ingestion/dailyfaceoff.py`, starter accuracy 40%→80% on test slate) DONE 2026-07-17; 2026-09-29: named-bookmaker odds (Kalshi/Polymarket in, half the credits), free NHL odds feed + `compare-feeds`, ESPN open/O-U prices, ESPN injuries, PP stats, props data (ESPN history + live Odds API on the props machine), per-game caps, totals v2 (still fails its gate); remaining: cloud migration, props model, rec digest, Odds API historical backfill |
+| **Phase 4** | Live-season ops: **paper trading first** (validate the 5-6% edge threshold), cloud migration, Daily Faceoff confirmed starters, player props | 🔶 IN PROGRESS — paper settlement + CLV ledger (`betting/settle.py`) and Daily Faceoff starters (`ingestion/dailyfaceoff.py`, starter accuracy 40%→80% on test slate) DONE 2026-07-17; 2026-09-29: named-bookmaker odds (Kalshi/Polymarket in, half the credits), free NHL odds feed + `compare-feeds`, ESPN open/O-U prices, ESPN injuries, PP stats, props data (ESPN history + live Odds API on the props machine), per-game caps, totals v2 (still fails its gate); 2026-10-04: bet ledger (real singles and parlays recorded on the dashboard's My bets tab, settled by the daily run from final scores and box scores, balances per bettor and platform); remaining: cloud migration, props model, rec digest, Odds API historical backfill |
 | **Phase 5** | Multi-sport expansion (NBA/CBB first), correlated same-game parlays via a joint model | ⬜ Pending |
 
 ### Phase 1 deliverables (done)
@@ -212,6 +212,7 @@ Full column definitions in `db/schema.sql`.
 - **Totals v2: more accurate, still no edge (2026-09-29).** Margin reweighting (ties 1.15×, one-goal 0.51×, two 0.72×, three 1.34× the independent joint; fitted per fold) plus a point-in-time within-season drift correction: NLL 2.1867 → 2.1801, DK-line O/U log loss 0.7051 → 0.6958 (n=1,011). The hardened gate gives the baseline the same margin fix: baseline 2.1787 still wins (model ahead in 2/5 seasons). GATE_PASSED stays False; `log_totals_gate()` logs it each run. `total_pmf` applies the weights by default, so the checker and alerts changed too. Next route: boost from the market total once 2026-27 O/U snapshots exist, judged by `market_check` (≥200 games, 95% confidence). `poisson_totals` is now v2: run `python -m models.totals` once after upgrading or totals predictions fail (non-fatally) for lack of a registry row.
 - **Machine roles (2026-10-01, replacing the 2026-09-29 split).** The goal is that both machines run every job, each on its own key and its own DB (every job needs a paid key: picks + one props market is about 540–790 credits/month; on a free 500-credit key a machine runs `-Role picks` only — the Windows PC is on a free key as of 2026-10-02): the Mac installs all five `ops/launchd/` templates (daily, optional odds, close --due, props, props --due); the Windows PC runs `register-tasks.ps1 -Role all` (the same five; no `refresh`, which `daily` covers). `-Role picks` / `-Role props` remain for a single-job machine. Each machine issues and grades its own picks; a pick is graded only against closes on the machine that made it.
 - **Never log a request URL that carries a key (2026-09-28).** `requests` puts the full URL, `?apiKey=` included, into HTTPError/ConnectionError messages, and urllib3 logs every request URL at DEBUG. Log a summary (status, reason, the API's own message), pass anything logged through a redactor, and filter urllib3's DEBUG lines. Logs written before this date may hold the key.
+- **Real bets live apart from the paper trail (2026-10-04).** The system's picks settle as paper bets in `betting.placed_bets`; the bettors' real bets go in `betting.slips`/`slip_legs`, settled by `betting/ledger.py`. Recording a real bet from a pick links the leg (`rec_id`) but never changes the pick's status, because paper settlement only grades PENDING/APPROVED picks: marking it PLACED would drop it from the CLV record. Parlay rules: a losing leg loses at once; pushed and void legs drop out (payout = winning legs' exact decimal odds multiplied, or a boosted price divided by the dropped legs' odds); a shots prop is void when the player has no box-score row in a loaded box score. Bettor labels come from `.env` BETTORS, never code.
 
 ---
 

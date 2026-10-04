@@ -34,6 +34,10 @@ The design choice behind everything else is calibration over accuracy. Research 
 - **Player prop**: a bet on one player's own numbers, such as "over 2.5 shots on goal".
 - **Power play**: time when one team has an extra skater because the other team took a penalty. The shorthanded team is on the **penalty kill**.
 - **Void**: a bet the book cancels and refunds in full, usually because the game was postponed or cancelled.
+- **Parlay**: several bets ("legs") on one ticket that pays only if every leg wins, at the legs' odds multiplied together. A **slip** is one ticket: a single bet or a parlay.
+- **Push**: a result exactly on the line (6 goals on a 6.0 total), so the stake comes back. In a parlay a pushed or void leg drops out and the rest still pay, at a lower price.
+- **Cash out**: settling a bet early for an amount the platform offers.
+- **Bonus bet**: a bet staked with promo credit instead of cash. A win pays the profit only; a loss costs no cash.
 
 ## Status
 
@@ -157,9 +161,10 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 7. Refreshes MoneyPuck shots for `CURRENT_SEASON` (non-fatal). It downloads a fresh file when the cached one is missing or more than 20 hours old, then reloads the season's shots. It does nothing until the season has a finished game.
 8. Rebuilds features for `CURRENT_SEASON`.
 9. Settles finished paper bets and rebuilds the bankroll and CLV ledger (non-fatal).
-10. Pulls starting goalies from Daily Faceoff (non-fatal).
-11. Saves ESPN's injury list (non-fatal).
-12. Scores the day's slate and writes recommendations for games that don't have one yet (non-fatal).
+10. Settles the bettors' recorded bets in the bet ledger from the final scores and box scores (non-fatal; see [The bet ledger](#the-bet-ledger)).
+11. Pulls starting goalies from Daily Faceoff (non-fatal).
+12. Saves ESPN's injury list (non-fatal).
+13. Scores the day's slate and writes recommendations for games that don't have one yet (non-fatal).
 
 "Today" is the local date: in `LOCAL_TIMEZONE` when that is set, otherwise in the machine's time zone. `CURRENT_SEASON` is the season containing that date (see [Configuration](#configuration)).
 
@@ -182,10 +187,20 @@ The edge and staking rules live in [betting/engine.py](betting/engine.py) and ar
 
 The code departs from PROJECT_CONTEXT §7 in four places, and the code is what runs. It removes the margin by proportional rescaling, not the power method. It accepts quotes up to 18 hours old, not 5 minutes. The totals and props thresholds are unused, because neither market is bet. And when a pick's own book has no closing quote, CLV compares two no-vig probabilities instead of §7's two implied ones, because the consensus close has no single price with a margin in it.
 
+### The bet ledger
+
+The system's own picks are paper bets. The bets the bettors really place go in the bet ledger, recorded on the dashboard's **📒 My bets** tab ([dashboard/my_bets.py](dashboard/my_bets.py), logic in [betting/ledger.py](betting/ledger.py)):
+
+- **Recording.** One row in the legs table is a single bet; several rows make a parlay. Each row is a game and a bet: a team to win (moneyline), a puck line, an over/under, a player's shots on goal, or "Other" (anything else, described in words and settled by hand). Pick the bettor (labels from `BETTORS` in `.env`), the platform, the stake and the odds. A parlay's combined odds can be typed in (needed for a boosted price) or left out, and then the legs' odds are multiplied. Legs can be copied from the Check-a-bet tab or added from a pending system pick, which links the leg to that pick. Tick **Bonus bet** for promo credit, or **Practice bet** for a bet that isn't real money.
+- **Settling.** The daily run (and `python pipeline.py settle`, and the tab's **Settle now** button) decides every leg it can: a moneyline from the final score with overtime and the shootout; a puck line from the margin plus the handicap; a total from both teams' goals (a shootout counts as one goal for the winner, as books count it), a push when it lands on the line; shots on goal from the box score, void when the player has no box-score line (he didn't play). A postponed or cancelled game voids its legs. A parlay loses as soon as one leg loses. Pushed and void legs drop out: the payout is the winning legs' odds multiplied (for a boosted price, the boosted odds with the dropped legs' own odds divided out). If every leg pushed or voided, the stake comes back. When a dropped leg has no odds of its own, the parlay waits to be settled by hand.
+- **By hand.** Under "Fix or settle a bet by hand": set a leg's result ("Other" bets, corrections), record a cash-out, set the whole bet's result as the platform ruled, or delete a typo. Correcting a leg works the bet's result out again; a cash-out stays as entered.
+- **The list.** Single bets are one table. Each parlay is its own group that opens to its legs in one table, with each leg's result and final score and the parlay's combined result. Filters by bettor, platform and status.
+- **Balances.** Deposits, withdrawals, bonuses (cash a promo credits) and adjustments go in per bettor and platform. Balance = deposits − withdrawals + bonuses + adjustments + profit/loss of settled bets − stakes of open bets, which is what the platform should show; an adjustment fixes any gap. A bonus bet's stake never leaves the balance, and only its winnings come in. Practice bets are left out. ROI counts settled cash bets only. The tab also charts each bettor's running profit/loss.
+
 ## What this deliberately does not do
 
 - **No real money yet.** Real stakes wait for 500+ paper bets with average CLV above 1 percentage point and a significance test on the claimed edge. A full backtest season produced 363 bets at a 2.5-point threshold and only 46 in the 6–9 point band, so at a higher threshold that gate is several seasons away.
-- **No automatic bet placement.** Recommendations are for a person to act on. The dashboard is read-only; there is no approve, skip, or "I placed this" step yet.
+- **No automatic bet placement.** Recommendations are for a person to act on. The bettors record the bets they really placed on the dashboard's **My bets** tab (see [The bet ledger](#the-bet-ledger)); recording one never changes the system's paper pick.
 - **No totals betting** until the totals model passes its gate. Each recommendation run logs that totals are predictions-only.
 - **No props betting.** Props lines are collected, live on the props machine and from ESPN for 2025-26, for a props model that doesn't exist yet.
 - **No random train/test splits and no look-ahead.** Validation is walk-forward with a 7-day purge gap, and every feature is built only from games that finished before puck drop.
@@ -267,6 +282,7 @@ The season rolls over on July 1 without any change to the code.
 
 `db/schema.sql` runs only when the Docker volume is first created, so an older database can be missing tables and columns added since. Nothing needs doing by hand for the schema: the next pipeline command creates any missing table with its indexes and adds any missing column, and so do the dashboard and the module commands that use them. It checks first, so an up-to-date database is left alone. No data is moved. `python -m config.migrate` does the same on demand.
 
+- **Tables added on 2026-10-04:** `betting.slips`, `betting.slip_legs` and `betting.bankroll_txns` (the bet ledger: real bets, their legs, and money in and out per bettor and platform).
 - **Tables added on 2026-09-29:** `raw.nhl_feed_snapshots` (the free NHL odds feed), `raw.injuries` (ESPN's injury list), `raw.prop_odds_hist` and `raw.prop_odds_fetches` (ESPN's past props and the backfill's resume log), and `raw.prop_snapshots` (live props lines).
 - **Columns added on 2026-09-29:** fourteen on `raw.historical_odds` (the opening moneylines and total, the over/under and puck-line prices opening and closing, the opening puck line, ESPN's event id, and `prices_fetched_at`), and `raw.skater_games.stats_filled_at`.
 - **Columns added on 2026-09-28:** `raw.games.start_time_utc` (puck drop), `raw.games.schedule_state` (postponed, suspended, or cancelled), `betting.recommendations.priced_at` (when a pick's price was captured), `betting.recommendations.scheduled_start` (the game's start time when the pick was written), and, on an older database where settlement has never run, `betting.placed_bets.is_paper`.
@@ -296,7 +312,7 @@ On a machine that already runs the pipeline, also reinstall with `python -m pip 
 
 ## Looking at the results
 
-The dashboard shows pending picks and the next few days' games with start times in your local time, the model registry, the backtest, and the paper bankroll. `python -m betting.settle --report` prints CLV and ROI, and how many settled bets have a CLV. For anything else, query PostgreSQL from the repo folder:
+The dashboard shows pending picks and the next few days' games with start times in your local time, the bettors' real bets and balances (My bets), the model registry, the backtest, and the paper bankroll. `python -m betting.settle --report` prints CLV and ROI, and how many settled bets have a CLV. For anything else, query PostgreSQL from the repo folder:
 
 ```bash
 docker compose exec db psql -U nhl -d nhl_betting
@@ -353,7 +369,7 @@ LIMIT 50;
 | `close [--due]` | Moneyline-only odds snapshot (1 credit) for the closing price, then a free NHL-feed snapshot. No picks, no alerts. With `--due`, only when a game starts within 16 minutes and no moneyline snapshot is under 16 minutes old; otherwise it logs why and exits at no cost |
 | `recommend` | Scores today's slate into `betting.recommendations` |
 | `starters` | Starting goalies from Daily Faceoff |
-| `settle` | Settles paper bets and rebuilds the bankroll and CLV ledger |
+| `settle` | Settles paper bets and rebuilds the bankroll and CLV ledger, then settles the bettors' recorded bets (the bet ledger) |
 | `refresh` | The props machine's daily run: schedule, box scores, power-play stats and the injury list. No Odds API request, no picks |
 | `props [--due] [--markets M]` | A player-props snapshot from The Odds API: every game in the next 24 hours, or with `--due` only games starting within 16 minutes that have no prop snapshot in the last 16. 1 credit a game per market returned |
 | `nhl-odds` | A free snapshot of the NHL's odds feed, right now |
@@ -370,6 +386,7 @@ LIMIT 50;
 | `betting.checker --leg "MTL@BUF ml away -125" --leg "SJS@WSH total over 6.5 -110"` | Is this bet or parlay +EV? Uses stored model probabilities; add `--date`, `--price` for a boosted parlay, `--bankroll` |
 | `betting.recommend --date 2026-01-15 --simulate --dry-run` | Replays a past slate as if it were upcoming, writing nothing. Also takes `--bankroll` and `--edge-min` |
 | `betting.settle --report` | CLV and ROI report, with a count of settled bets that have a CLV |
+| `betting.ledger [--no-settle]` | Settles the bet ledger's open bets, then prints each bettor's balance and profit/loss per platform |
 | `betting.backtest` | Payout backtest on DraftKings-era prices. Uses the 2.5 threshold in `betting/engine.py`. Redraws `models/artifacts/lgbm_calibration.png` |
 | `betting.alerts` | Arbitrage and middle scan over the freshest quotes; results go to the log |
 | `betting.promo free_bet --amount 100 --bonus-odds 400 --hedge-venue kalshi --contract-price 0.80` | Hedge stakes for a sportsbook promo, per bettor. `--contract-price` is the price of the contract that pays if the bonus leg loses. Details: [docs/promo_hedging_calculator.md](docs/promo_hedging_calculator.md) |
@@ -412,6 +429,8 @@ Settings come from `.env`. `.env.example` sets the first four rows and lists the
 | `PROPS_CLOSE_MIN_GAP_MINUTES` | `16` | ... and it has no prop snapshot younger than this (0 allowed) |
 | `NHL_SEASON` | the season containing today's local date | Pins the season as eight digits, such as `20252026`. The default rolls over on July 1, so set this only to finish a playoff run that goes past July 1, then remove it. A value that isn't eight digits with the second year one after the first logs an error and the default is used |
 | `BACKFILL_FIRST_SEASON` | `20202021` | The first season `backfill` loads. It loads every season from this one through the current one. A malformed value logs an error and `20202021` is used. A first season later than the current one (or an `NHL_SEASON` pinned before it) logs an error, and only the current season is loaded |
+| `BETTORS` | `bettor 1,bettor 2` | Comma-separated labels for the people whose real bets the ledger records (My bets tab). Keep real names out of the repo; `.env` is private |
+| `PLATFORMS` | unset | Comma-separated platform names offered first in the My bets tab. Any other name can be typed in |
 | `BANKROLL` | `1000` | Fixed bankroll that stakes are sized against, and the paper ledger's starting balance. Changing it restates the whole paper ledger on the next settle run |
 | `EDGE_MIN_ML` | `0.025` | Moneyline edge threshold for the recommendation job only. The checker and backtest keep the 2.5 in `betting/engine.py` |
 | `MAX_ODDS_AGE_HOURS` | `18` | Odds older than this are ignored when scoring a slate |
@@ -491,7 +510,7 @@ pytest
 - **Its name ends in `_test`**, set as `POSTGRES_DB` in the environment or in `.env`.
 - **`NHL_ALLOW_DB_TESTS=1` together with `POSTGRES_HOST`, `POSTGRES_PORT` and `POSTGRES_DB`**, all three set in the environment for that run, pointing at the copy. The flag alone does nothing, and so do overrides that name the same database as `.env` (`localhost` and `127.0.0.1` count as the same server): the tests still skip, and the line at the top says why. So the flag on its own can never send the suite to the database `.env` names.
 
-The suite has 697 tests. Without a database, 612 pass and 85 skip, in about a minute. Nine files need no database at all: `test_betting_engine`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, and `test_db_guard`; most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network.
+The suite has 820 tests. Without a database, 730 pass and 90 skip, in about a minute. Nine files need no database at all: `test_betting_engine`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, and `test_db_guard`; most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network.
 
 ### Running the database tests on a copy
 
@@ -532,6 +551,7 @@ With a database, 696 of the 697 pass against a copy of the live data, in about a
 - **`test_baseline`** re-registers `baseline_logreg` in `models.model_registry`.
 - **`test_nhl_api`**, **`test_checker`**, and **`test_dailyfaceoff`** insert synthetic rows and delete them: games with ids 9999020001 to 9999020004 (the last three in January 2031), predictions, and a 2026-01-15 starting goalie (replacing, then deleting, any real row for that team and date).
 - **The feed tests** insert synthetic games and delete them with everything they wrote: `test_nhl_stats` (game 9999020101), `test_props_odds` (9999020201), `test_espn_odds` (9999020301), `test_espn_props` (9999020302), and `test_nhl_odds` (9999030001 and 9999030002, on 2031-02-15). `test_espn_injuries` writes and deletes injury snapshots dated 2031-01-14 and 2031-01-15. They also create the new tables and columns if the database lacks them.
+- **`test_ledger`** and **`test_my_bets`** insert synthetic games (9990000101 to 9990000104, 9990000201 and 9990000202), players 99999901 to 99999903 with box-score rows, and bets and deposits on the platforms `zz-ledger-test` and `zz-dashboard-test`, then delete all of it. `test_ledger` also runs the schema upgrade, which creates the ledger tables if the database lacks them. `test_my_bets` renders the whole dashboard with Streamlit's test runner.
 - **`test_recommend`**'s per-game limit test issues and deletes a totals pick and moneyline picks on 2026-01-15 games; **`test_totals`** reads ESPN DraftKings prices inside a transaction it rolls back.
 
 `test_baseline` and `test_lgbm` also redraw `models/artifacts/baseline_calibration.png` and `lgbm_calibration.png`, which git tracks: restore them with `git checkout -- models/artifacts/` unless the model changed. Don't run the database tests while a scheduled job is writing to the same database.
@@ -546,8 +566,9 @@ ingestion/             nhl_api, moneypuck, odds_api, espn_odds, dailyfaceoff; nh
                        nhl_stats (power-play stats), espn_injuries, espn_props, props_odds (live props)
 features/              team, goalie, schedule, and Elo builders; build_all orchestrates
 models/                baseline, lgbm (moneyline), totals; artifacts/ holds calibration plots
-betting/               engine, recommend, settle, backtest, checker, alerts, promo
-dashboard/app.py       Streamlit control room: Today, Model, Backtest, Bankroll and Check a bet tabs
+betting/               engine, recommend, settle, backtest, checker, alerts, promo, ledger (real bets)
+dashboard/app.py       Streamlit control room: Today, Check a bet, My bets, Model, Backtest and Bankroll tabs
+dashboard/my_bets.py   The My bets tab: record real bets and parlays, results, balances
 ops/launchd/           launchd job templates for the Mac: daily, odds, close, props, props-due
 ops/windows/           Task Scheduler registration script for Windows: -Role all, picks or props
 pipeline.py            Master command-line entry point
