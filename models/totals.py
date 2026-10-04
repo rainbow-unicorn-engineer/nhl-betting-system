@@ -117,6 +117,22 @@ Evaluation (walk-forward, expanding season folds, purge gap):
   knew every starter perfectly, and the goalie features were still net
   noise. Daily Faceoff starters only keep live scoring as good as this
   test; they add nothing the test lacked.
+- Starter-role experiment (2026-10-01, pre-registered; run_totals
+  variant=A|B|C|D, features/goalie_role.py). Pass rule fixed in advance:
+  pooled NLL below the baseline by >= 2 paired SEs AND ahead in >= 4 of 5
+  folds. Baseline 2.1787 throughout. A (v2) 2.1801 (+0.0014, SE 0.0011,
+  2/5 folds); B (no goalie_*) 2.1793 (+0.0006, SE 0.0010, 1/5); C (v2 +
+  defending goalie's start shares, primary flag, rest, back-to-back,
+  carried save%, gap to the other goalie) 2.1790 (+0.0003, SE 0.0010,
+  2/5); D (C minus goalie_*) 2.1791 (+0.0004, SE 0.0010, 3/5). NONE
+  passes. O/U log loss at the DraftKings line (n=1,011): A 0.6958, B
+  0.6949, C 0.6941, D 0.6945 (coin flip 0.6931). On games where either
+  starter was not his team's season-to-date leader (4,466 scored games;
+  the definition counts ties and early-season splits, so it is broad) all
+  four variants are still behind the baseline (2.1788-2.1795 vs 2.1781).
+  Attack rows facing a non-leader goalie do score ~0.12 more regulation
+  goals on average, but that difference did not turn into a lower
+  out-of-fold NLL for any variant.
 - Consequences: the model registers as inactive, the daily job writes PMF
   predictions for the bet checker and the alerts but NO totals
   recommendations, and GATE_PASSED stays False. The realistic path is
@@ -329,15 +345,61 @@ def _env_normalize(X: np.ndarray, env_total: np.ndarray) -> np.ndarray:
     return X
 
 
-def load_totals_dataset():
+# ── Goalie experiment variants (2026-10, pre-registered) ──────────
+#
+# Evaluation-only switch; production (fit_production / score_production)
+# always uses variant A.
+#   A  v2 as committed (ATTACK_FEATURES)
+#   B  A minus every goalie_* column (the shrunk goalie-form features)
+#   C  A plus the defending goalie's starter-role features
+#      (features/goalie_role.py ROLE_FEATURES), appended after A's columns
+#   D  C minus every goalie_* column
+VARIANTS = ("A", "B", "C", "D")
+
+
+def variant_feature_names(variant: str = "A") -> list:
+    """Attack-row column names of an experiment variant, in order."""
+    from features.goalie_role import ROLE_FEATURES
+    if variant not in VARIANTS:
+        raise ValueError(f"variant must be one of {VARIANTS}, got {variant!r}")
+    names = list(ATTACK_FEATURES)
+    if variant in ("C", "D"):
+        names += ROLE_FEATURES
+    if variant in ("B", "D"):
+        names = [n for n in names if not n.startswith("goalie_")]
+    return names
+
+
+def apply_variant(Xh, Xa, role_h, role_a, variant: str = "A") -> tuple:
+    """(Xh, Xa, names) for a variant from the (environment-normalized) A
+    matrices and the defending goalie's role features (DataFrames with
+    ROLE_FEATURES columns, row-aligned; ignored for A and B). Pure."""
+    from features.goalie_role import ROLE_FEATURES
+    names = variant_feature_names(variant)
+    if variant in ("C", "D"):
+        Xh = np.hstack([Xh, role_h[ROLE_FEATURES].to_numpy(dtype=float)])
+        Xa = np.hstack([Xa, role_a[ROLE_FEATURES].to_numpy(dtype=float)])
+        full = list(ATTACK_FEATURES) + ROLE_FEATURES
+    else:
+        full = list(ATTACK_FEATURES)
+    keep = [full.index(n) for n in names]
+    return Xh[:, keep], Xa[:, keep], names
+
+
+def load_totals_dataset(variant: str = "A", with_roles: bool = False):
     """Attack matrices + regulation goals + settlement totals + the
-    DraftKings-era market line (the only trustworthy historical one)."""
+    DraftKings-era market line (the only trustworthy historical one).
+    variant: see VARIANTS (default A = production v2). with_roles (or a
+    C/D variant): also compute the starter-role features in memory and
+    add meta["backup_start"] — True when either team's starter had
+    role_is_primary == 0."""
     games = _load_games_frame()
     if games.empty:
         raise RuntimeError("No completed games with matchup rows — "
                            "run the feature build first")
     Xh, Xa = build_attack_matrix(games, _load_team_levels(),
                                  _load_goalie_levels())
+    variant_feature_names(variant)                 # validates the name
 
     hg = games["home_score"].to_numpy(dtype=float)
     ag = games["away_score"].to_numpy(dtype=float)
@@ -356,7 +418,18 @@ def load_totals_dataset():
                  + env_rates(meta["date"], y_away_reg, ENV_PRIOR_RATE["away"]))
     Xh = _env_normalize(Xh, env_total)
     Xa = _env_normalize(Xa, env_total)
-    return Xh, Xa, y_home_reg, y_away_reg, meta, ATTACK_FEATURES
+    if variant == "A" and not with_roles:
+        return Xh, Xa, y_home_reg, y_away_reg, meta, ATTACK_FEATURES
+
+    from features.goalie_role import defending_role_frame, load_appearances
+    with engine.connect() as conn:
+        app = load_appearances(conn)
+    role_h, role_a = defending_role_frame(games, app)
+    # role_h describes the away starter, role_a the home starter
+    meta["backup_start"] = ((role_h["role_is_primary"] == 0)
+                            | (role_a["role_is_primary"] == 0)).to_numpy()
+    Xh, Xa, names = apply_variant(Xh, Xa, role_h, role_a, variant)
+    return Xh, Xa, y_home_reg, y_away_reg, meta, names
 
 
 ENV_FAST_DAYS = 120            # tracks the current season's level
@@ -862,14 +935,26 @@ def load_market_quotes(conn=None) -> pd.DataFrame:
 
 # ── Walk-forward validation ────────────────────────────────────────
 
-def run_totals(register: bool = True, market_quotes=None) -> dict:
+def run_totals(register: bool = True, market_quotes=None,
+               variant: str = "A", with_roles: bool = False) -> dict:
     """Walk-forward evaluation with the hardened gate (module docstring,
     Evaluation). market_quotes: game_id, book_name, line, over_price,
     under_price rows for the market check; None loads them from the
-    database (load_market_quotes)."""
+    database (load_market_quotes). variant: the goalie experiment's
+    feature set (VARIANTS; only A may be registered). with_roles: also
+    report the NLL on backup starts (meta["backup_start"])."""
     from sklearn.metrics import log_loss
 
-    Xh, Xa, y_h, y_a, meta, names = load_totals_dataset()
+    if register and variant != "A":
+        raise ValueError(f"variant {variant} is an experiment; only the "
+                         f"production variant A may be registered")
+    if variant == "A" and not with_roles:
+        Xh, Xa, y_h, y_a, meta, names = load_totals_dataset()
+    else:
+        Xh, Xa, y_h, y_a, meta, names = load_totals_dataset(
+            variant=variant, with_roles=True)
+    backup = (meta["backup_start"].to_numpy(dtype=bool)
+              if "backup_start" in meta else None)
     env_h = env_rates(meta["date"], y_h, ENV_PRIOR_RATE["home"])
     env_a = env_rates(meta["date"], y_a, ENV_PRIOR_RATE["away"])
     folds = walk_forward_folds(meta)
@@ -949,6 +1034,12 @@ def run_totals(register: bool = True, market_quotes=None) -> dict:
             "n_lined": int(lined.sum()),
             "n_priced": int(priced.sum()),
         }
+        if backup is not None:
+            b = backup[val]
+            m["n_backup"] = int(b.sum())
+            if b.any():
+                m["backup_nll"] = float(np.mean(oof_nll[val][b]))
+                m["backup_baseline_nll"] = float(np.mean(oof_base_nll[val][b]))
         if lined.any():
             p_over, p_push = prob_over(tp[lined], lines[lined])
             over_actual = tv[lined] > lines[lined]
@@ -979,6 +1070,18 @@ def run_totals(register: bool = True, market_quotes=None) -> dict:
     diff = oof_nll[scored] - oof_base_nll[scored]
     pooled["nll_diff_se"] = float(diff.std(ddof=1) / np.sqrt(len(diff)))
     pooled["gate_passed"] = pooled["nll"] < pooled["baseline_nll"]
+    pooled["variant"] = variant
+    pooled["folds_won"] = int(sum(f["nll"] < f["baseline_nll"]
+                                  for f in fold_metrics))
+    if backup is not None:
+        b = scored & backup
+        pooled["n_backup"] = int(b.sum())
+        if b.any():
+            bd = oof_nll[b] - oof_base_nll[b]
+            pooled["backup_nll"] = float(np.mean(oof_nll[b]))
+            pooled["backup_baseline_nll"] = float(np.mean(oof_base_nll[b]))
+            pooled["backup_diff_se"] = (float(bd.std(ddof=1) / np.sqrt(len(bd)))
+                                        if len(bd) > 1 else float("nan"))
 
     lined = ~np.isnan(oof_over)
     if lined.any():
@@ -1021,6 +1124,7 @@ def run_totals(register: bool = True, market_quotes=None) -> dict:
 
     oof = meta.loc[scored, ["game_id", "season", "date", "total"]].copy()
     oof["nll"] = oof_nll[scored]
+    oof["baseline_nll"] = oof_base_nll[scored]
     oof["p_over_line"] = oof_over[scored]
     oof["expected_total"] = oof_exp_total[scored]
     return {"folds": fold_metrics, "pooled": pooled, "oof": oof}
