@@ -186,6 +186,53 @@ TABLES = (
         "CREATE INDEX IF NOT EXISTS idx_prop_snapshots_player "
         "ON raw.prop_snapshots(player_id, market)",
     )),
+    # Past two-way prices bought from The Odds API's historical endpoint
+    # (ingestion/odds_history.py): one row per snapshot, event, book,
+    # market and side
+    ("raw", "odds_history", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.odds_history (
+            id              BIGSERIAL PRIMARY KEY,
+            snapshot_ts     TIMESTAMP NOT NULL,
+            requested_ts    TIMESTAMP NOT NULL,
+            event_id        VARCHAR(64) NOT NULL,
+            game_id         BIGINT REFERENCES raw.games(game_id),
+            commence_time   TIMESTAMP,
+            home_name       VARCHAR(40),
+            away_name       VARCHAR(40),
+            book            VARCHAR(40) NOT NULL,
+            market          VARCHAR(10) NOT NULL,
+            side            VARCHAR(5) NOT NULL,
+            price           INTEGER NOT NULL,
+            point           NUMERIC(4,1),
+            book_updated_at TIMESTAMP,
+            UNIQUE (snapshot_ts, event_id, book, market, side)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_odds_history_game ON raw.odds_history(game_id, market)",
+        "CREATE INDEX IF NOT EXISTS idx_odds_history_snapshot ON raw.odds_history(snapshot_ts)",
+    )),
+    # Every historical purchase (and its credits), so a re-run resumes and
+    # never buys the same snapshot twice
+    ("raw", "odds_history_fetches", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.odds_history_fetches (
+            id              BIGSERIAL PRIMARY KEY,
+            requested_ts    TIMESTAMP NOT NULL,
+            purpose         VARCHAR(12) NOT NULL,
+            season          INTEGER,
+            markets         VARCHAR(60) NOT NULL,
+            bookmakers      VARCHAR(200) NOT NULL,
+            snapshot_ts     TIMESTAMP,
+            next_ts         TIMESTAMP,
+            credits         INTEGER NOT NULL DEFAULT 0,
+            n_events        INTEGER NOT NULL DEFAULT 0,
+            n_rows          INTEGER NOT NULL DEFAULT 0,
+            status          VARCHAR(10) NOT NULL,
+            fetched_at      TIMESTAMP NOT NULL DEFAULT now()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_odds_history_fetches_ts "
+        "ON raw.odds_history_fetches(requested_ts)",
+    )),
 )
 
 _done = False
