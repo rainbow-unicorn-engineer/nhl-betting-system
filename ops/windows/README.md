@@ -42,6 +42,7 @@ Each machine has its own `.env`, its own Odds API key and its own database. **Th
 | `daily` | `python pipeline.py daily` | 9:00 |
 | `odds` (optional, `-IncludeOdds`) | `python pipeline.py odds` | 13:00 |
 | `close` | `python pipeline.py close --due` | every 15 minutes |
+| `news` | `python pipeline.py news --due` | every 15 minutes |
 | `props` | `python pipeline.py props` | 10:00 |
 | `props-due` | `python pipeline.py props --due` | every 15 minutes |
 
@@ -59,15 +60,18 @@ Each machine has its own `.env`, its own Odds API key and its own database. **Th
 
 **Credits for props:** a morning and a pre-game snapshot is 2 credits a game for each market. With the default single market (`PROPS_MARKETS=player_shots_on_goal`) that is at most 308 (February) to 464 (January) credits a month on the 2026-27 schedule, under the free plan's 500, narrowly in January. Four markets need the paid 20K plan. A game where no book has posted props yet costs nothing.
 
-**`-Role picks`** (moneyline picks and closing lines only, the same jobs as the Mac's daily, odds and close agents):
+**`-Role picks`** (moneyline picks, closing lines and team news only, the same jobs as the Mac's daily, odds, close and news agents):
 
 | Task | Runs | When | Credits a run |
 |---|---|---|---|
 | `daily` | `python pipeline.py daily` | 9:00 | 3 |
 | `odds` (optional, `-IncludeOdds`) | `python pipeline.py odds` | 13:00 | 3 |
 | `close` | `python pipeline.py close --due` | every 15 minutes | 1 when a game is about to start, otherwise 0 |
+| `news` | `python pipeline.py news --due` | every 15 minutes | 0: never calls The Odds API |
 
 The credits are for the default `ODDS_BOOKMAKERS` (10 named books bill as one region). `close --due` takes its 1-credit snapshot only when a game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old (`CLOSE_LEAD_MINUTES` and `CLOSE_MIN_GAP_MINUTES`), so each start time gets one close, in the last run before puck drop; the other runs log one line and exit. At the defaults the daily run plus the closes come to at most about 228 credits in any month of the 2026-27 schedule, and the midday `odds` run (about 93 more) fits too. [Snapshot schedule](../../README.md#snapshot-schedule) in the main README has the numbers. The picks chains also take a free NHL-feed snapshot after each Odds API snapshot.
+
+`news --due` is the news monitor (`betting/news.py`). On a game day, from 8:00 local time until the day's last puck drop, it refreshes Daily Faceoff's starting goalies (one request) and line combinations (at most one request per team still to play, and less often while a team's puck drop is more than 3 hours away), and ESPN's injury list (one request). It writes what changed to `raw.news_events`: a starting goalie confirmed or changed, a player in or out, a line change, or a power-play unit change (power-play unit → a group of five players sent out together when the other team takes a penalty). When a game's starting goalie changes or is confirmed and the game has no pick yet, it re-scores the game. A new pick is issued only when the NHL's free odds feed shows the price has not moved since the last paid snapshot. The dashboard's Today tab lists the day's news under 📰 News. Outside the window a run logs one line and exits. `NEWS_START_HOUR`, `NEWS_MIN_GAP_MINUTES` and `NEWS_MOVE_PTS` in `.env` change the defaults (8, 14 and 1.0).
 
 Times are this PC's local time. Every snapshot run makes no Odds API request, and costs nothing, when no game starts in the next 24 hours. Registering a role removes any `\NHLBetting\` task that role leaves out (for example `refresh` when switching to `all`, or the picks tasks when switching to `props`), so the folder always matches the role given. Nothing runs the script automatically, and it changes nothing on the Mac.
 
@@ -85,7 +89,7 @@ Without `-Role`, PowerShell asks for it (type `!?` at the prompt for help), and 
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `-Role` | required | `all`: `daily`, `close`, `props`, `props-due`, and `odds` with `-IncludeOdds`. `props`: `refresh`, `props`, `props-due`. `picks`: `daily`, `close`, and `odds` with `-IncludeOdds` |
+| `-Role` | required | `all`: `daily`, `close`, `news`, `props`, `props-due`, and `odds` with `-IncludeOdds`. `props`: `refresh`, `props`, `props-due`. `picks`: `daily`, `close`, `news`, and `odds` with `-IncludeOdds` |
 | `-RepoPath` | the repo the script is in | The repo folder |
 | `-PythonPath` | `<RepoPath>\.venv\Scripts\python.exe` | The Python the project is installed in. Calling it directly means the task doesn't need to activate the virtual environment |
 | `-IncludeOdds` | off | `-Role all` or `picks`: also register the midday `odds` task |
@@ -100,7 +104,7 @@ Running the script again replaces the tasks, so that is also how to change a tim
 ## What the tasks do
 
 - Each task starts in the repo folder, so `.env` is found and a relative `DATA_DIR` resolves to `<repo>\data`.
-- Output is appended to `logs\<task>.log` in the repo, named after the task: `daily.log`, `odds.log`, `close.log`, `props.log`, `props-due.log` and `refresh.log`. The script creates `logs\`, and git ignores it.
+- Output is appended to `logs\<task>.log` in the repo, named after the task: `daily.log`, `odds.log`, `close.log`, `news.log`, `props.log`, `props-due.log` and `refresh.log`. The script creates `logs\`, and git ignores it.
 - The tasks run as you, only while you are logged on, so no password is stored and no administrator rights are needed. Docker Desktop must be running too, or every run fails at the database check.
 - The tasks run hidden: no console window opens, and nothing takes the focus from what you are doing. See the next section.
 - A run missed while the PC was off or asleep starts as soon as the PC is back. The pipeline then waits up to 3 minutes for the network, and a late close or props snapshot skips games already under way.

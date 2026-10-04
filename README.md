@@ -38,6 +38,9 @@ The design choice behind everything else is calibration over accuracy. Research 
 - **Push**: a result exactly on the line (6 goals on a 6.0 total), so the stake comes back. In a parlay a pushed or void leg drops out and the rest still pay, at a lower price.
 - **Cash out**: settling a bet early for an amount the platform offers.
 - **Bonus bet**: a bet staked with promo credit instead of cash. A win pays the profit only; a loss costs no cash.
+- **Starting goalie (starter)**: the goalie who starts the game. It is the biggest single piece of team news for a win bet. A starter is **confirmed** once the team or a beat reporter says so; before that it is only projected.
+- **Line combinations**: which three forwards play together (a **line**; the first line plays the most) and which two defencemen (a **defence pair**). A **power-play unit** is the group of five sent out when the other team takes a penalty; PP1, the first unit, gets most of that time.
+- **Scratch**: a healthy player left out of the lineup. A **game-time decision** is a player whose team will decide at warm-ups whether he plays.
 
 ## Status
 
@@ -46,7 +49,7 @@ The design choice behind everything else is calibration over accuracy. Research 
 | 1 | Data foundation: PostgreSQL schema; NHL API, MoneyPuck, and Odds API ingestion; pipeline commands | Done: 6 seasons, 7,945 games, 683k shots |
 | 2 | Feature store (team form, goalie quality, rest and travel, Elo ratings) and a baseline model | Done: walk-forward log loss 0.6829, under its 0.69 gate |
 | 3 | Moneyline model, betting engine, backtest, dashboard, daily recommendations, totals model, bet checker, arbitrage and middle alerts | Done. The totals model failed its gate, and its 2026-09-29 rebuild (v2) fails the stricter gate too: it is more accurate, but the team stats still add nothing beyond the league's scoring rate. Totals betting is off |
-| 4 | Live-season operations | In progress. Done: paper settlement, the CLV ledger, confirmed starters, locked picks with a pre-game closing snapshot, per-game bet limits, named-bookmaker odds requests (Kalshi and Polymarket included, at half the credits), the free NHL odds feed stored beside The Odds API, ESPN injuries, power-play stats, ESPN opening and over/under prices, and props-line collection (history from ESPN, live from The Odds API on a second machine). Remaining: cloud migration, a props model, a daily recommendation digest, an Odds API historical backfill |
+| 4 | Live-season operations | In progress. Done: paper settlement, the CLV ledger, confirmed starters, locked picks with a pre-game closing snapshot, per-game bet limits, named-bookmaker odds requests (Kalshi and Polymarket included, at half the credits), the free NHL odds feed stored beside The Odds API, ESPN injuries, power-play stats, ESPN opening and over/under prices, props-line collection (history from ESPN, live from The Odds API on a second machine), and the news monitor (starting goalies, line combinations and injuries every 15 minutes on game days, re-scoring a game when its starter changes). Remaining: cloud migration, a props model, a daily recommendation digest, an Odds API historical backfill |
 | 5 | Other sports and same-game parlays | Not started |
 
 Where the evidence stands, from [docs/phase3_results.md](docs/phase3_results.md):
@@ -78,7 +81,7 @@ A code review on 2026-09-28 found problems with odds matching, paper-trading CLV
 Five layers, each replaceable without touching the others:
 
 ```
-DATA        ingestion/   ->  raw.*        NHL API, MoneyPuck shots, odds, starters, injuries, props lines
+DATA        ingestion/   ->  raw.*        NHL API, MoneyPuck shots, odds, starters, lineups, injuries, props lines, news
 FEATURES    features/    ->  features.*   point-in-time team, goalie, schedule, and Elo features
 MODELS      models/      ->  models.*     calibrated probabilities
 STRATEGY    betting/     ->  betting.*    edges, stakes, paper bets, CLV
@@ -97,17 +100,17 @@ INTERFACE   dashboard/                    Streamlit control room
 | ESPN summary API | One reference line per past game: the closing moneyline, puck line and total, and, where ESPN has them, the opening moneylines and total and the over/under and puck-line prices, opening and closing. The book varies by season | Free, no key, undocumented |
 | ESPN injury list | Every listed player's status (day-to-day, out, injured reserve, suspended), injury and expected return | Free, no key; the current list only, so it is saved daily |
 | ESPN core API | Past player-prop prices for 2025-26: DraftKings on some dates and in the playoffs, ESPN BET opening prices in October and November 2025 | Free, no key, undocumented |
-| Daily Faceoff | Projected starting goalies, each tagged Confirmed or a softer status | Scraped from the page's embedded data, one request per run; can break without notice |
+| Daily Faceoff | Projected starting goalies, each tagged Confirmed or a softer status; each team's line combinations (forward lines, defence pairs, power-play and penalty-kill units, goalies, injured reserve, game-time decisions) | Scraped from the pages' embedded data: one request per run for the starters, at most one per team per run for the lines. robots.txt allows these pages; can break without notice |
 
 Research notes behind the 2026-09-29 feeds work are in [docs/research/](docs/research/).
 
 ### Machine roles
 
-Each machine has its own `.env`, its own Odds API key, and its own database. **The owner runs every job on both machines** (decided 2026-10-01): the Mac installs all five [ops/launchd/](ops/launchd/) templates, and the Windows PC runs `.\ops\windows\register-tasks.ps1 -Role all`. The two roles below are what "every job" is made of, and either one can still be run alone on a machine that should do only that job.
+Each machine has its own `.env`, its own Odds API key, and its own database. **The owner runs every job on both machines** (decided 2026-10-01): the Mac installs all six [ops/launchd/](ops/launchd/) templates, and the Windows PC runs `.\ops\windows\register-tasks.ps1 -Role all`. The two roles below are what "every job" is made of, and either one can still be run alone on a machine that should do only that job.
 
 | Role | Scheduled runs | What its key pays for |
 |---|---|---|
-| Picks | `daily`, `close --due` every 15 minutes, optional midday `odds` | Moneyline snapshots and closes: at most about 228 credits a month, about 321 with the midday run |
+| Picks | `daily`, `close --due` and `news --due` every 15 minutes, optional midday `odds` | Moneyline snapshots and closes: at most about 228 credits a month, about 321 with the midday run. `news` costs no credits |
 | Props | `props` at 10:00, `props --due` every 15 minutes, plus `refresh` at 9:00 when the machine doesn't run `daily` | Player-props lines: at most 308 to 464 credits a month for one market (February to January) |
 
 A machine running both roles therefore needs more than the free plan's 500 credits a month: on a free key, run the picks role only (`-Role picks`, about 228 credits a month, about 321 with the midday run) and leave props to a machine with a paid key. A pick can be graded only against closing snapshots taken on the machine that made it, which is why every picks machine takes its own closes. Each machine keeps its own picks and paper ledger, so the Mac and the PC each issue and grade their own picks. `refresh` loads the schedule (every props line is tied to a game), box scores, power-play stats and the injury list, all free; `daily` already does all of that, so a machine running every job skips `refresh`.
@@ -131,7 +134,7 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 ### ESPN: prices, injuries and past props
 
 - **Opening and over/under prices.** The ESPN summary the backfill already downloads always carried each game's opening lines and the over/under and puck-line prices; the old loader kept only the closing moneyline. It now stores them all (`raw.historical_odds`), and the daily top-up does so for new games. `python -m ingestion.espn_odds --refresh --season 20252026` fills rows stored before, about one request a game; it never overwrites a stored closing line and never mixes in prices from a different book. On a 74-game 2025-26 DraftKings sample, 71 games have closing over/under prices and 70 opening ones, and in 18 the opening total was on a different line from the close. Older Unibet seasons have closing over/under prices but no opening ones, except 2023-24, which has everything; Unibet's moneylines are 3-way and some of its prices were taken in play, so a backtest should use `provider = 'DraftKings'` rows only. ESPN serves no lines for 2024-25 or for October to late November 2025.
-- **Injuries.** `python pipeline.py injuries` saves ESPN's current injury list into `raw.injuries`, one snapshot a day, because ESPN keeps no history. Names are matched to `raw.players` the way the Daily Faceoff goalies are (full name, then first initial and surname, then surname on the same team; a goalie never matches a skater). On 2026-10-01 the list had 117 players, 93 matched; the other 24 are prospects with no NHL games. Nothing uses it yet; it is the start of an injury history for future features and for ruling out injured goalies.
+- **Injuries.** `python pipeline.py injuries` saves ESPN's current injury list into `raw.injuries`, one snapshot a day, because ESPN keeps no history. Names are matched to `raw.players` the way the Daily Faceoff goalies are (full name, then first initial and surname, then surname on the same team; a goalie never matches a skater). On 2026-10-01 the list had 117 players, 93 matched; the other 24 are prospects with no NHL games. No model uses it yet; it is the start of an injury history for future features and for ruling out injured goalies. The news monitor compares the list every 15 minutes on game days and records each change with its time (see [The news monitor](#the-news-monitor)), but leaves the day's saved list as the daily run took it, so a list saved after the day's first games can never feed those games.
 - **Past props.** `python -m ingestion.espn_props --season 20252026 [--limit N]` backfills past player-prop prices into `raw.prop_odds_hist`, about 4 to 6 requests a game, so the whole season takes 1 to 1.5 hours; it is resumable. DraftKings props cover only certain 2025-26 dates and the playoffs, last updated 2 to 5 hours before puck drop on the dates checked. ESPN BET covers October and November 2025, but its last update came hours after puck drop, so only its opening prices are kept. A price updated after puck drop is never stored as a pre-game price.
 
 ### Power-play stats
@@ -171,6 +174,17 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 `python pipeline.py odds` is the midday run: a full odds snapshot, a free NHL-feed snapshot, starting goalies, recommendations for games that still have no pick, then an arbitrage and middle scan. `python pipeline.py close` takes a moneyline-only snapshot (1 credit) and a free NHL-feed snapshot, and does nothing else. It supplies the closing price that settlement grades each pick against. `python pipeline.py close --due`, the scheduled form, takes those snapshots only when a game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old, and otherwise exits at no cost. Run every 15 minutes, that is one close per start time, in the last run before puck drop. [Snapshot schedule](#snapshot-schedule) says when to run each one.
 
 `python pipeline.py refresh` is the props machine's daily run: steps 1 and 2, then the power-play stats and the injury list. It makes no Odds API request and no picks.
+
+### The news monitor
+
+Prices react to team news, so news seen before the price moves is an edge. `python pipeline.py news --due` runs every 15 minutes (see [Scheduling](#scheduling)). On a game day, from 8:00 local time until the day's last puck drop, it ([betting/news.py](betting/news.py)):
+
+1. **Refreshes three free sources.** Daily Faceoff's starting goalies (one request); Daily Faceoff's line combinations for every team still to play ([ingestion/dailyfaceoff_lines.py](ingestion/dailyfaceoff_lines.py): at most one request per team, 2 seconds apart, and only every 55 minutes while a team's puck drop is more than 3 hours away); and ESPN's injury list (one request). The lines go into `raw.lineups`, a new snapshot only when they change, with each player matched to `raw.players`.
+2. **Records what changed** since its previous run in `raw.news_events`, with the time it was seen: `STARTER_CONFIRMED`, `STARTER_CHANGED`, `PLAYER_OUT` and `PLAYER_IN` (the projected lineup or ESPN's list), `LINE_CHANGE` (a forward line or defence pair) and `PP_UNIT_CHANGE` (a power-play unit). The first time it sees a source it only remembers it (`raw.news_state`), so a new install starts quietly.
+3. **Re-scores games with starter news.** The win/loss model uses the starting goalie, so when a game's starter changes or is confirmed and the game has no pick yet, it runs the normal recommend path for that date. Picks already issued never change. First it takes a free snapshot of the NHL's odds feed and compares each book's fair chance now with the same book's at the last paid odds snapshot. A new pick is allowed only when that moved less than `NEWS_MOVE_PTS` (1.0) percentage points. The pick would be priced at the last paid snapshot, and once the market has reacted that price may be gone, which would also make its CLV look better than it really is. When the price moved, or can't be checked, the game waits for the next paid snapshot.
+4. **Shows it** on the dashboard's Today tab under **📰 News**: each event's time, team, game, what changed (before and now) and what the system did.
+
+It never calls The Odds API. Every step is non-fatal and logged, and a run outside the window logs one line and exits. Without `--due` it runs at once. Skater news is recorded but no model uses it yet; it is the history a props model or a lineup feature can be tested on later.
 
 ### Betting rules
 
@@ -259,6 +273,7 @@ python pipeline.py daily                    # morning: picks are issued at this 
 python pipeline.py odds                     # optional, midday: confirmed starters and alerts
 python pipeline.py close --due              # every 15 minutes: a close only when a game is about to start
 python pipeline.py close                    # by hand: a closing snapshot right now (1 credit)
+python pipeline.py news --due               # every 15 minutes: starters, lines and injuries; no credits
 python pipeline.py compare-feeds            # the free NHL feed against The Odds API, today's games
 streamlit run dashboard/app.py              # the control room
 
@@ -274,7 +289,7 @@ The season rolls over on July 1 without any change to the code.
 
 1. Run `python pipeline.py setup`. Check that it prints the new season, your time zone, and today's date, and that the Odds API key is OK. If `NHL_SEASON` is still set in `.env` from a playoff run that went past July 1, remove it.
 2. Build the new season's features now with `python pipeline.py features --season 20262027`, or let the next `daily` run do it.
-3. Check that each machine's scheduled jobs are loaded: `daily`, `close`, and `odds` if you use it, on the picks machine; `refresh`, `props` and `props-due` on the props machine (see [Scheduling](#scheduling)). Each machine's `.env` needs its own `ODDS_API_KEY`.
+3. Check that each machine's scheduled jobs are loaded: `daily`, `close`, `news`, and `odds` if you use it, on the picks machine; `refresh`, `props` and `props-due` on the props machine (see [Scheduling](#scheduling)). Each machine's `.env` needs its own `ODDS_API_KEY`.
 4. Decide `EDGE_MIN_ML` for the season (see Status).
 5. Before using the promo calculator, re-check the Kalshi and Polymarket fees hard-coded in `betting/promo.py`.
 
@@ -282,7 +297,7 @@ The season rolls over on July 1 without any change to the code.
 
 `db/schema.sql` runs only when the Docker volume is first created, so an older database can be missing tables and columns added since. Nothing needs doing by hand for the schema: the next pipeline command creates any missing table with its indexes and adds any missing column, and so do the dashboard and the module commands that use them. It checks first, so an up-to-date database is left alone. No data is moved. `python -m config.migrate` does the same on demand.
 
-- **Tables added on 2026-10-04:** `betting.slips`, `betting.slip_legs` and `betting.bankroll_txns` (the bet ledger: real bets, their legs, and money in and out per bettor and platform).
+- **Tables added on 2026-10-04:** `betting.slips`, `betting.slip_legs` and `betting.bankroll_txns` (the bet ledger: real bets, their legs, and money in and out per bettor and platform); `raw.lineups` and `raw.lineup_fetches` (Daily Faceoff line combinations and the last fetch per team); `raw.news_events`, `raw.news_state` and `raw.news_runs` (the news monitor).
 - **Tables added on 2026-09-29:** `raw.nhl_feed_snapshots` (the free NHL odds feed), `raw.injuries` (ESPN's injury list), `raw.prop_odds_hist` and `raw.prop_odds_fetches` (ESPN's past props and the backfill's resume log), and `raw.prop_snapshots` (live props lines).
 - **Columns added on 2026-09-29:** fourteen on `raw.historical_odds` (the opening moneylines and total, the over/under and puck-line prices opening and closing, the opening puck line, ESPN's event id, and `prices_fetched_at`), and `raw.skater_games.stats_filled_at`.
 - **Columns added on 2026-09-28:** `raw.games.start_time_utc` (puck drop), `raw.games.schedule_state` (postponed, suspended, or cancelled), `betting.recommendations.priced_at` (when a pick's price was captured), `betting.recommendations.scheduled_start` (the game's start time when the pick was written), and, on an older database where settlement has never run, `betting.placed_bets.is_paper`.
@@ -381,6 +396,7 @@ LIMIT 50;
 | `nhl-odds` | A free snapshot of the NHL's odds feed, right now |
 | `compare-feeds [--date YYYY-MM-DD] [--detail]` | The NHL feed against The Odds API for one date's games: price gaps and how often prices changed. Reads only |
 | `injuries` | Saves ESPN's injury list for today |
+| `news [--due]` | The news monitor: refreshes Daily Faceoff's starters and lines and ESPN's injury list, records what changed in `raw.news_events`, and re-scores games with starter news and no pick yet. No Odds API request. With `--due`, only on a game day from 8:00 local until the last puck drop, at most every 14 minutes |
 | `nhl-stats [--season YYYYYYYY]` | Fills power-play, penalty-kill and faceoff stats: the current season's unfilled dates, or one whole season |
 
 `python pipeline.py --help` lists the commands, and `<command> --help` prints a command's options and runs nothing. An unknown command or option exits with code 2.
@@ -407,10 +423,12 @@ LIMIT 50;
 | `ingestion.nhl_odds snapshot \| compare [--date D] [--detail]` | The NHL feed: one snapshot, or the comparison report |
 | `ingestion.props_odds [--due] [--markets M]` | One props snapshot, as `pipeline.py props` |
 | `ingestion.dailyfaceoff [--date YYYY-MM-DD]` | Starters for one date |
+| `ingestion.dailyfaceoff_lines [--team BOS ...] [--force]` | Daily Faceoff line combinations into `raw.lineups`: today's teams still to play, or the teams given. `--force` ignores the gap since each team's last fetch |
+| `betting.news [--due]` | The news monitor, as `pipeline.py news` |
 | `ingestion.odds_api [--markets h2h,spreads,totals]` | One odds snapshot: 3 credits for the default markets, 1 for `h2h`, with the default books. Skipped, at no cost, when no game starts in the next 24 hours |
 | `config.migrate [--seed-venues]` | Creates any tables and adds any columns a database made from an older `db/schema.sql` is missing. Pipeline commands do this on their own. `--seed-venues` also applies `db/seed_venues.sql` |
 
-`--help` prints the options and runs nothing for `pipeline.py` and each of its commands, `betting.checker`, `betting.recommend`, `betting.settle`, `betting.alerts`, `betting.promo`, `betting.montecarlo`, `ingestion.odds_api`, `ingestion.espn_odds`, `ingestion.espn_props`, `ingestion.espn_injuries`, `ingestion.nhl_stats`, `ingestion.nhl_odds`, `ingestion.props_odds`, `ingestion.dailyfaceoff`, `models.totals`, and `config.migrate`, so it never spends credits or writes to the database. `models.baseline`, `models.lgbm`, and `betting.backtest` take no options and start their full run whatever you pass them.
+`--help` prints the options and runs nothing for `pipeline.py` and each of its commands, `betting.checker`, `betting.recommend`, `betting.settle`, `betting.alerts`, `betting.promo`, `betting.montecarlo`, `ingestion.odds_api`, `ingestion.espn_odds`, `ingestion.espn_props`, `ingestion.espn_injuries`, `ingestion.nhl_stats`, `ingestion.nhl_odds`, `ingestion.props_odds`, `ingestion.dailyfaceoff`, `ingestion.dailyfaceoff_lines`, `betting.news`, `models.totals`, and `config.migrate`, so it never spends credits or writes to the database. `models.baseline`, `models.lgbm`, and `betting.backtest` take no options and start their full run whatever you pass them.
 
 ## Configuration
 
@@ -449,6 +467,13 @@ Settings come from `.env`. `.env.example` sets the first four rows and lists the
 | `ALERTS_MAX_AGE_MINUTES` | `30` | Only quotes this fresh count for arbitrage and middles |
 | `MIN_ARB_PROFIT` | `0.001` | Smallest locked-in arbitrage profit worth alerting |
 | `ALERTS_NOTIFY` | unset | `1` sends a macOS notification for each arbitrage alert |
+| `NEWS_START_HOUR` | `8` | `news --due` works from this local hour until the day's last puck drop |
+| `NEWS_MIN_GAP_MINUTES` | `14` | `news --due` skips a run when the last one started less than this many minutes ago |
+| `NEWS_MOVE_PTS` | `1.0` | After starter news, a book's fair chance moving this many percentage points or more since the last paid snapshot counts as the market having moved: no new pick from that news |
+| `LINEUPS_MIN_GAP_MINUTES` | `14` | A team's Daily Faceoff lines are fetched at most this often once its puck drop is near |
+| `LINEUPS_FAR_GAP_MINUTES` | `55` | ... and at most this often while its puck drop is more than `LINEUPS_NEAR_HOURS` away |
+| `LINEUPS_NEAR_HOURS` | `3` | Where "near" starts, in hours before puck drop |
+| `LINEUPS_PAUSE_SECONDS` | `2` | The pause between two teams' requests |
 
 The season is `CURRENT_SEASON` in `config/settings.py`: `NHL_SEASON` when that is set, otherwise the season containing today's local date. `python pipeline.py setup` prints the season, the time zone, and today's local date. For `BETTABLE_BOOKS`, the keys the API has returned so far are in `raw.odds_snapshots`: `SELECT DISTINCT book_name FROM raw.odds_snapshots ORDER BY 1`.
 
@@ -476,6 +501,7 @@ A pick is locked at the price of the snapshot it was issued from, so grading it 
 | `daily` | Morning, 9:00 | 3, or 0 when no game starts in the next 24 hours | Refreshes everything and issues the day's picks at this snapshot's prices |
 | `odds` (optional) | Midday, 13:00, once most starting goalies are confirmed | 3, or 0 the same way | Confirmed starters, picks for games that still have none, and arbitrage and middle alerts. It never changes a pick already issued |
 | `close --due` | Every 15 minutes | 1 when due, otherwise 0 | Moneyline only. It snapshots when a game starts within 16 minutes and no moneyline snapshot is under 16 minutes old, so every start time, afternoon games included, gets one close, in the last run before its puck drop |
+| `news --due` | Every 15 minutes, 8:00 to the last puck drop | 0 | Team news (see [The news monitor](#the-news-monitor)). Its price check uses the free NHL feed |
 
 The credits are for the default `ODDS_BOOKMAKERS`. Each of these runs also takes a free NHL-feed snapshot right after its Odds API snapshot.
 
@@ -498,16 +524,16 @@ These figures were replayed at the old cost of 6 credits a full snapshot and 2 a
 
 The live copy runs on macOS under launchd. Don't add cron entries as well, because the crontab is intentionally empty.
 
-Templates for five agents are in [ops/launchd/](ops/launchd/), with install steps in its README: `com.nhlbetting.daily`, `com.nhlbetting.close` (`close --due` every 15 minutes), the optional `com.nhlbetting.odds`, and the props agents `com.nhlbetting.props` (10:00) and `com.nhlbetting.props-due` (`props --due` every 15 minutes). Each job logs to the repo's `logs/` folder, which git ignores. The live Mac already has `com.nhlbetting.daily` and `com.nhlbetting.odds` in `~/Library/LaunchAgents`, with their own times and log paths. Nothing replaces those files automatically: add the `close` agent by hand (unloading any earlier fixed-time close first), and compare the other two with the templates before replacing them.
+Templates for six agents are in [ops/launchd/](ops/launchd/), with install steps in its README: `com.nhlbetting.daily`, `com.nhlbetting.close` (`close --due` every 15 minutes), `com.nhlbetting.news` (`news --due` every 15 minutes), the optional `com.nhlbetting.odds`, and the props agents `com.nhlbetting.props` (10:00) and `com.nhlbetting.props-due` (`props --due` every 15 minutes). Each job logs to the repo's `logs/` folder, which git ignores. The live Mac already has `com.nhlbetting.daily` and `com.nhlbetting.odds` in `~/Library/LaunchAgents`, with their own times and log paths. Nothing replaces those files automatically: add the `close` agent by hand (unloading any earlier fixed-time close first), and compare the other two with the templates before replacing them.
 
 - **Check the agents** with `launchctl list | grep com.nhlbetting`. The middle column is the last exit code.
 - **Docker Desktop must be running**, or every run fails at the database check.
 - **A Mac that was asleep** at the daily or midday time runs that job once when it wakes. The run waits up to 3 minutes for the network, and a late close skips the games already under way.
-- **Pause them for the off-season** with `launchctl unload ~/Library/LaunchAgents/com.nhlbetting.odds.plist`, and the same for `.daily`, `.close`, `.props` and `.props-due`.
+- **Pause them for the off-season** with `launchctl unload ~/Library/LaunchAgents/com.nhlbetting.odds.plist`, and the same for `.daily`, `.close`, `.news`, `.props` and `.props-due`.
 
 The Mac runs every job, so it installs the two props agents too; the free steps (NHL feed, power-play stats, injuries) run inside `daily`, `odds` and `close`, so it needs no `refresh` job.
 
-**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all`, the Windows PC's setup, registers `daily` at 9:00, `close --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details. `ops\windows\setup-all.bat` (the **NHL Setup** desktop shortcut) runs it with `-Role all -IncludeOdds` as its last step.
+**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all`, the Windows PC's setup, registers `daily` at 9:00, `close --due` and `news --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, `news`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details. `ops\windows\setup-all.bat` (the **NHL Setup** desktop shortcut) runs it with `-Role all -IncludeOdds` as its last step.
 
 ## Tests
 
@@ -562,6 +588,7 @@ With a database, 696 of the 697 pass against a copy of the live data, in about a
 - **`test_nhl_api`**, **`test_checker`**, and **`test_dailyfaceoff`** insert synthetic rows and delete them: games with ids 9999020001 to 9999020004 (the last three in January 2031), predictions, and a 2026-01-15 starting goalie (replacing, then deleting, any real row for that team and date).
 - **The feed tests** insert synthetic games and delete them with everything they wrote: `test_nhl_stats` (game 9999020101), `test_props_odds` (9999020201), `test_espn_odds` (9999020301), `test_espn_props` (9999020302), and `test_nhl_odds` (9999030001 and 9999030002, on 2031-02-15). `test_espn_injuries` writes and deletes injury snapshots dated 2031-01-14 and 2031-01-15. They also create the new tables and columns if the database lacks them.
 - **`test_ledger`** and **`test_my_bets`** insert synthetic games (9990000101 to 9990000104, 9990000201 and 9990000202), players 99999901 to 99999903 with box-score rows, and bets and deposits on the platforms `zz-ledger-test` and `zz-dashboard-test`, then delete all of it. `test_ledger` also runs the schema upgrade, which creates the ledger tables if the database lacks them. `test_my_bets` renders the whole dashboard with Streamlit's test runner.
+- **`test_news`** empties the five news tables (`raw.news_events`, `news_state`, `news_runs`, `lineups`, `lineup_fetches`), adds game 2099020001 (BOS against MTL, today) with odds and NHL-feed rows, and deletes the game and those rows afterwards. It replaces today's BOS and MTL starting goalies, and saves today's injury list when the database has none. **`test_dailyfaceoff_lines`** writes and deletes lines for the made-up team `ZZZ`.
 - **`test_recommend`**'s per-game limit test issues and deletes a totals pick and moneyline picks on 2026-01-15 games; **`test_totals`** reads ESPN DraftKings prices inside a transaction it rolls back.
 
 `test_baseline` and `test_lgbm` also redraw `models/artifacts/baseline_calibration.png` and `lgbm_calibration.png`, which git tracks: restore them with `git checkout -- models/artifacts/` unless the model changed. Don't run the database tests while a scheduled job is writing to the same database.
@@ -572,15 +599,17 @@ With a database, 696 of the 697 pass against a copy of the live data, in about a
 config/settings.py     Settings from .env, database engine, local date and season
 config/migrate.py      Creates the tables and adds the columns an older database is missing; applies the venue seed
 db/                    schema.sql (applied by Docker on first start), seed_venues.sql
-ingestion/             nhl_api, moneypuck, odds_api, espn_odds, dailyfaceoff; nhl_odds (free NHL feed),
-                       nhl_stats (power-play stats), espn_injuries, espn_props, props_odds (live props)
+ingestion/             nhl_api, moneypuck, odds_api, espn_odds, dailyfaceoff (starters), dailyfaceoff_lines
+                       (line combinations); nhl_odds (free NHL feed), nhl_stats (power-play stats),
+                       espn_injuries, espn_props, props_odds (live props)
 features/              team, goalie, schedule, and Elo builders; build_all orchestrates
 models/                baseline, lgbm (moneyline), totals; artifacts/ holds calibration plots
-betting/               engine, recommend, settle, backtest, checker, alerts, promo, ledger (real bets)
+betting/               engine, recommend, settle, backtest, checker, alerts, promo, ledger (real bets),
+                       news (the news monitor), montecarlo
 dashboard/app.py       Streamlit control room: Today, Check a bet, My bets, Model, Backtest and Bankroll tabs
 dashboard/my_bets.py   The My bets tab: record real bets and parlays, results, balances
-dashboard/today.py     The Today tab: pending picks, stake limits in use, prices by book
-ops/launchd/           launchd job templates for the Mac: daily, odds, close, props, props-due
+dashboard/today.py     The Today tab: pending picks, stake limits in use, today's news, prices by book
+ops/launchd/           launchd job templates for the Mac: daily, odds, close, news, props, props-due
 ops/windows/           Windows: Task Scheduler registration (-Role all, picks or props), the one-step setup
                        (setup-all.bat), the dashboard launcher (open-dashboard.bat) and the desktop shortcuts
 pipeline.py            Master command-line entry point
