@@ -337,6 +337,77 @@ CREATE TABLE IF NOT EXISTS raw.starting_goalies (
     PRIMARY KEY (game_date, team)
 );
 
+-- Daily Faceoff line combinations (ingestion/dailyfaceoff_lines.py): a new
+-- snapshot of a team's lines each time they change. unit F1-F4 (forward
+-- lines), D1-D4 (defence pairs), G (goalies: slot g1 = projected starter),
+-- PP1/PP2 (power-play units), PK1/PK2 (penalty kill), IR (injured reserve).
+CREATE TABLE IF NOT EXISTS raw.lineups (
+    snapshot_ts         TIMESTAMPTZ NOT NULL,      -- when the change was seen
+    team                VARCHAR(3) NOT NULL,
+    game_date           DATE NOT NULL,             -- the team's game day the lines are for
+    unit                VARCHAR(6) NOT NULL,
+    slot                VARCHAR(6) NOT NULL,       -- lw, c, rw, ld, rd, g1, g2, sk1-sk5, ir1...
+    player_name         VARCHAR(80) NOT NULL,      -- as Daily Faceoff publishes it
+    player_id           INTEGER,                   -- raw.players id; NULL when unresolved
+    df_player_id        INTEGER,                   -- Daily Faceoff's own player id
+    position            VARCHAR(2),                -- C, L, R, D, G
+    injury_status       VARCHAR(12),               -- out, dtd, ir (Daily Faceoff's)
+    game_time_decision  BOOLEAN NOT NULL DEFAULT FALSE,
+    source_updated_at   TIMESTAMPTZ,               -- Daily Faceoff's updatedAt
+    PRIMARY KEY (snapshot_ts, team, unit, slot)
+);
+CREATE INDEX IF NOT EXISTS idx_lineups_team ON raw.lineups(team, snapshot_ts);
+CREATE INDEX IF NOT EXISTS idx_lineups_player ON raw.lineups(player_id, game_date);
+
+-- The last line-combinations fetch per team (politeness gap, store-on-change)
+CREATE TABLE IF NOT EXISTS raw.lineup_fetches (
+    team                VARCHAR(3) PRIMARY KEY,
+    fetched_at          TIMESTAMPTZ NOT NULL,
+    source_updated_at   TIMESTAMPTZ,
+    lines_hash          VARCHAR(64),
+    status              VARCHAR(12) NOT NULL       -- new, same, broken, failed
+);
+
+-- Team news found by the news monitor (betting/news.py, `pipeline.py news`)
+CREATE TABLE IF NOT EXISTS raw.news_events (
+    event_id        BIGSERIAL PRIMARY KEY,
+    ts              TIMESTAMPTZ NOT NULL,          -- when the run saw the change
+    game_id         BIGINT REFERENCES raw.games(game_id),  -- the team's game that day
+    game_date       DATE,
+    team            VARCHAR(3) NOT NULL,
+    kind            VARCHAR(20) NOT NULL CHECK (kind IN ('STARTER_CONFIRMED', 'STARTER_CHANGED', 'PLAYER_OUT', 'PLAYER_IN', 'LINE_CHANGE', 'PP_UNIT_CHANGE')),
+    source          VARCHAR(20) NOT NULL,          -- dailyfaceoff, dailyfaceoff_lines, espn
+    player_name     VARCHAR(80),
+    player_id       INTEGER,
+    detail          TEXT,
+    previous        TEXT,
+    current         TEXT,
+    rescored        BOOLEAN,                       -- starter news: the game was re-scored
+    new_pick        BOOLEAN,                       -- ... and got a new pick
+    market_moved    BOOLEAN,                       -- the free feed's price moved since the last paid snapshot
+    market_note     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_news_events_ts ON raw.news_events(ts);
+CREATE INDEX IF NOT EXISTS idx_news_events_game ON raw.news_events(game_id);
+
+-- What the news monitor saw last, per source and team (the diff baseline)
+CREATE TABLE IF NOT EXISTS raw.news_state (
+    source          VARCHAR(20) NOT NULL,
+    team            VARCHAR(3) NOT NULL,
+    state           JSONB NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source, team)
+);
+
+-- One row per news run (its minimum gap, and "last checked" on the dashboard)
+CREATE TABLE IF NOT EXISTS raw.news_runs (
+    run_id          BIGSERIAL PRIMARY KEY,
+    started_at      TIMESTAMPTZ NOT NULL,
+    finished_at     TIMESTAMPTZ,
+    events          INTEGER,
+    notes           TEXT
+);
+
 CREATE TABLE IF NOT EXISTS raw.shifts (
     shift_id        BIGSERIAL PRIMARY KEY,
     game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),

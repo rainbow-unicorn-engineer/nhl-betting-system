@@ -186,6 +186,83 @@ TABLES = (
         "CREATE INDEX IF NOT EXISTS idx_prop_snapshots_player "
         "ON raw.prop_snapshots(player_id, market)",
     )),
+    # Daily Faceoff line combinations, a snapshot per change
+    # (ingestion/dailyfaceoff_lines.py), and its last fetch per team
+    ("raw", "lineups", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.lineups (
+            snapshot_ts         TIMESTAMPTZ NOT NULL,
+            team                VARCHAR(3) NOT NULL,
+            game_date           DATE NOT NULL,
+            unit                VARCHAR(6) NOT NULL,
+            slot                VARCHAR(6) NOT NULL,
+            player_name         VARCHAR(80) NOT NULL,
+            player_id           INTEGER,
+            df_player_id        INTEGER,
+            position            VARCHAR(2),
+            injury_status       VARCHAR(12),
+            game_time_decision  BOOLEAN NOT NULL DEFAULT FALSE,
+            source_updated_at   TIMESTAMPTZ,
+            PRIMARY KEY (snapshot_ts, team, unit, slot)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_lineups_team ON raw.lineups(team, snapshot_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_lineups_player ON raw.lineups(player_id, game_date)",
+    )),
+    ("raw", "lineup_fetches", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.lineup_fetches (
+            team                VARCHAR(3) PRIMARY KEY,
+            fetched_at          TIMESTAMPTZ NOT NULL,
+            source_updated_at   TIMESTAMPTZ,
+            lines_hash          VARCHAR(64),
+            status              VARCHAR(12) NOT NULL
+        )""",
+    )),
+    # The news monitor (betting/news.py): what changed, the last state seen
+    # per source and team, and one row per run
+    ("raw", "news_events", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.news_events (
+            event_id        BIGSERIAL PRIMARY KEY,
+            ts              TIMESTAMPTZ NOT NULL,
+            game_id         BIGINT REFERENCES raw.games(game_id),
+            game_date       DATE,
+            team            VARCHAR(3) NOT NULL,
+            kind            VARCHAR(20) NOT NULL CHECK (kind IN ('STARTER_CONFIRMED', 'STARTER_CHANGED', 'PLAYER_OUT', 'PLAYER_IN', 'LINE_CHANGE', 'PP_UNIT_CHANGE')),
+            source          VARCHAR(20) NOT NULL,
+            player_name     VARCHAR(80),
+            player_id       INTEGER,
+            detail          TEXT,
+            previous        TEXT,
+            current         TEXT,
+            rescored        BOOLEAN,
+            new_pick        BOOLEAN,
+            market_moved    BOOLEAN,
+            market_note     TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_news_events_ts ON raw.news_events(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_news_events_game ON raw.news_events(game_id)",
+    )),
+    ("raw", "news_state", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.news_state (
+            source          VARCHAR(20) NOT NULL,
+            team            VARCHAR(3) NOT NULL,
+            state           JSONB NOT NULL,
+            updated_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (source, team)
+        )""",
+    )),
+    ("raw", "news_runs", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.news_runs (
+            run_id          BIGSERIAL PRIMARY KEY,
+            started_at      TIMESTAMPTZ NOT NULL,
+            finished_at     TIMESTAMPTZ,
+            events          INTEGER,
+            notes           TEXT
+        )""",
+    )),
     # The bet ledger (betting/ledger.py): real bets as slips (a single bet
     # or a parlay) with their legs, and each bettor's deposits,
     # withdrawals and bonuses per platform. slips comes before slip_legs,
