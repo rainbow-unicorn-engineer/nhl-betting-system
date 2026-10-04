@@ -145,7 +145,7 @@ Tags: [V] = checked this session, with file:line or a live response. [I] = my in
   - The repo's props edge threshold of 4% (`PROJECT_CONTEXT.md:127`) may be too low.
   - 191 of the 375 entries had no paired opposite side (goalscorer and milestone markets). [I] Those usually carry even bigger margins.
 - **Low limits cap profit [I].** Props limits are often a few hundred dollars, so even a real edge earns little in absolute terms.
-- **Account limiting [I].** Books limit winning prop bettors fastest. In the two-bettor structure, the partner's Louisiana accounts are the scarce resource. On Kalshi, props are "thinner than NBA/NFL" (`docs/texas_execution_options.md:22-25`) [V].
+- **Account limiting [I].** Books limit winning prop bettors fastest. In the two-bettor structure, bettor A's sportsbook accounts are the scarce resource. On Kalshi, props are "thinner than NBA/NFL" (`docs/texas_execution_options.md:22-25`) [V].
 - **Correlation.** Props in the same game move together: they share the same game total and the same power-play chances. Stacking them at quarter-Kelly each is riskier than it looks, and the per-game cap isn't enforced in code.
 - **Noise.** Counts of 0-3 per game mean hundreds of bets are needed to separate skill from luck. CLV is the faster signal, but it needs prop snapshots before the game and at the close, which cost credits.
 

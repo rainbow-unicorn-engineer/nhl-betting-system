@@ -3,9 +3,9 @@ betting/promo.py
 Promo-hedging calculator v1 (design: docs/promo_hedging_calculator.md).
 
 Basis: the two-bettor legal structure in docs/texas_execution_options.md.
-Every leg belongs to exactly one bettor placing his own funds on a venue
-legal for him — Bettor A (partner, Louisiana sportsbooks, in his name)
-or Bettor B (Gavin, Kalshi/Polymarket in Texas). The calculator computes
+Every leg belongs to exactly one bettor placing their own funds on a venue
+legal for them — Bettor A (sportsbooks in their own state, in their name)
+or Bettor B (Kalshi/Polymarket in Texas). The calculator computes
 equal-profit hedge stakes and reports PER-BETTOR P&L per outcome; it
 never pools stakes and has no concept of one bettor placing for another.
 

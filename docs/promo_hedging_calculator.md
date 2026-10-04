@@ -1,10 +1,10 @@
 # Promo-hedging calculator — design
 
 > Basis: the two-bettor legal structure in `docs/texas_execution_options.md`
-> (§ Two-bettor execution structure). Bettor A (partner, Louisiana) has
-> full sportsbook + promo access in his own name with his own funds;
-> Bettor B (Gavin, Texas) has Kalshi/Polymarket. Every leg is placed by
-> its own bettor with his own bankroll; the calculator never pools stakes
+> (§ Two-bettor execution structure). Bettor A (a legal online-sportsbook
+> state) has full sportsbook + promo access in their own name with their own
+> funds; Bettor B (Texas) has Kalshi/Polymarket. Every leg is placed by
+> its own bettor with their own bankroll; the calculator never pools stakes
 > — it reports per-bettor P&L per outcome, plus an informational
 > household net.
 

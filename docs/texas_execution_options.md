@@ -126,35 +126,33 @@ Constraints to model:
   to hedge a puck-line free bet; support partial hedges + residual exposure.
 - **Age/KYC**: prediction markets 18+, sportsbooks 21+, SSN KYC everywhere.
 
-## Two-bettor execution structure (Louisiana partner)
+## Two-bettor execution structure
 
-Gavin's partner is resident in Louisiana through ~mid-2028, which upgrades
+Bettor A lives in a state with legal online sportsbooks, which upgrades
 the execution layer from "trip-based promo harvesting" to a standing
 two-bettor structure. This is the documented plan, and its legality rests
 on the two actors staying independent:
 
-**Bettor A (partner, Louisiana):** full online sportsbook access (FanDuel,
-DraftKings, BetMGM, Caesars, bet365, Fanatics, theScore — 55 of 64
-parishes). Accounts **in his name, funded by him, bets placed by him while
-physically in Louisiana, winnings his** (and his taxable income — LA
-withholds on gambling winnings; he files as the bettor). He runs the
-system's recommendations like any user of betting software — sharing
-software, picks, and strategy is legal.
+**Bettor A (legal online-sportsbook state):** full online sportsbook access
+in their state. Accounts **in their own name, funded by them, bets placed
+by them while physically in that state, winnings theirs** (and their
+taxable income; the state may withhold on gambling winnings, and they file
+as the bettor). They run the system's recommendations like any user of
+betting software — sharing software, picks, and strategy is legal.
 
-**Bettor B (Gavin, Texas):** Kalshi + Polymarket US from home, exactly as
-ranked below. His own accounts, his own funds.
+**Bettor B (Texas):** Kalshi + Polymarket US from home, exactly as
+ranked below. Their own accounts, their own funds.
 
 **The line that keeps this legal (do not cross it):** no proxy placement.
 If A's accounts are funded by B, or A places bets at B's direction with
-B's economics, that is messenger betting — illegal in Louisiana as in
-other legal states, a universal sportsbook T&C violation, and the
+B's economics, that is messenger betting — illegal in every legal state, a universal sportsbook T&C violation, and the
 specific pattern KYC/source-of-funds reviews are built to catch
 (withdrawal freezes + confiscation, before any legal question). Each
-bettor's bets are his own decisions with his own bankroll; the system is
+bettor's bets are their own decisions with their own bankroll; the system is
 shared analytics, not a shared wallet.
 
 Practical notes for this structure:
-- **Promo inventory**: A can open 7-8 LA books from home, no travel —
+- **Promo inventory**: A can open 7-8 books from home, no travel —
   the new-user promo stack that previously required Houston/Dallas trips
   is now fully and continuously accessible, plus ongoing reload/boost
   offers that trip-based access always missed.
