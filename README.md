@@ -493,7 +493,7 @@ pytest
 - **Its name ends in `_test`**, set as `POSTGRES_DB` in the environment or in `.env`.
 - **`NHL_ALLOW_DB_TESTS=1` together with `POSTGRES_HOST`, `POSTGRES_PORT` and `POSTGRES_DB`**, all three set in the environment for that run, pointing at the copy. The flag alone does nothing, and so do overrides that name the same database as `.env` (`localhost` and `127.0.0.1` count as the same server): the tests still skip, and the line at the top says why. So the flag on its own can never send the suite to the database `.env` names.
 
-The suite has 811 tests. Without a database, 726 pass and 85 skip, in about a minute. Ten files need no database at all: `test_betting_engine`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_odds_history`, `test_moneypuck`, `test_pipeline`, `test_migrate`, and `test_db_guard`; most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`, `test_odds_history`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network.
+The suite has 840 tests. Without a database, 749 pass and 91 skip, in about a minute. Nine files need no database at all: `test_betting_engine`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, and `test_db_guard`; most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`, `test_odds_history`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network.
 
 ### Running the database tests on a copy
 

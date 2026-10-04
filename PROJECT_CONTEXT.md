@@ -115,7 +115,7 @@ Layer 5: INTERFACE   → dashboard/ → Streamlit (daily slate, bankroll, CLV re
 - **Layer D — Totals:** Convolve home/away goal PMFs → total-goals distribution → price any O/U line.
 - **Layer E — Props:** Goalie saves/GAA/shutout from PMF. Skater props via Poisson regression (later phase).
 
-### Database schema (4 namespaces, 26 tables)
+### Database schema (4 namespaces, 28 tables)
 - `raw.*` — games, teams, players, rosters, shots, team_games, skater_games, goalie_games, odds_snapshots, historical_odds, starting_goalies, shifts; since 2026-09-29 also nhl_feed_snapshots, injuries, prop_odds_hist, prop_odds_fetches, prop_snapshots, and since 2026-10-04 odds_history and odds_history_fetches (created on old databases by `config/migrate.ensure_schema`)
 - `features.*` — team_rolling, goalie_rolling, matchup, game_vector
 - `models.*` — model_registry, predictions
