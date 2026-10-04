@@ -3,12 +3,14 @@ dashboard/app.py — Streamlit control room (Phase 3).
 
 Run:  .venv/bin/streamlit run dashboard/app.py
 
-Five tabs:
+Six tabs:
 - Today: pending recommendations + upcoming slate (live during the season)
 - Check a bet: a bet or parlay you enter, run through betting/checker.py
+- My bets: the bettors' real bets (singles and parlays), their results,
+  and the balance on every platform (dashboard/my_bets.py, betting/ledger.py)
 - Model: registry, walk-forward metrics, calibration plots
 - Backtest: strategy simulation on true-price (DraftKings-era) games
-- Bankroll: placed bets, PnL curve, CLV once live betting starts
+- Bankroll: the system's paper bets, PnL curve, CLV
 """
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from betting.checker import EDGE_MIN_TOTAL, Leg, evaluate_parlay
 from betting.engine import EDGE_MIN_ML
 from config.migrate import ensure_schema
 from config.settings import engine, local_today, to_local
+from dashboard import my_bets
 from features.util import american_implied_prob
 
 st.set_page_config(page_title="NHL Betting System", page_icon="🏒",
@@ -92,8 +95,9 @@ def slip_legs(slip: pd.DataFrame, games: dict) -> tuple:
     return legs, problems
 
 
-tab_today, tab_check, tab_model, tab_backtest, tab_bankroll = st.tabs(
-    ["📅 Today", "🔍 Check a bet", "🧠 Model", "🧪 Backtest", "💰 Bankroll"])
+tab_today, tab_check, tab_mine, tab_model, tab_backtest, tab_bankroll = st.tabs(
+    ["📅 Today", "🔍 Check a bet", "📒 My bets", "🧠 Model", "🧪 Backtest",
+     "💰 Bankroll"])
 
 with tab_today:
     st.subheader("Pending recommendations")
@@ -155,6 +159,7 @@ with tab_check:
                     required=True),
             },
             num_rows="dynamic", hide_index=True, key="slip")
+        st.session_state["checker_slip"] = slip     # My bets can copy these rows
         c1, c2 = st.columns(2)
         boost = c1.number_input("Boosted parlay odds (optional)", value=None,
                                 step=1, help="Only if the book offers a "
@@ -203,6 +208,12 @@ with tab_check:
                 banner(meaning)
                 for n in r["notes"]:
                     st.warning(n)
+
+with tab_mine:
+    try:
+        my_bets.render(st)
+    except Exception as e:
+        st.error(f"The bet ledger could not load: {e}")
 
 with tab_model:
     st.subheader("Model registry")
