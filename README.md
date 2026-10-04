@@ -251,7 +251,7 @@ python pipeline.py status
 
 ### Every day
 
-These runs are automatic on each machine (see [Scheduling](#scheduling)). By hand, on a new machine or to catch up:
+These runs are automatic on each machine (see [Scheduling](#scheduling)). **On the Windows PC, the NHL Setup desktop shortcut does the whole setup in one go** (`ops\windows\setup-all.bat`: the setup check, the database upgrade, a `daily` run that catches up and makes today's picks, and registering every scheduled job), and **the NHL Dashboard shortcut opens the dashboard**, starting Docker Desktop and waiting for the database first. Run `.\ops\windows\create-shortcuts.ps1` once to put both on the desktop; [ops/windows/README.md](ops/windows/README.md#desktop-shortcuts) has the details. By hand, on a new machine or to catch up:
 
 ```bash
 # Picks machine (the Mac)
@@ -312,7 +312,7 @@ On a machine that already runs the pipeline, also reinstall with `python -m pip 
 
 ## Looking at the results
 
-The dashboard shows pending picks and the next few days' games with start times in your local time, the bettors' real bets and balances (My bets), the model registry, the backtest, and the paper bankroll.
+The dashboard shows pending picks and the next few days' games with start times in your local time, the bettors' real bets and balances (My bets), the model registry, the backtest, and the paper bankroll. On Windows, open it with the **NHL Dashboard** desktop shortcut ([ops/windows/](ops/windows/README.md#desktop-shortcuts)) instead of `.venv\Scripts\streamlit run dashboard\app.py`.
 
 The **📅 Today** tab ([dashboard/today.py](dashboard/today.py)) has three parts:
 
@@ -507,7 +507,7 @@ Templates for five agents are in [ops/launchd/](ops/launchd/), with install step
 
 The Mac runs every job, so it installs the two props agents too; the free steps (NHL feed, power-play stats, injuries) run inside `daily`, `odds` and `close`, so it needs no `refresh` job.
 
-**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all`, the Windows PC's setup, registers `daily` at 9:00, `close --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details.
+**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all`, the Windows PC's setup, registers `daily` at 9:00, `close --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details. `ops\windows\setup-all.bat` (the **NHL Setup** desktop shortcut) runs it with `-Role all -IncludeOdds` as its last step.
 
 ## Tests
 
@@ -581,7 +581,8 @@ dashboard/app.py       Streamlit control room: Today, Check a bet, My bets, Mode
 dashboard/my_bets.py   The My bets tab: record real bets and parlays, results, balances
 dashboard/today.py     The Today tab: pending picks, stake limits in use, prices by book
 ops/launchd/           launchd job templates for the Mac: daily, odds, close, props, props-due
-ops/windows/           Task Scheduler registration script for Windows: -Role all, picks or props
+ops/windows/           Windows: Task Scheduler registration (-Role all, picks or props), the one-step setup
+                       (setup-all.bat), the dashboard launcher (open-dashboard.bat) and the desktop shortcuts
 pipeline.py            Master command-line entry point
 tests/                 Test suite; conftest.py keeps it off the live database; fixtures/ holds trimmed API responses
 PROJECT_CONTEXT.md     Locked decisions, status, and lessons learned

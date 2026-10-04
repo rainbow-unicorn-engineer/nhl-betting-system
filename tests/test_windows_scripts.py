@@ -35,3 +35,55 @@ def test_register_tasks_finds_the_repo_in_windows_powershell(tmp_path):
     assert out.returncode != 0
     assert "Python not found" in err, err
     assert "empty string" not in err
+
+
+BATS = ("open-dashboard.bat", "setup-all.bat", "start-db.bat")
+
+
+@pytest.mark.parametrize("name", BATS)
+def test_batch_files_use_windows_line_endings(name):
+    """cmd.exe can misread labels (goto) in a batch file with bare LF
+    line endings; .gitattributes keeps them CRLF on every checkout."""
+    data = (WIN / name).read_bytes()
+    assert b"\r\n" in data and b"\n" not in data.replace(b"\r\n", b"")
+
+
+def test_setup_all_runs_the_steps_in_order():
+    text = (WIN / "setup-all.bat").read_text()
+    steps = ['call "%~dp0start-db.bat"', '"%PY%" pipeline.py setup',
+             '"%PY%" -m config.migrate', '"%PY%" pipeline.py daily',
+             'register-tasks.ps1" -Role all -IncludeOdds']
+    at = [text.index(s) for s in steps]
+    assert at == sorted(at)
+    # every step stops the script on failure
+    assert text.count("if errorlevel 1 goto failed") == len(steps)
+
+
+def test_open_dashboard_waits_for_the_database_and_stays_local():
+    text = (WIN / "open-dashboard.bat").read_text()
+    assert 'call "%~dp0start-db.bat"' in text
+    assert "-m streamlit run dashboard" + chr(92) + "app.py" in text
+    assert "--server.address localhost" in text      # not the whole network
+    assert text.index("start-db.bat") < text.index("streamlit run")
+
+
+def test_shortcut_targets_exist():
+    text = (WIN / "create-shortcuts.ps1").read_text()
+    for name in ("open-dashboard.bat", "setup-all.bat", "nhl-dashboard.ico",
+                 "nhl-setup.ico"):
+        assert f"'{name}'" in text
+        assert (WIN / name).exists()
+
+
+@on_windows
+def test_create_shortcuts(tmp_path):
+    out = _ps("create-shortcuts.ps1", "-Desktop", str(tmp_path))
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["NHL Dashboard.lnk",
+                                                           "NHL Setup.lnk"]
+    # read one back through the Windows shell
+    check = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"(New-Object -ComObject WScript.Shell).CreateShortcut('{tmp_path / 'NHL Dashboard.lnk'}')"
+         ".TargetPath"], capture_output=True, text=True, timeout=60)
+    assert check.stdout.strip().lower() == str(WIN / "open-dashboard.bat").lower()

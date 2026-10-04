@@ -1,3 +1,34 @@
+# Windows: desktop shortcuts, one-step setup, scheduled jobs
+
+## Desktop shortcuts
+
+Run this once from the repo folder in PowerShell:
+
+```powershell
+.\ops\windows\create-shortcuts.ps1
+```
+
+It puts two shortcuts on the desktop (running it again replaces them, for example after moving the repo):
+
+| Shortcut | Runs | What it does |
+|---|---|---|
+| **NHL Dashboard** | `open-dashboard.bat` | Starts Docker Desktop if it isn't running, waits for the database, starts the dashboard and opens http://localhost:8501 in your browser. If the dashboard is already running, it just opens the browser. Keep its window open while you use the dashboard; closing the window stops it. The dashboard is reachable from this PC only, not from other computers on the network |
+| **NHL Setup** | `setup-all.bat` | The whole setup in one go, below |
+
+Docker Desktop → the app that runs the database's container (a small self-contained Linux box) on Windows. `start-db.bat` is the shared first step of both: it starts Docker Desktop (installed for all users or just for you), starts the `nhl_betting_db` container if it is stopped (or creates it with `docker compose up -d`), and waits until the database accepts a connection with the settings in `.env`. Each waits at most a few minutes and says what to check if it gives up. To use a Python other than the repo's `.venv`, set `NHL_PYTHON` to its `python.exe` first.
+
+## One-step setup (NHL Setup)
+
+`setup-all.bat` prints a heading before each step and stops at the first one that fails, saying which:
+
+1. Docker Desktop and the database (`start-db.bat`).
+2. `python pipeline.py setup`: checks the database, nhlpy and the Odds API key, and seeds the arena locations on a new database.
+3. `python -m config.migrate`: adds any tables and columns the database is missing.
+4. `python pipeline.py daily`: catches up every game since the last run, settles finished bets, and makes today's picks. It can take several minutes and spends about 3 Odds API credits.
+5. `register-tasks.ps1 -Role all -IncludeOdds`: registers the scheduled jobs below, so from then on everything runs by itself while you are logged on.
+
+Every step is safe to repeat, so after fixing a problem just run NHL Setup again. Nothing runs it automatically.
+
 # Windows Task Scheduler jobs
 
 Task Scheduler is the job scheduler built into Windows. `register-tasks.ps1` registers the tasks for one **machine role** in a Task Scheduler folder named `\NHLBetting\`. `-Role` is required.
