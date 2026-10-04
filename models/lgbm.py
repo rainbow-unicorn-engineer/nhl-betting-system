@@ -182,8 +182,11 @@ def score_production(prod: dict, X_new: np.ndarray, names_new: list) -> np.ndarr
     return predict_fold(prod["fm"], X_new, base, avail)
 
 
-def run_lgbm(register: bool = True) -> dict:
-    """Full walk-forward run of LightGBM + isotonic. Returns metrics."""
+def run_lgbm(register: bool = True, plot: bool = True) -> dict:
+    """Full walk-forward run of LightGBM + isotonic. Returns metrics.
+    register=False writes nothing to the database; plot=False also leaves
+    the committed calibration plot alone (betting/montecarlo.py uses both,
+    so its run changes nothing)."""
     from sklearn.metrics import (accuracy_score, brier_score_loss, log_loss,
                                  roc_auc_score)
 
@@ -260,8 +263,9 @@ def run_lgbm(register: bool = True) -> dict:
         f"{'PASSED' if pooled['gate_passed'] else 'FAILED'}")
 
     artifact = ARTIFACT_DIR / "lgbm_calibration.png"
-    calibration_plot(ys, ps, artifact)
-    logger.info(f"Calibration plot saved to {artifact}")
+    if plot:
+        calibration_plot(ys, ps, artifact)
+        logger.info(f"Calibration plot saved to {artifact}")
 
     if register:
         _register(pooled, meta, names, str(artifact))
