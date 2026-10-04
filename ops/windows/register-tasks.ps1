@@ -104,7 +104,9 @@ param(
         HelpMessage = "all = every job; picks = moneyline picks and closes (daily, close --due, optional odds); props = player-props lines (refresh, props, props --due)")]
     [ValidateSet("all", "picks", "props")]
     [string]$Role,
-    [string]$RepoPath = (Join-Path $PSScriptRoot "..\.."),
+    # Resolved below: Windows PowerShell 5.1 leaves $PSScriptRoot empty in
+    # an advanced script's parameter defaults
+    [string]$RepoPath = "",
     [string]$PythonPath = "",
     [Parameter(ParameterSetName = "Register")]
     [switch]$IncludeOdds,
@@ -147,6 +149,9 @@ if ($IncludeOdds -and -not $DoesPicks) {
     throw "-IncludeOdds adds the midday moneyline odds run, which belongs to -Role all or picks. The props role makes no picks."
 }
 
+if (-not $RepoPath) {
+    $RepoPath = Join-Path $PSScriptRoot "..\.."
+}
 $RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
 if (-not $PythonPath) {
     $PythonPath = Join-Path $RepoPath ".venv\Scripts\python.exe"
