@@ -87,3 +87,18 @@ def test_create_shortcuts(tmp_path):
          f"(New-Object -ComObject WScript.Shell).CreateShortcut('{tmp_path / 'NHL Dashboard.lnk'}')"
          ".TargetPath"], capture_output=True, text=True, timeout=60)
     assert check.stdout.strip().lower() == str(WIN / "open-dashboard.bat").lower()
+
+
+def test_news_task_is_scheduled_every_15_minutes_for_picks_and_all():
+    """register-tasks.ps1: the news monitor runs as `news --due` on the
+    quarter-hour trigger, in the picks and all roles, never in props."""
+    import re
+    text = (WIN / "register-tasks.ps1").read_text(encoding="utf-8")
+    roles = dict(re.findall(r'"(\w+)"\s*=\s*@\(([^)]*)\)', text))
+    assert '"news"' in roles["picks"] and '"news"' in roles["all"]
+    assert '"news"' not in roles["props"]
+    m = re.search(r'Register-PipelineTask "news" \(New-QuarterHourTrigger\) `\s*'
+                  r'\(New-PipelineAction "news --due" "news"\)', text)
+    assert m, "news task not registered on the 15-minute trigger"
+    # registered inside the picks block, before the props-only else branch
+    assert text.index('Register-PipelineTask "news"') < text.index('Register-PipelineTask "refresh"')

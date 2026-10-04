@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE: the news monitor, `python pipeline.py news` with its due flag
+  (see ProgramArguments), every 15 minutes. XML comments cannot hold a
+  double hyphen, so the flag is not spelled out here.
+  On a game day, from 8:00 local time (NEWS_START_HOUR) until the day's
+  last puck drop, a run refreshes Daily Faceoff's starting goalies and line
+  combinations and ESPN's injury list, records what changed in
+  raw.news_events, and re-scores a game whose starting goalie changed or
+  was confirmed when it has no pick yet. It makes no Odds API request, so
+  it costs no credits. Every other run logs one line and exits.
+
+  Replace __REPO__ with the repo's absolute path and __PYTHON__ with the
+  virtual environment's Python (usually __REPO__/.venv/bin/python), then
+  install it as ops/launchd/README.md describes. Nothing installs this file
+  automatically.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nhlbetting.news</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/pipeline.py</string>
+        <string>news</string>
+        <string>--due</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- Every 900 seconds (15 minutes) while the Mac is awake -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- The logs/ folder must exist before the job first runs; git ignores it -->
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/news.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/news.log</string>
+</dict>
+</plist>
