@@ -307,6 +307,19 @@ class TestRunFetch:
         report, saved = self.run(_plan(1), _Getter(empty, last=0), oh.Budget(max_credits=20))
         assert report.credits == 0 and saved[0][1]["status"] == "empty"
 
+    def test_a_200_without_timestamp_is_an_error_and_retried(self, body):
+        broken = {"data": body["data"]}                  # no timestamp at all
+        done = []
+        report, saved = self.run(_plan(1), _Getter(broken), oh.Budget(max_credits=100), done)
+        ((rows, fetch),) = saved
+        assert fetch["status"] == "error" and rows == [] and fetch["credits"] == 20
+        assert report.errors == 1 and done == []
+        assert oh.covering_fetches([fetch], "h2h,totals", BOOKS) == []
+        # the next run asks again
+        getter = _Getter(body)
+        report2, saved2 = self.run(_plan(1), getter, oh.Budget(max_credits=100), done)
+        assert report2.calls == 1 and saved2[0][1]["status"] == "ok"
+
     def test_limit_and_raw_copy(self, body, tmp_path):
         report, _ = self.run(_plan(3), _Getter(body), oh.Budget(max_credits=1000),
                              limit=1, raw_dir=tmp_path)

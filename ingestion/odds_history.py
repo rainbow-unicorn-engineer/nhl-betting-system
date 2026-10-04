@@ -769,13 +769,17 @@ def find_raw(raw_dir: Path, stem: str) -> Optional[Path]:
 def parse_body(body: dict, requested: datetime, games: List[dict]) -> Tuple[List[dict], dict, dict]:
     """(rows, fetch-log fields, stats) for one paid response: the rows for
     raw.odds_history and the snapshot_ts, next_ts, n_events, n_rows and
-    status to log. Used by a fetch and by `reparse` on a raw copy."""
+    status to log. Used by a fetch and by `reparse` on a raw copy.
+
+    Status: ok (events listed), empty (a snapshot with no events), or error
+    when the response has no snapshot `timestamp`: that is not a snapshot
+    at all, so it is not counted as bought and a later run retries it."""
     snap = parse_commence(body.get("timestamp"))
     rows, stats = parse_snapshot(body, requested, _candidates(games, snap) if snap else [])
+    status = "error" if snap is None else "ok" if body.get("data") else "empty"
     update = {"snapshot_ts": _naive(snap),
               "next_ts": _naive(parse_commence(body.get("next_timestamp"))),
-              "n_events": stats["events"], "n_rows": len(rows),
-              "status": "ok" if body.get("data") else "empty"}
+              "n_events": stats["events"], "n_rows": len(rows), "status": status}
     return rows, update, stats
 
 
@@ -850,6 +854,12 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
                              "further call is bought without being logged")
                 raise
             done.append(fetch)
+            continue
+        if fetch["status"] == "error":
+            report.errors += 1
+            logger.error(f"{p.purpose} {p.season} {iso_z(p.requested_ts)}: the response has "
+                         f"no snapshot timestamp; logged as error ({charged} credits), "
+                         f"to be retried")
             continue
         done.append(fetch)
         report.rows += len(rows)
