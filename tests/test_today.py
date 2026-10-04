@@ -149,6 +149,15 @@ class TestLimits:
         assert got == {"Per bet": "2% ($20)", "Per day": "10% ($100)",
                        "Per game": "4% ($40)", "Bets per game": "3"}
 
+    def test_a_fractional_limit_is_shown_as_set(self, monkeypatch):
+        """MAX_STAKE_PCT=0.025 must read 2.5%, not a rounded 2%."""
+        from betting import engine
+        monkeypatch.setattr(engine, "MAX_STAKE_PCT", 0.025)
+        monkeypatch.setattr(engine, "MAX_GAME_STAKE_PCT", 0.0333)
+        got = {label: value for label, value, _ in limits_in_use(150)}
+        assert got["Per bet"] == "2.5% ($3.75)"
+        assert got["Per game"] == "3.33% ($5)"
+
 
 def _tab_script():
     """Rendered by AppTest: the Today tab on canned query results."""

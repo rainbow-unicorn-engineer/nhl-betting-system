@@ -316,7 +316,9 @@ def picks_table(recs: pd.DataFrame) -> pd.DataFrame:
 def limits_in_use(bankroll: float) -> List[Tuple[str, str, str]]:
     """(label, value, plain-English help) for each stake limit in use."""
     def share(pct):
-        return f"{pct:.0%} (${bankroll * pct:,.0f})"
+        amount = round(bankroll * pct, 2)
+        money = f"${amount:,.0f}" if amount == int(amount) else f"${amount:,.2f}"
+        return f"{limits.pct_text(pct)} ({money})"
     return [
         ("Per bet", share(limits.MAX_STAKE_PCT),
          "The most on any one bet (MAX_STAKE_PCT). Default 2%."),

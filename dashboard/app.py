@@ -21,7 +21,7 @@ import streamlit as st
 from sqlalchemy import text
 
 from betting.checker import EDGE_MIN_TOTAL, Leg, evaluate_parlay
-from betting.engine import EDGE_MIN_ML, MAX_STAKE_PCT
+from betting.engine import EDGE_MIN_ML, MAX_STAKE_PCT, pct_text
 from config.migrate import ensure_schema
 from config.settings import engine, local_today
 from dashboard import my_bets, today
@@ -176,7 +176,7 @@ with tab_check:
                                 else f"{stake:.2%} of bankroll",
                                 help="A quarter of the Kelly-formula bet "
                                      "size, capped at "
-                                     f"{MAX_STAKE_PCT:.0%} of bankroll "
+                                     f"{pct_text(MAX_STAKE_PCT)} of bankroll "
                                      "(MAX_STAKE_PCT)")
                 banner, meaning = VERDICTS[r["verdict"]]
                 banner(meaning)

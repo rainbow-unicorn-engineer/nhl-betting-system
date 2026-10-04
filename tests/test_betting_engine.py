@@ -161,3 +161,12 @@ class TestCapWarnings:
         assert len(w) == 2
         assert "MAX_DAILY_PCT (4%)" in w[0] and "skipped" in w[0]
         assert "MAX_GAME_STAKE_PCT (3%)" in w[1]
+
+    def test_fractional_limits_are_not_rounded_away(self):
+        from betting.engine import game_cap_reason, pct_text
+        assert [pct_text(x) for x in (0.02, 0.025, 0.1, 0.07, 1 / 3, 1.0)] == [
+            "2%", "2.5%", "10%", "7%", "33.33%", "100%"]
+        w = cap_warnings(0.025, 0.02, 0.015)
+        assert "MAX_STAKE_PCT (2.5%)" in w[0] and "MAX_GAME_STAKE_PCT (1.5%)" in w[1]
+        why = game_cap_reason(30, 0, 0, 1000, max_bets=3, max_game_stake_pct=0.025)
+        assert "(2.5% of bankroll)" in why

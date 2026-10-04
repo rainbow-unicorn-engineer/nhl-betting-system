@@ -94,6 +94,12 @@ MAX_GAME_STAKE_PCT = fraction_setting("MAX_GAME_STAKE_PCT",
                                       DEFAULT_MAX_GAME_STAKE_PCT)
 
 
+def pct_text(share: float) -> str:
+    """A share as a percentage with no rounding a reader could mistake for
+    another setting: 0.02 -> '2%', 0.025 -> '2.5%', 1/3 -> '33.33%'."""
+    return f"{round(share * 100, 2):g}%"
+
+
 def cap_warnings(stake_pct: float = None, daily_pct: float = None,
                  game_pct: float = None) -> List[str]:
     """Plain-English warnings for limits that contradict each other (the
@@ -105,12 +111,12 @@ def cap_warnings(stake_pct: float = None, daily_pct: float = None,
     game_pct = MAX_GAME_STAKE_PCT if game_pct is None else game_pct
     out = []
     if stake_pct > daily_pct:
-        out.append(f"MAX_STAKE_PCT ({stake_pct:.0%}) is above MAX_DAILY_PCT "
-                   f"({daily_pct:.0%}): a bet bigger than the day's limit is "
+        out.append(f"MAX_STAKE_PCT ({pct_text(stake_pct)}) is above MAX_DAILY_PCT "
+                   f"({pct_text(daily_pct)}): a bet bigger than the day's limit is "
                    f"skipped, not made smaller.")
     if stake_pct > game_pct:
-        out.append(f"MAX_STAKE_PCT ({stake_pct:.0%}) is above "
-                   f"MAX_GAME_STAKE_PCT ({game_pct:.0%}): a bet bigger than "
+        out.append(f"MAX_STAKE_PCT ({pct_text(stake_pct)}) is above "
+                   f"MAX_GAME_STAKE_PCT ({pct_text(game_pct)}): a bet bigger than "
                    f"the per-game limit is skipped, not made smaller.")
     return out
 
@@ -206,7 +212,7 @@ def game_cap_reason(stake: float, bets_on_game: int, staked_on_game: float,
     if staked_on_game + stake > limit + 1e-9:     # 1e-9: float noise only
         return (f"per-game stake limit: {staked_on_game:.2f} already on this "
                 f"game + {stake:.2f} would pass {limit:.2f} "
-                f"({max_game_stake_pct:.0%} of bankroll)")
+                f"({pct_text(max_game_stake_pct)} of bankroll)")
     return None
 
 
