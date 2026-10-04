@@ -15,6 +15,7 @@ prints that command's options and runs nothing):
     python pipeline.py props [--due]                # Player-props snapshot (the props machine)
     python pipeline.py nhl-odds                     # Free snapshot of the NHL's own odds feed
     python pipeline.py compare-feeds [--date D]     # NHL feed vs The Odds API, stored prices
+    python pipeline.py settle                       # Settle paper picks + the bettors' recorded bets
     python pipeline.py injuries                     # ESPN injury list snapshot (free)
     python pipeline.py nhl-stats [--season S]       # Power-play, penalty-kill, faceoff stats (free)
 
@@ -159,6 +160,17 @@ def settle():
         settle_paper()
     except Exception as e:
         logger.error(f"Paper settlement failed (non-fatal): {e}")
+
+
+def settle_ledger():
+    """Settle the bet ledger's open slips (real bets recorded on the
+    dashboard's My bets tab) from final scores and box scores
+    (non-fatal)."""
+    try:
+        from betting.ledger import settle_slips
+        settle_slips()
+    except Exception as e:
+        logger.error(f"Bet-ledger settlement failed (non-fatal): {e}")
 
 
 def recommend():
@@ -325,6 +337,7 @@ def daily():
     # full-history inside the build)
     features(season=CURRENT_SEASON)
     settle()        # yesterday's finals + closing snapshots are in
+    settle_ledger() # the bettors' recorded bets, from the same finals and box scores
     starters()
     injuries()      # ESPN keeps no history: save today's list before picks
     recommend()
@@ -432,7 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "moneyline snapshot is under CLOSE_MIN_GAP_MINUTES (16) old")
     add("recommend", "Score today's slate into betting.recommendations")
     add("starters", "Starting goalies from Daily Faceoff")
-    add("settle", "Settle paper bets and rebuild the bankroll and CLV ledger")
+    add("settle", "Settle paper bets and rebuild the bankroll and CLV ledger, "
+                  "then settle the bettors' recorded bets (the bet ledger)")
     add("refresh", "The props machine's daily run: schedule and box scores, "
                    "power-play stats, ESPN injuries. No odds request, no picks")
     p = add("props", "Player-props snapshot from The Odds API into "
@@ -497,6 +511,7 @@ def main(argv=None) -> int:
         starters()
     elif cmd == "settle":
         settle()
+        settle_ledger()
     elif cmd == "refresh":
         refresh()
     elif cmd == "props":

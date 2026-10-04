@@ -128,7 +128,7 @@ def _record_chain(monkeypatch, calls):
                         lambda season: calls.append("espn_lines"))
     monkeypatch.setattr(moneypuck, "refresh_season", lambda season: calls.append("moneypuck"))
     monkeypatch.setattr(pipeline, "features", lambda season=None: calls.append("features"))
-    for step in ("settle", "starters", "recommend", "injuries"):
+    for step in ("settle", "settle_ledger", "starters", "recommend", "injuries"):
         monkeypatch.setattr(pipeline, step, lambda step=step: calls.append(step))
     monkeypatch.setattr(pipeline, "nhl_feed", lambda **kw: calls.append("nhl_feed"))
     monkeypatch.setattr(pipeline, "nhl_stats",
@@ -142,8 +142,8 @@ def test_daily_adds_the_free_feeds_in_order(monkeypatch):
     _record_chain(monkeypatch, calls)
     pipeline.daily()
     assert calls == ["daily_refresh", ("snapshot_odds", {}), "nhl_feed", "espn_lines",
-                     "nhl_stats", "moneypuck", "features", "settle", "starters",
-                     "injuries", "recommend"]
+                     "nhl_stats", "moneypuck", "features", "settle", "settle_ledger",
+                     "starters", "injuries", "recommend"]
 
 
 def test_odds_pairs_its_snapshot_with_a_free_nhl_feed_snapshot(monkeypatch):
@@ -184,6 +184,25 @@ def test_new_steps_are_non_fatal(monkeypatch):
     pipeline.nhl_stats()
     pipeline.nhl_stats(20252026)
     pipeline.props(due=True)
+
+
+def test_ledger_settlement_is_non_fatal(monkeypatch, caplog):
+    from betting import ledger
+
+    def boom():
+        raise RuntimeError("database gone")
+    monkeypatch.setattr(ledger, "settle_slips", boom)
+    pipeline.settle_ledger()
+    assert "Bet-ledger settlement failed (non-fatal)" in caplog.text
+
+
+def test_settle_command_settles_paper_picks_then_the_ledger(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pipeline, "db_ready", lambda: True)
+    monkeypatch.setattr(pipeline, "settle", lambda: calls.append("settle"))
+    monkeypatch.setattr(pipeline, "settle_ledger", lambda: calls.append("ledger"))
+    assert pipeline.main(["settle"]) == 0
+    assert calls == ["settle", "ledger"]
 
 
 def test_nhl_feed_skips_when_idle_by_default(monkeypatch):
