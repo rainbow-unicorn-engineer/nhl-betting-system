@@ -726,10 +726,15 @@ def write_recommendations(recs: list, slate_game_ids: list, slate_date=None,
 
 def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
                              edge_min: float = None, dry_run: bool = False,
-                             simulate: bool = False) -> pd.DataFrame:
+                             simulate: bool = False,
+                             only_games=None) -> pd.DataFrame:
     """Score the slate, decide bets through the engine, persist. Returns
     the frame of NEW recommendations (possibly empty); games that already
-    have a pick keep it and are not re-decided."""
+    have a pick keep it and are not re-decided.
+    only_games: when given (a set of game ids, possibly empty), every
+    slate game is still scored and its prediction written, but only these
+    games may get a new pick. The news monitor (betting/news.py) passes
+    the games whose stored price it could confirm is still the market's."""
     ensure_schema()
     target_date = target_date or local_today()
     if edge_min is None:
@@ -773,10 +778,17 @@ def generate_recommendations(target_date=None, bankroll: float = BANKROLL,
     def _price(p):
         return None if p is None or pd.isna(p) else p
 
+    if only_games is not None:
+        only_games = {int(g) for g in only_games}
+        logger.info(f"Only {len(only_games)} game(s) may get a new pick this "
+                    f"run: " + (", ".join(map(str, sorted(only_games))) or "none"))
+
     candidates = []
     for g in merged.itertuples():
         if pd.isna(g.fair_home_prob):
             continue                      # no line -> never bet
+        if only_games is not None and int(g.game_id) not in only_games:
+            continue
         d = evaluate_market(g.prob_home, g.fair_home_prob,
                             _price(g.home_price), _price(g.away_price),
                             edge_min)
