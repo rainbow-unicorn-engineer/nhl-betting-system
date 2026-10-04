@@ -478,6 +478,63 @@ class TestPaidUnparsed:
         assert update["snapshot_ts"] == saved[0][1]["snapshot_ts"]
 
 
+class TestRematch:
+    GAMES = TestParseSnapshot.GAMES
+
+    def ev(self, event_id, home, away, commence):
+        return {"event_id": event_id, "home_name": home, "away_name": away,
+                "commence_time": commence}
+
+    def test_matches_by_home_team_and_start(self):
+        events = [
+            # naive UTC, as stored; the API's 17:10 vs the NHL's 17:00
+            self.ev("a", "Buffalo Sabres", "New Jersey Devils", dt.datetime(2024, 10, 4, 17, 10)),
+            self.ev("b", "New Jersey Devils", "Buffalo Sabres", t("2024-10-05T15:05")),
+            self.ev("c", "Montréal Canadiens", "Toronto Maple Leafs", t("2024-10-09T23:00")),
+        ]
+        assert oh.rematch_pairs(events, self.GAMES) == {
+            "a": 2024020001, "b": 2024020002, "c": 2024020010}
+
+    def test_leaves_out_what_cannot_match(self):
+        events = [
+            self.ev("no_time", "Buffalo Sabres", "New Jersey Devils", None),
+            self.ev("unknown", "Quebec Nordiques", "Buffalo Sabres", t("2024-10-04T17:00")),
+            self.ev("too_far", "Buffalo Sabres", "New Jersey Devils", t("2024-10-05T01:00")),
+            self.ev("wrong_home", "New Jersey Devils", "Buffalo Sabres", t("2024-10-04T17:00")),
+        ]
+        assert oh.rematch_pairs(events, self.GAMES) == {}
+
+    def test_a_game_without_a_start_time_is_not_a_candidate(self):
+        games = [g(7, None, date=dt.date(2024, 10, 4), home="BUF", away="NJD")]
+        events = [self.ev("a", "Buffalo Sabres", "New Jersey Devils", t("2024-10-04T17:00"))]
+        assert oh.rematch_pairs(events, games) == {}
+
+    def test_season_of(self):
+        assert oh.season_of(dt.datetime(2024, 10, 4)) == 20242025
+        assert oh.season_of(dt.datetime(2025, 6, 20)) == 20242025
+        assert oh.season_of(dt.datetime(2025, 8, 1)) == 20252026
+
+
+class TestCollectStartTimes:
+    def test_one_call_per_week_from_first_to_last_date(self):
+        asked = []
+
+        def week(d):
+            asked.append(d)
+            if d == "2030-10-17":
+                raise ConnectionError("schedule down")      # skipped, not fatal
+            return {"gameWeek": [{"games": [
+                {"id": 2030020001, "startTimeUTC": "2030-10-10T23:00:00Z"},
+                {"id": 2030020002, "startTimeUTC": None},          # no time: left out
+                {"startTimeUTC": "2030-10-11T23:00:00Z"},          # no id: left out
+            ]}]}
+
+        found = oh.collect_start_times(dt.date(2030, 10, 10), dt.date(2030, 10, 24), week,
+                                       pause=0)
+        assert asked == ["2030-10-10", "2030-10-17", "2030-10-24"]
+        assert found == {2030020001: t("2030-10-10T23:00")}
+
+
 # ── Start-time fill and HTTP ──────────────────────────────────────
 
 def test_int_header_is_case_blind():
@@ -658,3 +715,89 @@ class TestOnDatabase:
         with engine.connect() as conn:
             assert conn.execute(text("SELECT COUNT(*) FROM raw.odds_history "
                                      "WHERE event_id LIKE 'dbtest-%'")).scalar() == 36
+
+    def _row(self, side, price, event="dbtest-e1"):
+        return {"snapshot_ts": dt.datetime(2031, 10, 4, 16, 45, 39),
+                "requested_ts": dt.datetime(2031, 10, 4, 16, 50), "event_id": event,
+                "game_id": None, "commence_time": dt.datetime(2031, 10, 4, 17, 10),
+                "home_name": "Buffalo Sabres", "away_name": "New Jersey Devils",
+                "book": "pinnacle", "market": "h2h", "side": side, "price": price,
+                "point": None, "book_updated_at": None}
+
+    def _fetch(self):
+        return {"requested_ts": dt.datetime(2031, 10, 4, 16, 50), "purpose": "dbtest",
+                "season": DB_SEASON, "markets": "h2h", "bookmakers": "pinnacle",
+                "snapshot_ts": dt.datetime(2031, 10, 4, 16, 45, 39), "next_ts": None,
+                "credits": 10, "n_events": 1, "n_rows": 2, "status": "ok"}
+
+    def test_store_is_idempotent_on_rows(self, db_clean):
+        rows = [self._row("home", 120), self._row("away", -140)]
+        oh.store(rows, self._fetch())
+        # the same snapshot again, one price changed: the first stored row wins
+        oh.store([self._row("home", 999), self._row("away", -140)], self._fetch())
+        with engine.connect() as conn:
+            got = conn.execute(text("""
+                SELECT side, price FROM raw.odds_history
+                WHERE event_id = 'dbtest-e1' ORDER BY side""")).all()
+            logged = conn.execute(text("SELECT COUNT(*) FROM raw.odds_history_fetches "
+                                       "WHERE purpose = 'dbtest'")).scalar()
+        assert [tuple(r) for r in got] == [("away", -140), ("home", 120)]
+        assert logged == 2                  # every call is logged, even a repeat
+
+    def test_store_rolls_back_rows_when_the_log_fails(self, db_clean):
+        bad = dict(self._fetch(), status=None)          # NOT NULL: the log insert fails
+        with pytest.raises(Exception):
+            oh.store([self._row("home", 120)], bad)
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM raw.odds_history "
+                                     "WHERE event_id = 'dbtest-e1'")).scalar() == 0
+
+    def test_fill_start_times_writes_only_null_starts_in_the_season(self, db_clean):
+        other = DB_SEASON + 10001
+        set_before = dt.datetime(2030, 10, 12, 0, 0, tzinfo=UTC)
+        with engine.begin() as conn:
+            for gid, season, day, start in (
+                    (9999030001, DB_SEASON, "2030-10-10", None),
+                    (9999030002, DB_SEASON, "2030-10-20", None),
+                    (9999030003, DB_SEASON, "2030-10-11", set_before),
+                    (9999030004, other, "2031-10-10", None)):
+                conn.execute(text("""
+                    INSERT INTO raw.games (game_id, season, game_type, date, start_time_utc,
+                                           home_team, away_team)
+                    VALUES (:g, :s, 2, :d, :t, 'BUF', 'MTL')
+                """), {"g": gid, "s": season, "d": day, "t": start})
+        asked = []
+
+        def week(d):
+            asked.append(d)
+            return {"gameWeek": [{"games": [
+                {"id": gid, "startTimeUTC": "2030-10-15T23:30:00Z"}
+                for gid in (9999030001, 9999030002, 9999030003, 9999030004, 9999030099)]}]}
+
+        assert oh.fill_start_times(DB_SEASON, fetch_week=week, pause=0) == 2
+        assert asked == ["2030-10-10", "2030-10-17"]
+        with engine.connect() as conn:
+            got = dict(conn.execute(text("""
+                SELECT game_id, start_time_utc FROM raw.games
+                WHERE game_id BETWEEN 9999030001 AND 9999030004""")).all())
+        filled = dt.datetime(2030, 10, 15, 23, 30, tzinfo=UTC)
+        assert got[9999030001] == filled and got[9999030002] == filled
+        assert got[9999030003] == set_before            # already set: untouched
+        assert got[9999030004] is None                  # another season: untouched
+        # nothing left to fill: no schedule call at all
+        assert oh.fill_start_times(DB_SEASON, fetch_week=week, pause=0) == 0
+        assert len(asked) == 2
+
+    def test_rematch_links_rows_once_the_game_exists(self, db_clean):
+        oh.store([self._row("home", 120), self._row("away", -140)], self._fetch())
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO raw.games (game_id, season, game_type, date, start_time_utc,
+                                       home_team, away_team)
+                VALUES (9999030005, :s, 2, '2031-10-04', '2031-10-04 17:00+00', 'BUF', 'NJD')
+            """), {"s": DB_SEASON + 10001})
+        assert oh.rematch_unmatched() >= 2
+        with engine.connect() as conn:
+            ids = {r[0] for r in conn.execute(text(
+                "SELECT game_id FROM raw.odds_history WHERE event_id = 'dbtest-e1'"))}
+        assert ids == {9999030005}

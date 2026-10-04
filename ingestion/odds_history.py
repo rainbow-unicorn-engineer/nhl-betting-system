@@ -513,10 +513,37 @@ def store(rows: List[dict], fetch: dict, db=None) -> None:
         conn.execute(INSERT_FETCH, fetch)
 
 
+def season_of(t: datetime) -> int:
+    """The NHL season a moment falls in: August onwards starts a season
+    (2024-10-04 -> 20242025, 2025-03-01 -> 20242025)."""
+    y = t.year if t.month >= 8 else t.year - 1
+    return y * 10000 + y + 1
+
+
+def rematch_pairs(events: Iterable[dict], games: List[dict]) -> Dict[str, int]:
+    """{event_id: game_id} for stored events that had no game, by the same
+    rule as a fetch (home team, start within 6 hours). events: dicts with
+    event_id, home_name, away_name, commence_time (naive UTC or aware);
+    games: as load_games returns. Pure. Events with no commence_time, an
+    unknown team or no game in reach are left out."""
+    out: Dict[str, int] = {}
+    for e in events:
+        commence = _aware(e.get("commence_time"))
+        if commence is None:
+            continue
+        ev = {"home_team": e.get("home_name") or "", "away_team": e.get("away_name") or "",
+              "commence_time": iso_z(commence)}
+        game_id, _ = match_event(ev, _candidates(games, commence),
+                                 commence - timedelta(seconds=1))
+        if game_id:
+            out[e["event_id"]] = game_id
+    return out
+
+
 def rematch_unmatched(db=None) -> int:
-    """Give stored rows with no game_id one, by the same rule as a fetch
-    (home team, start within 6 hours): for events bought before their game
-    was in raw.games or had a start time. Returns the rows updated."""
+    """Give stored rows with no game_id one (rematch_pairs): for events
+    bought before their game was in raw.games or had a start time.
+    Returns the rows updated."""
     db = db or engine
     with db.connect() as conn:
         events = [dict(r) for r in conn.execute(text("""
@@ -525,27 +552,15 @@ def rematch_unmatched(db=None) -> int:
         """)).mappings()]
     if not events:
         return 0
-    seasons = set()
-    for e in events:
-        if e["commence_time"] is not None:
-            y = e["commence_time"].year if e["commence_time"].month >= 8 else e["commence_time"].year - 1
-            seasons.add(y * 10000 + y + 1)
-    games = load_games(sorted(seasons), db=db)
+    seasons = {season_of(e["commence_time"]) for e in events if e["commence_time"] is not None}
+    pairs = rematch_pairs(events, load_games(sorted(seasons), db=db))
     n = 0
     with db.begin() as conn:
-        for e in events:
-            commence = _aware(e["commence_time"])
-            if commence is None:
-                continue
-            ev = {"home_team": e["home_name"] or "", "away_team": e["away_name"] or "",
-                  "commence_time": iso_z(commence)}
-            game_id, _ = match_event(ev, _candidates(games, commence),
-                                     commence - timedelta(seconds=1))
-            if game_id:
-                n += conn.execute(text("""
-                    UPDATE raw.odds_history SET game_id = :g
-                    WHERE event_id = :e AND game_id IS NULL
-                """), {"g": game_id, "e": e["event_id"]}).rowcount or 0
+        for event_id, game_id in pairs.items():
+            n += conn.execute(text("""
+                UPDATE raw.odds_history SET game_id = :g
+                WHERE event_id = :e AND game_id IS NULL
+            """), {"g": game_id, "e": event_id}).rowcount or 0
     logger.info(f"Matched {n} stored row(s) that had no game")
     return n
 
@@ -609,23 +624,12 @@ def reparse_unparsed(raw_dir: Path = DEFAULT_RAW_DIR, db=None) -> Dict[str, int]
 
 # ── Start times for older seasons (free NHL schedule API) ────────
 
-def fill_start_times(season: int, db=None, fetch_week=None) -> int:
-    """Fill raw.games.start_time_utc where it is NULL for one season, from
-    the NHL weekly schedule (free). Only that column is written, and only
-    where empty. Returns the number of games filled."""
+def collect_start_times(lo: date, hi: date, fetch_week: Callable,
+                        pause: float = 0.3) -> Dict[int, datetime]:
+    """{game_id: puck drop (aware UTC)} from the NHL weekly schedule, one
+    fetch_week(YYYY-MM-DD) call per 7 days from lo while <= hi. A week that
+    fails is skipped with a warning."""
     from ingestion.nhl_api import _parse_start_time
-    if fetch_week is None:
-        from ingestion.nhl_api import client
-        fetch_week = lambda d: client.schedule.weekly_schedule(date=d)   # noqa: E731
-    db = db or engine
-    with db.connect() as conn:
-        lo, hi = conn.execute(text("""
-            SELECT MIN(date), MAX(date) FROM raw.games
-            WHERE season = :s AND start_time_utc IS NULL
-        """), {"s": season}).one()
-    if lo is None:
-        logger.info(f"Season {season}: every game already has a start time")
-        return 0
     found: Dict[int, datetime] = {}
     d = lo
     while d <= hi:
@@ -640,7 +644,28 @@ def fill_start_times(season: int, db=None, fetch_week=None) -> int:
                 if g.get("id") and t is not None:
                     found[int(g["id"])] = t
         d += timedelta(days=7)
-        time.sleep(0.3)
+        if pause:
+            time.sleep(pause)
+    return found
+
+
+def fill_start_times(season: int, db=None, fetch_week=None, pause: float = 0.3) -> int:
+    """Fill raw.games.start_time_utc where it is NULL for one season, from
+    the NHL weekly schedule (free). Only that column is written, and only
+    where empty and in that season. Returns the number of games filled."""
+    if fetch_week is None:
+        from ingestion.nhl_api import client
+        fetch_week = lambda d: client.schedule.weekly_schedule(date=d)   # noqa: E731
+    db = db or engine
+    with db.connect() as conn:
+        lo, hi = conn.execute(text("""
+            SELECT MIN(date), MAX(date) FROM raw.games
+            WHERE season = :s AND start_time_utc IS NULL
+        """), {"s": season}).one()
+    if lo is None:
+        logger.info(f"Season {season}: every game already has a start time")
+        return 0
+    found = collect_start_times(lo, hi, fetch_week, pause)
     with db.begin() as conn:
         n = 0
         for gid, t in found.items():
