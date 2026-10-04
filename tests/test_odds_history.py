@@ -550,6 +550,36 @@ class TestFetchStart:
         assert calls[0].remaining == 9000
 
 
+@pytest.mark.parametrize("cmd", [["plan"], ["fetch", "--max-credits", "100"]])
+def test_same_books_only_needs_explicit_steps(monkeypatch, capsys, cmd):
+    monkeypatch.setattr(oh, "ensure_tables", lambda: pytest.fail("ran without --steps"))
+    with pytest.raises(SystemExit) as exc:
+        oh.main(cmd + ["--same-books-only"])
+    assert exc.value.code == 2 and "--steps" in capsys.readouterr().err
+
+
+def test_same_books_only_with_steps_runs(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(oh, "ensure_tables", lambda: None)
+    monkeypatch.setattr(oh, "load_games", lambda seasons: seen.setdefault("seasons", seasons)
+                        and [])
+    monkeypatch.setattr(oh, "load_done",
+                        lambda m, b, same_books=False: seen.setdefault("same", same_books)
+                        and [])
+    assert oh.main(["plan", "--same-books-only", "--steps", "close:20232024"]) == 0
+    assert seen == {"seasons": [20232024], "same": True}
+
+
+def test_default_steps_without_same_books_only(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(oh, "ensure_tables", lambda: None)
+    monkeypatch.setattr(oh, "load_games", lambda seasons: seen.setdefault("seasons", seasons)
+                        and [])
+    monkeypatch.setattr(oh, "load_done", lambda *a, **k: [])
+    assert oh.main(["plan"]) == 0
+    assert seen["seasons"] == sorted({s for _, s in oh.parse_steps(oh.DEFAULT_STEPS)})
+
+
 def test_fetch_requires_a_credit_cap(monkeypatch, capsys):
     monkeypatch.setattr(oh, "ensure_tables", lambda: pytest.fail("ran without a cap"))
     with pytest.raises(SystemExit):

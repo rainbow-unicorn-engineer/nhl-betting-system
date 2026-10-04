@@ -49,7 +49,9 @@ The plan needs raw.games.start_time_utc; seasons loaded before that column
 existed have none, so `starts` fills it from the free NHL schedule API.
 
 Never bought twice: before a call, a logged fetch (holding every requested
-market, whatever its books; --same-books-only to require the same books)
+market, whatever its books; --same-books-only to require the same books,
+which re-buys snapshots bought with other books and so needs explicit
+--steps)
 whose snapshot covers the requested time (snapshot_ts <= t <
 next_timestamp, or the same requested time) means the API would return the
 same snapshot, so the call is skipped. Re-runs resume where the last one
@@ -934,13 +936,14 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("plan", "fetch"):
         p = sub.add_parser(name)
-        p.add_argument("--steps", default=DEFAULT_STEPS, type=parse_steps,
+        p.add_argument("--steps", default=None, type=parse_steps,
                        help=f"purpose:season pairs in priority order (default {DEFAULT_STEPS})")
         p.add_argument("--markets", default=DEFAULT_MARKETS)
         p.add_argument("--bookmakers", default=",".join(DEFAULT_BOOKMAKERS))
         p.add_argument("--same-books-only", action="store_true",
                        help="count a snapshot as bought only if it was bought with "
-                            "exactly these books (default: any books)")
+                            "exactly these books (default: any books). Re-buys every "
+                            "snapshot bought with other books, so it needs explicit --steps")
     f = sub.choices["fetch"]
     f.add_argument("--max-credits", type=int, required=True,
                    help="most credits this run may spend")
@@ -969,6 +972,13 @@ def main(argv=None) -> int:
         for season in args.seasons:
             fill_start_times(season)
         return 0
+    if args.cmd in ("plan", "fetch"):
+        if args.same_books_only and args.steps is None:
+            parser.error("--same-books-only re-buys every snapshot already bought with "
+                         "other books, so it needs explicit --steps naming only the "
+                         "seasons to buy (e.g. --steps close:20232024)")
+        if args.steps is None:
+            args.steps = parse_steps(DEFAULT_STEPS)
     ensure_tables()
     if args.cmd == "rematch":
         print(f"Matched {rematch_unmatched()} row(s)")

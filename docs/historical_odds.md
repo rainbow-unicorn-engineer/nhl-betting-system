@@ -100,8 +100,22 @@ sugarhouse (since closed or renamed); espnbet starts in November 2023.
 In the 2024-25 data lowvig and betonlineag quoted the same price 99.2% of
 the time, so for 2023-24 and 2022-23 swap betonlineag for another book
 (for example `mybookieag`, or `pointsbetus` in 2022-23) with
-`--bookmakers`. A snapshot already bought with other books is never
-bought again.
+`--bookmakers`, and name the seasons with `--steps` so the run buys only
+those:
+
+```bash
+BOOKS=pinnacle,draftkings,fanduel,betmgm,williamhill_us,betrivers,espnbet,lowvig,mybookieag,bovada
+python -m ingestion.odds_history plan  --steps close:20232024,close:20222023 --bookmakers $BOOKS
+python -m ingestion.odds_history fetch --steps close:20232024,close:20222023 --bookmakers $BOOKS --max-credits 2000
+```
+
+By default a snapshot already bought with other books counts as bought,
+so the 2024-25 snapshots are skipped whatever `--bookmakers` says. **Do not
+add `--same-books-only` to this command:** that flag counts a snapshot as
+bought only when it was bought with exactly the same books, so every
+snapshot bought with the old list would be bought again (all of 2024-25
+is 13,960 credits). For that reason `--same-books-only` refuses to run
+without explicit `--steps`.
 
 **The plan, and what was bought on 2026-10-04 (14,000 credits including
 the probes; 6,000 left on the account for the live jobs):**
