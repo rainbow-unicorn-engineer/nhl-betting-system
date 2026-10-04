@@ -25,7 +25,7 @@ Docker Desktop → the app that runs the database's container (a small self-cont
 2. `python pipeline.py setup`: checks the database, nhlpy and the Odds API key, and seeds the arena locations on a new database.
 3. `python -m config.migrate`: adds any tables and columns the database is missing.
 4. `python pipeline.py daily`: catches up every game since the last run, settles finished bets, and makes today's picks. It can take several minutes and spends about 3 Odds API credits.
-5. `register-tasks.ps1 -Role all -IncludeOdds`: registers the scheduled jobs below, so from then on everything runs by itself while you are logged on.
+5. `register-tasks.ps1 -Role picks -IncludeOdds`: registers the scheduled jobs below, so from then on everything runs by itself while you are logged on. By default that is the picks jobs only (`daily`, the midday `odds` run, `close --due` and `news --due`: about 321 Odds API credits a month, inside a free 500-credit key → the plan The Odds API gives without payment). For the props jobs too (`-Role all`, more than 500 credits a month, so a paid key), open a Command Prompt, type `set NHL_ROLE=all`, and run `ops\windows\setup-all.bat` from that same window. Registering a role removes the jobs it leaves out.
 
 Every step is safe to repeat, so after fixing a problem just run NHL Setup again. Nothing runs it automatically.
 

@@ -52,11 +52,47 @@ def test_setup_all_runs_the_steps_in_order():
     text = (WIN / "setup-all.bat").read_text()
     steps = ['call "%~dp0start-db.bat"', '"%PY%" pipeline.py setup',
              '"%PY%" -m config.migrate', '"%PY%" pipeline.py daily',
-             'register-tasks.ps1" -Role all -IncludeOdds']
+             'register-tasks.ps1" -Role %NHL_ROLE% -IncludeOdds']
     at = [text.index(s) for s in steps]
     assert at == sorted(at)
     # every step stops the script on failure
     assert text.count("if errorlevel 1 goto failed") == len(steps)
+    # the role is settled before anything runs
+    assert text.index(":role_ok") < at[0]
+    assert "-Role all" not in text
+
+
+def _role_block() -> str:
+    text = (WIN / "setup-all.bat").read_text()
+    return text[text.index("rem -- role --"):text.index("rem -- end role --")]
+
+
+def _run_role_block(tmp_path, role=None):
+    """setup-all.bat's role lines on their own, in cmd.exe: the role it
+    would pass to register-tasks.ps1, or the exit code it fails with."""
+    import os
+    bat = tmp_path / "role.bat"
+    lines = ["@echo off", "setlocal", *_role_block().splitlines(), "echo ROLE=%NHL_ROLE%",
+             "exit /b 0", ":failed", "exit /b %ERRORLEVEL%", ""]
+    bat.write_bytes("\r\n".join(lines).encode())
+    env = {k: v for k, v in os.environ.items() if k.upper() != "NHL_ROLE"}
+    if role is not None:
+        env["NHL_ROLE"] = role
+    return subprocess.run(["cmd", "/d", "/c", str(bat)], capture_output=True, text=True,
+                          env=env, timeout=60)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs cmd.exe")
+def test_setup_all_registers_the_free_key_role_unless_told_otherwise(tmp_path):
+    """On a free 500-credit key the PC runs the picks jobs only; the props
+    jobs (more than 500 credits a month with the picks jobs) need NHL_ROLE=all."""
+    out = _run_role_block(tmp_path)
+    assert out.returncode == 0 and "ROLE=picks" in out.stdout
+    out = _run_role_block(tmp_path, "all")
+    assert out.returncode == 0 and "ROLE=all" in out.stdout
+    out = _run_role_block(tmp_path, "props")      # -IncludeOdds would refuse it
+    assert out.returncode == 2 and "use picks or all" in out.stdout
+    assert not any(line.startswith("ROLE=") for line in out.stdout.splitlines())
 
 
 def test_open_dashboard_waits_for_the_database_and_stays_local():
