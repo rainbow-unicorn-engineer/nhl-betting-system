@@ -129,7 +129,7 @@ Full column definitions in `db/schema.sql`.
 
 - **Edge thresholds:** ML ≥ 2.5%, totals ≥ 3.0%, props ≥ 4.0%
 - **Staking:** Quarter-Kelly (f = 0.25). `stake = 0.25 × kelly × bankroll`
-- **Exposure caps:** Max 2% bankroll per bet; max 10% per day; max 3 correlated bets per game and max 4% of bankroll staked on one game, every market counted (enforced since 2026-09-29: `MAX_BETS_PER_GAME`, `MAX_GAME_STAKE_PCT` in `betting/engine.py`, env-overridable)
+- **Exposure caps:** Max 2% bankroll per bet; max 10% per day; max 3 correlated bets per game and max 4% of bankroll staked on one game, every market counted (enforced since 2026-09-29). These are the defaults in `betting/engine.py`; since 2026-10-04 all four (`MAX_STAKE_PCT`, `MAX_DAILY_PCT`, `MAX_BETS_PER_GAME`, `MAX_GAME_STAKE_PCT`) can be overridden in `.env`, validated (a share must be above 0 and at most 1), and the dashboard shows the ones in use. `betting/montecarlo.py` measures what larger caps do
 - **Line shopping:** Best price across all books; exclude stale lines (>5 min old)
 - **CLV:** `clv = implied_prob(closing) − implied_prob(placed)`. Target avg CLV > 1.0% over 500+ bets.
 - **No-vig conversion:** Power method

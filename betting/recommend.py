@@ -65,7 +65,6 @@ dress rehearsal for the 2026-27 paper-trading season.
 """
 import argparse
 import logging
-import math
 import os
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
@@ -75,11 +74,10 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from betting.engine import (MAX_BETS_PER_GAME as _DEFAULT_BETS_PER_GAME,
-                            MAX_DAILY_PCT,
-                            MAX_GAME_STAKE_PCT as _DEFAULT_GAME_STAKE_PCT,
-                            decimal_odds, evaluate_market, EDGE_MIN_ML,
-                            game_cap_reason)
+# The exposure limits (.env-overridable, validated) are read in engine.py
+from betting.engine import (MAX_BETS_PER_GAME, MAX_DAILY_PCT,
+                            MAX_GAME_STAKE_PCT, decimal_odds, evaluate_market,
+                            EDGE_MIN_ML, game_cap_reason)
 from config.migrate import ensure_schema
 from config.settings import engine as db, local_today
 
@@ -93,35 +91,6 @@ RECENT_TEAM_GAMES = 10          # starter projection window
 BETTABLE_BOOKS = frozenset(b.strip().lower() for b in
                            os.getenv("BETTABLE_BOOKS", "").split(",")
                            if b.strip())
-
-
-def _limit_setting(name: str, default, parse, valid, what: str):
-    """An exposure limit from the environment. Unset or blank = default; a
-    malformed or out-of-range value logs an error and uses the default, so
-    a typo in .env can't abort the import, and with it the daily chain."""
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = parse(raw)
-        if not valid(value):
-            raise ValueError(raw)
-        return value
-    except (ValueError, OverflowError):
-        logger.error(f"{name}={raw!r} is not {what} — using the default, "
-                     f"{default:g}")
-        return default
-
-
-# Per-game limits (PROJECT_CONTEXT §7: max 3 correlated bets per game),
-# every market counted. Defaults are betting/engine.py's.
-MAX_BETS_PER_GAME = _limit_setting(
-    "MAX_BETS_PER_GAME", _DEFAULT_BETS_PER_GAME, int, lambda v: v >= 1,
-    "a whole number of bets, 1 or more")
-MAX_GAME_STAKE_PCT = _limit_setting(
-    "MAX_GAME_STAKE_PCT", _DEFAULT_GAME_STAKE_PCT, float,
-    lambda v: math.isfinite(v) and 0 < v <= 1,
-    "a fraction of bankroll above 0 and at most 1 (0.04 = 4%)")
 
 
 # ── Slate ──────────────────────────────────────────────────────────

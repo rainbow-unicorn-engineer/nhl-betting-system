@@ -8,10 +8,18 @@ so simulated and live behavior cannot drift apart.
 
 Rules (locked):
 - Bet only when model edge >= EDGE_MIN for the market (moneyline 2.5%).
-- Stake = KELLY_FRACTION (0.25) of the full Kelly fraction, capped at
-  MAX_STAKE_PCT (2%) of bankroll per bet and MAX_DAILY_PCT (10%) per day.
-- Per game, at most MAX_BETS_PER_GAME (3) bets and MAX_GAME_STAKE_PCT (4%)
-  of bankroll staked, counting every market. Bets on one game are
+- Stake = KELLY_FRACTION (0.25) of the full Kelly fraction (Kelly → the
+  bet size that grows a bankroll fastest IF the win chances are right;
+  a quarter of it gives up a little growth for far smaller swings),
+  capped at MAX_STAKE_PCT (default 2%) of bankroll per bet and
+  MAX_DAILY_PCT (default 10%) per day.
+- Per game, at most MAX_BETS_PER_GAME (3) bets and MAX_GAME_STAKE_PCT
+  (default 4%) of bankroll staked, counting every market.
+- The four limits can be changed in .env (same names). A fraction must
+  be above 0 and at most 1 (0.02 = 2%); a bad value logs an error and
+  the default is used, so a typo can't stop the daily run. The defaults
+  below stay the locked rule; `python -m betting.montecarlo` shows what
+  larger limits do to a bankroll. Bets on one game are
   correlated → they tend to win or lose together (a high-scoring game
   moves the total, the puck line and the scorers' props at once), so
   three bets on one game are riskier than three bets on three games.
@@ -22,17 +30,93 @@ Rules (locked):
   settled at the actual (vig-inclusive) price. Both matter: edge vs the
   fair line, cash at the offered line.
 """
+import logging
+import math
+import os
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
+
+from dotenv import load_dotenv
 
 from features.util import american_implied_prob
 
+# The same .env config/settings.py loads (it never overrides a variable
+# already set). Loaded here too because this module is often imported
+# before config.settings, and the limits below are read at import.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+logger = logging.getLogger("nhl.betting.engine")
+
 EDGE_MIN_ML = 0.025
 KELLY_FRACTION = 0.25
-MAX_STAKE_PCT = 0.02
-MAX_DAILY_PCT = 0.10
-MAX_BETS_PER_GAME = 3          # bets on one game, any market (§7)
-MAX_GAME_STAKE_PCT = 0.04      # of bankroll, all bets on one game together
+
+# The locked defaults (PROJECT_CONTEXT §7). The live values below can be
+# overridden in .env; these never change.
+DEFAULT_MAX_STAKE_PCT = 0.02        # of bankroll, one bet
+DEFAULT_MAX_DAILY_PCT = 0.10        # of bankroll, every bet issued on one day
+DEFAULT_MAX_BETS_PER_GAME = 3       # bets on one game, any market (§7)
+DEFAULT_MAX_GAME_STAKE_PCT = 0.04   # of bankroll, all bets on one game together
+
+
+def limit_setting(name: str, default, parse, valid, what: str):
+    """An exposure limit from the environment. Unset or blank = default; a
+    malformed or out-of-range value logs an error and uses the default, so
+    a typo in .env can't abort the import, and with it the daily chain."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = parse(raw)
+        if not valid(value):
+            raise ValueError(raw)
+        return value
+    except (ValueError, OverflowError):
+        logger.error(f"{name}={raw!r} is not {what} — using the default, "
+                     f"{default:g}")
+        return default
+
+
+def fraction_setting(name: str, default: float) -> float:
+    """A share of bankroll from the environment: above 0, at most 1."""
+    return limit_setting(name, default, float,
+                         lambda v: math.isfinite(v) and 0 < v <= 1,
+                         f"a fraction of bankroll above 0 and at most 1 "
+                         f"({default:g} = {default:.0%})")
+
+
+MAX_STAKE_PCT = fraction_setting("MAX_STAKE_PCT", DEFAULT_MAX_STAKE_PCT)
+MAX_DAILY_PCT = fraction_setting("MAX_DAILY_PCT", DEFAULT_MAX_DAILY_PCT)
+MAX_BETS_PER_GAME = limit_setting(
+    "MAX_BETS_PER_GAME", DEFAULT_MAX_BETS_PER_GAME, int, lambda v: v >= 1,
+    "a whole number of bets, 1 or more")
+MAX_GAME_STAKE_PCT = fraction_setting("MAX_GAME_STAKE_PCT",
+                                      DEFAULT_MAX_GAME_STAKE_PCT)
+
+
+def cap_warnings(stake_pct: float = None, daily_pct: float = None,
+                 game_pct: float = None) -> List[str]:
+    """Plain-English warnings for limits that contradict each other (the
+    settings in use by default). The caps skip a bet that doesn't fit;
+    they never shrink it, so a per-bet cap above the per-day or per-game
+    cap means a bet that large is never issued."""
+    stake_pct = MAX_STAKE_PCT if stake_pct is None else stake_pct
+    daily_pct = MAX_DAILY_PCT if daily_pct is None else daily_pct
+    game_pct = MAX_GAME_STAKE_PCT if game_pct is None else game_pct
+    out = []
+    if stake_pct > daily_pct:
+        out.append(f"MAX_STAKE_PCT ({stake_pct:.0%}) is above MAX_DAILY_PCT "
+                   f"({daily_pct:.0%}): a bet bigger than the day's limit is "
+                   f"skipped, not made smaller.")
+    if stake_pct > game_pct:
+        out.append(f"MAX_STAKE_PCT ({stake_pct:.0%}) is above "
+                   f"MAX_GAME_STAKE_PCT ({game_pct:.0%}): a bet bigger than "
+                   f"the per-game limit is skipped, not made smaller.")
+    return out
+
+
+for _w in cap_warnings():
+    logger.warning(_w)
 
 
 def no_vig_probs(home_ml: float, away_ml: float) -> tuple:
