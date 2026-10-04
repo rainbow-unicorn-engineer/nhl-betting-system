@@ -303,7 +303,23 @@ class TestRunFetch:
                              limit=1, raw_dir=tmp_path)
         assert report.calls == 1 and "--limit" in report.stopped
         (f,) = list(tmp_path.iterdir())
-        assert f.name == "close_2024-10-04T165000Z.json.gz"
+        stem = oh.raw_stem("close", t("2024-10-04T16:50"), "h2h,totals", BOOKS)
+        assert f.name == stem + ".json.gz"
+        assert stem.startswith("close_2024-10-04T165000Z_") and len(stem.split("_")[-1]) == 8
+
+    def test_raw_copy_never_overwrites(self, body, tmp_path):
+        plan = _plan(1)
+        self.run(plan, _Getter(body), oh.Budget(max_credits=1000), raw_dir=tmp_path)
+        first = oh.find_raw(tmp_path, oh.raw_stem("close", plan[0].requested_ts,
+                                                  "h2h,totals", BOOKS))
+        before = first.read_bytes()
+        # the same request bought again (a fresh fetch log): a second file
+        self.run(plan, _Getter(body), oh.Budget(max_credits=1000), raw_dir=tmp_path)
+        names = sorted(f.name for f in tmp_path.iterdir())
+        assert len(names) == 2 and names[1].endswith("_2.json.gz")
+        assert first.read_bytes() == before
+        assert oh.find_raw(tmp_path, first.name[:-len(".json.gz")]).name == names[1]
+
 
     def test_describe_plan_counts_what_is_left(self):
         plan = _plan(3)
@@ -312,6 +328,29 @@ class TestRunFetch:
         lines = oh.describe_plan(plan, done, 20)
         assert "1 already bought; to buy 2 x 20 = 40 credits" in lines[0]
         assert lines[-1] == "  total still to buy: 40 credits"
+
+
+class TestRawNames:
+    def test_hash_follows_the_book_list_not_its_order(self):
+        when = t("2024-10-04T16:50")
+        a = oh.raw_stem("close", when, "h2h,totals", "pinnacle,draftkings")
+        assert a == oh.raw_stem("close", when, "totals,h2h", "draftkings, pinnacle")
+        assert a != oh.raw_stem("close", when, "h2h,totals", "pinnacle,fanduel")
+        assert a != oh.raw_stem("close", when, "h2h", "pinnacle,draftkings")
+
+    def test_save_and_find(self, tmp_path):
+        stem = oh.raw_stem("morning", t("2024-10-04T15:00"), "h2h", "pinnacle")
+        assert oh.find_raw(tmp_path, stem) is None
+        p1 = oh.save_raw(tmp_path, stem, {"n": 1})
+        p2 = oh.save_raw(tmp_path, stem, {"n": 2})
+        p3 = oh.save_raw(tmp_path, stem, {"n": 3})
+        assert (p1.name, p2.name, p3.name) == (f"{stem}.json.gz", f"{stem}_2.json.gz",
+                                               f"{stem}_3.json.gz")
+        assert oh.find_raw(tmp_path, stem) == p3
+        (tmp_path / f"{stem}_x.json.gz").write_bytes(b"")          # not a copy name
+        other = oh.raw_stem("morning", t("2024-10-04T15:00"), "h2h", "fanduel")
+        oh.save_raw(tmp_path, other, {"n": 9})
+        assert oh.find_raw(tmp_path, stem) == p3
 
 
 # ── Start-time fill and HTTP ──────────────────────────────────────

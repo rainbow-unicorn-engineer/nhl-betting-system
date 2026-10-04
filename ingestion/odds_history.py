@@ -63,6 +63,9 @@ endpoint before the first call and from every response's headers.
 
 Every paid response is also saved, gzipped, under --raw-dir (default
 data/odds_history/, git-ignored), so paid data survives a database loss.
+A copy is named <purpose>_<requested time>_<hash>.json.gz, where the hash
+is a short fingerprint of the markets and book list, and never overwrites
+an existing file (a second copy of the same request gets _2, _3, ...).
 
 The API key never reaches the logs (odds_api._redact on everything
 logged; exceptions from requests, whose messages carry the URL, are never
@@ -70,6 +73,7 @@ logged themselves).
 """
 import argparse
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -642,6 +646,50 @@ def build_plan(steps: Sequence[Tuple[str, int]], games: List[dict]) -> List[Plan
     return plan
 
 
+def raw_stem(purpose: str, requested: datetime, markets: str, bookmakers: str) -> str:
+    """The raw copy's file name without its extension:
+    close_2024-10-04T165000Z_1a2b3c4d, the last part a short hash of the
+    markets and the book list (order-blind), so copies of the same time
+    bought with different books never share a name."""
+    key = (",".join(sorted(_key_list(markets))) + "|"
+           + ",".join(sorted(_key_list(bookmakers))))
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return f"{purpose}_{iso_z(requested).replace(':', '')}_{digest}"
+
+
+def save_raw(raw_dir: Path, stem: str, body: dict) -> Path:
+    """Write body gzipped as <stem>.json.gz, or <stem>_2.json.gz, _3, ...
+    when that name is taken: an existing copy is never overwritten (the
+    file is opened in exclusive-create mode)."""
+    raw_dir = Path(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        path = raw_dir / (f"{stem}.json.gz" if n == 1 else f"{stem}_{n}.json.gz")
+        try:
+            with gzip.open(path, "xt", encoding="utf-8") as f:
+                json.dump(body, f)
+            return path
+        except FileExistsError:
+            n += 1
+
+
+def find_raw(raw_dir: Path, stem: str) -> Optional[Path]:
+    """The newest raw copy saved under this stem (the highest _N), or None."""
+    best, best_n = None, 0
+    for path in Path(raw_dir).glob(f"{stem}*.json.gz"):
+        rest = path.name[len(stem):-len(".json.gz")]
+        if rest == "":
+            n = 1
+        elif rest.startswith("_") and rest[1:].isdigit():
+            n = int(rest[1:])
+        else:
+            continue
+        if n > best_n:
+            best, best_n = path, n
+    return best
+
+
 def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: Budget,
               games: List[dict], done: List[dict], getter: Callable = http_get,
               saver: Callable = store, raw_dir: Optional[Path] = None,
@@ -689,10 +737,7 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
             continue
         snap = parse_commence(body.get("timestamp"))
         if raw_dir is not None:
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            name = f"{p.purpose}_{iso_z(p.requested_ts).replace(':', '')}.json.gz"
-            with gzip.open(raw_dir / name, "wt", encoding="utf-8") as f:
-                json.dump(body, f)
+            save_raw(raw_dir, raw_stem(p.purpose, p.requested_ts, markets, bookmakers), body)
         rows, stats = parse_snapshot(body, p.requested_ts,
                                      _candidates(games, snap) if snap else [])
         fetch.update(snapshot_ts=_naive(snap),

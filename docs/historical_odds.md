@@ -144,3 +144,9 @@ python -m ingestion.odds_history rematch                     # match stored rows
 remaining credits from the free `/sports` endpoint first and from every
 response after. Every paid response is also kept, gzipped, in
 `data/odds_history/` (git-ignored), so the data survives a database loss.
+A copy is named `<purpose>_<requested time>_<hash>.json.gz`, where the
+hash is a short fingerprint of the markets and the book list, so the same
+time bought with other books gets its own file; an existing file is never
+overwritten (a repeat gets `_2`, `_3`, ...). The 698 copies from the
+2024-25 purchase predate the hash and are named
+`<purpose>_<requested time>.json.gz`.
