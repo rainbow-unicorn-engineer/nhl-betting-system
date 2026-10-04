@@ -516,6 +516,16 @@ def may_save_injuries(now: datetime, starts: Iterable[Optional[datetime]]) -> bo
     return not starts or now < min(starts)
 
 
+def have_injury_list(day: date_cls) -> bool:
+    """Whether raw.injuries already holds a list for `day`."""
+    from ingestion import espn_injuries as espn
+    espn.ensure_table()
+    with engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT 1 FROM raw.injuries WHERE snapshot_date = :d LIMIT 1"),
+            {"d": day}).first() is not None
+
+
 def check_injuries(games: List[dict], games_by_team: dict, now: datetime) -> List[dict]:
     """Fetch ESPN's injury list and diff it with the last run's. Saves it
     as today's raw.injuries snapshot only when today has none yet and the
@@ -527,12 +537,7 @@ def check_injuries(games: List[dict], games_by_team: dict, now: datetime) -> Lis
         return []
     espn.resolve_player_ids(rows)
     today = local_today()
-    espn.ensure_table()
-    with engine.connect() as conn:
-        have_today = conn.execute(text(
-            "SELECT 1 FROM raw.injuries WHERE snapshot_date = :d LIMIT 1"),
-            {"d": today}).first() is not None
-    if not have_today:
+    if not have_injury_list(today):
         if may_save_injuries(now, [g["start_time_utc"] for g in games]):
             espn.write_injuries(rows, today)
             logger.info(f"ESPN injuries: saved today's first list ({len(rows)} players)")

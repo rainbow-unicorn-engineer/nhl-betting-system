@@ -594,31 +594,27 @@ class TestRunOnDatabase:
         moved, note = news.market_check(self.GAME, since=since)
         assert moved is True
 
-    def _injury_rows_today(self):
-        with engine.connect() as conn:
-            return conn.execute(text("SELECT COUNT(*) FROM raw.injuries "
-                                     "WHERE snapshot_date = :d"), {"d": self.today}).scalar()
-
     @pytest.mark.parametrize("started", [False, True])
-    def test_the_injury_list_is_saved_only_before_the_first_puck_drop(self, started):
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM raw.injuries WHERE snapshot_date = :d"),
-                         {"d": self.today})
-            if started:      # the day's game began an hour ago
+    def test_the_injury_list_is_saved_only_before_the_first_puck_drop(self, started,
+                                                                       monkeypatch):
+        """Today has no saved list (stubbed, so a real one is never touched):
+        the news run saves it before the game starts, never after."""
+        from ingestion import espn_injuries
+        saved = []
+        monkeypatch.setattr(news, "have_injury_list", lambda day: False)
+        monkeypatch.setattr(espn_injuries, "write_injuries",
+                            lambda rows, day: saved.append(day))
+        if started:          # the day's game began an hour ago
+            with engine.begin() as conn:
                 conn.execute(text("UPDATE raw.games SET start_time_utc = :s "
                                   "WHERE game_id = :g"),
                              {"s": datetime.now(timezone.utc) - timedelta(hours=1),
                               "g": self.GAME})
-        try:
-            news.run_news()
-            assert self._injury_rows_today() == (0 if started else 1)
-            with engine.connect() as conn:       # compared either way
-                assert conn.execute(text("SELECT COUNT(*) FROM raw.news_state "
-                                         "WHERE source = 'espn'")).scalar() >= 1
-        finally:
-            with engine.begin() as conn:
-                conn.execute(text("DELETE FROM raw.injuries WHERE snapshot_date = :d"),
-                             {"d": self.today})
+        news.run_news()
+        assert saved == ([] if started else [self.today])
+        with engine.connect() as conn:           # compared either way
+            assert conn.execute(text("SELECT COUNT(*) FROM raw.news_state "
+                                     "WHERE source = 'espn'")).scalar() >= 1
 
     def test_no_paid_snapshot_means_no_new_pick(self):
         news.run_news()
