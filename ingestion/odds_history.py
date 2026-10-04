@@ -61,6 +61,10 @@ the account's x-requests-remaining below --reserve (default 6,000, kept
 for the live jobs). It reads the remaining credits from the free /sports
 endpoint before the first call and from every response's headers.
 
+A paid call that cannot be parsed or stored is still logged, as
+'paid_unparsed' with its credits, and counts as bought; its raw copy is
+kept, and `reparse` loads it later without another call.
+
 Every paid response is also saved, gzipped, under --raw-dir (default
 data/odds_history/, git-ignored), so paid data survives a database loss.
 A copy is named <purpose>_<requested time>_<hash>.json.gz, where the hash
@@ -158,7 +162,7 @@ DDL = [
         credits         INTEGER NOT NULL DEFAULT 0,    -- x-requests-last
         n_events        INTEGER NOT NULL DEFAULT 0,
         n_rows          INTEGER NOT NULL DEFAULT 0,
-        status          VARCHAR(10) NOT NULL,          -- ok, empty, error
+        status          VARCHAR(16) NOT NULL,          -- ok, empty, error, paid_unparsed
         fetched_at      TIMESTAMP NOT NULL DEFAULT now()
     )
     """,
@@ -168,10 +172,21 @@ DDL = [
 
 
 def ensure_tables(db=None) -> None:
-    """Create raw.odds_history and raw.odds_history_fetches when missing."""
+    """Create raw.odds_history and raw.odds_history_fetches when missing,
+    and widen the fetch log's status from its first VARCHAR(10) to
+    VARCHAR(16) ('paid_unparsed' is 13 characters). Widening a VARCHAR is a
+    catalog change in PostgreSQL, with no table rewrite, and runs once."""
     with (db or engine).begin() as conn:
         for stmt in DDL:
             conn.execute(text(stmt))
+        width = conn.execute(text("""
+            SELECT character_maximum_length FROM information_schema.columns
+            WHERE table_schema = 'raw' AND table_name = 'odds_history_fetches'
+              AND column_name = 'status'
+        """)).scalar()
+        if width is not None and width < 16:
+            conn.execute(text("ALTER TABLE raw.odds_history_fetches "
+                              "ALTER COLUMN status TYPE VARCHAR(16)"))
 
 
 # ── Pure helpers ──────────────────────────────────────────────────
@@ -416,9 +431,13 @@ def load_games(seasons: Sequence[int], db=None) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+BOUGHT_STATUSES = ("ok", "empty", "paid_unparsed")
+
+
 def covering_fetches(rows: Iterable[dict], markets: str, bookmakers: str,
                      same_books: bool = False) -> List[dict]:
-    """The logged fetches (ok or empty) that count as already bought for
+    """The logged fetches (ok, empty, or paid_unparsed: paid for, its raw
+    copy kept, waiting for `reparse`) that count as already bought for
     a request of these markets: every requested market was in the bought
     call. By default the book list is ignored, so changing the books never
     re-buys a stored snapshot; same_books=True counts only identical lists
@@ -426,7 +445,7 @@ def covering_fetches(rows: Iterable[dict], markets: str, bookmakers: str,
     want, books = set(_key_list(markets)), _key_list(bookmakers)
     out = []
     for r in rows:
-        if r.get("status") not in ("ok", "empty"):
+        if r.get("status") not in BOUGHT_STATUSES:
             continue
         if not want <= set(_key_list(r.get("markets", ""))):
             continue
@@ -523,6 +542,63 @@ def rematch_unmatched(db=None) -> int:
                 """), {"g": game_id, "e": e["event_id"]}).rowcount or 0
     logger.info(f"Matched {n} stored row(s) that had no game")
     return n
+
+
+UPDATE_FETCH = text("""
+    UPDATE raw.odds_history_fetches
+    SET snapshot_ts = :snapshot_ts, next_ts = :next_ts, n_events = :n_events,
+        n_rows = :n_rows, status = :status
+    WHERE id = :id AND status = 'paid_unparsed'
+""")
+
+
+def reparse_file(path: Path, requested: datetime, games: List[dict]) -> Tuple[List[dict], dict]:
+    """(rows, fetch-log fields) from a raw copy, as a fetch would have
+    stored them."""
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        body = json.load(f)
+    if not isinstance(body, dict):
+        raise ValueError(f"{Path(path).name} does not hold a historical response")
+    rows, update, _stats = parse_body(body, requested, games)
+    return rows, update
+
+
+def reparse_unparsed(raw_dir: Path = DEFAULT_RAW_DIR, db=None) -> Dict[str, int]:
+    """Load every paid_unparsed fetch from its raw copy: store its rows and
+    set its log line to what the fetch would have written (ok or empty).
+    A fetch whose copy is missing or still fails stays paid_unparsed."""
+    db = db or engine
+    with db.connect() as conn:
+        fetches = [dict(r) for r in conn.execute(text("""
+            SELECT id, requested_ts, purpose, season, markets, bookmakers
+            FROM raw.odds_history_fetches WHERE status = 'paid_unparsed' ORDER BY id
+        """)).mappings()]
+    out = {"unparsed": len(fetches), "loaded": 0, "missing": 0, "failed": 0, "rows": 0}
+    if not fetches:
+        return out
+    games = load_games(sorted({f["season"] for f in fetches if f["season"]}), db=db)
+    for f in fetches:
+        stem = raw_stem(f["purpose"], f["requested_ts"], f["markets"], f["bookmakers"])
+        path = find_raw(raw_dir, stem)
+        if path is None:
+            out["missing"] += 1
+            logger.warning(f"No raw copy {stem}*.json.gz in {raw_dir} for fetch {f['id']}")
+            continue
+        try:
+            rows, update = reparse_file(path, f["requested_ts"], games)
+            with db.begin() as conn:
+                if rows:
+                    conn.execute(INSERT_ROW, rows)
+                conn.execute(UPDATE_FETCH, {**update, "id": f["id"]})
+        except Exception as e:
+            out["failed"] += 1
+            logger.error(f"Fetch {f['id']} ({path.name}) still fails: "
+                         f"{type(e).__name__}: {_redact(e)[:300]}")
+            continue
+        out["loaded"] += 1
+        out["rows"] += len(rows)
+    logger.info(f"Reparse: {out}")
+    return out
 
 
 # ── Start times for older seasons (free NHL schedule API) ────────
@@ -690,6 +766,19 @@ def find_raw(raw_dir: Path, stem: str) -> Optional[Path]:
     return best
 
 
+def parse_body(body: dict, requested: datetime, games: List[dict]) -> Tuple[List[dict], dict, dict]:
+    """(rows, fetch-log fields, stats) for one paid response: the rows for
+    raw.odds_history and the snapshot_ts, next_ts, n_events, n_rows and
+    status to log. Used by a fetch and by `reparse` on a raw copy."""
+    snap = parse_commence(body.get("timestamp"))
+    rows, stats = parse_snapshot(body, requested, _candidates(games, snap) if snap else [])
+    update = {"snapshot_ts": _naive(snap),
+              "next_ts": _naive(parse_commence(body.get("next_timestamp"))),
+              "n_events": stats["events"], "n_rows": len(rows),
+              "status": "ok" if body.get("data") else "empty"}
+    return rows, update, stats
+
+
 def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: Budget,
               games: List[dict], done: List[dict], getter: Callable = http_get,
               saver: Callable = store, raw_dir: Optional[Path] = None,
@@ -735,16 +824,33 @@ def run_fetch(plan: List[PlannedFetch], markets: str, bookmakers: str, budget: B
                 report.stopped = f"HTTP {status}: every further call would fail"
                 break
             continue
-        snap = parse_commence(body.get("timestamp"))
+        # The credits are spent: keep the raw copy first, then parse and
+        # store. Whatever fails after this point, the call is logged.
         if raw_dir is not None:
-            save_raw(raw_dir, raw_stem(p.purpose, p.requested_ts, markets, bookmakers), body)
-        rows, stats = parse_snapshot(body, p.requested_ts,
-                                     _candidates(games, snap) if snap else [])
-        fetch.update(snapshot_ts=_naive(snap),
-                     next_ts=_naive(parse_commence(body.get("next_timestamp"))),
-                     n_events=stats["events"], n_rows=len(rows),
-                     status="ok" if body.get("data") else "empty")
-        saver(rows, fetch)
+            try:
+                save_raw(raw_dir, raw_stem(p.purpose, p.requested_ts, markets, bookmakers), body)
+            except Exception as e:
+                logger.error(f"Raw copy of {iso_z(p.requested_ts)} not saved: "
+                             f"{type(e).__name__}: {_redact(e)[:300]}")
+        try:
+            rows, update, stats = parse_body(body, p.requested_ts, games)
+            fetch.update(update)
+            saver(rows, fetch)
+        except Exception as e:
+            report.errors += 1
+            fetch.update(n_rows=0, status="paid_unparsed")
+            logger.error(f"{p.purpose} {p.season} {iso_z(p.requested_ts)}: the paid response "
+                         f"could not be parsed or stored ({type(e).__name__}: "
+                         f"{_redact(e)[:300]}); logged as paid_unparsed with {charged} "
+                         f"credits, and `reparse` loads it from the raw copy")
+            try:
+                saver([], fetch)
+            except Exception:
+                logger.error("The fetch log could not be written either: stopping, so no "
+                             "further call is bought without being logged")
+                raise
+            done.append(fetch)
+            continue
         done.append(fetch)
         report.rows += len(rows)
         agg = report.by_purpose.setdefault(f"{p.purpose} {p.season}",
@@ -817,15 +923,26 @@ def main(argv=None) -> int:
     s = sub.add_parser("starts")
     s.add_argument("seasons", nargs="+", type=int)
     sub.add_parser("rematch", help="match stored rows that have no game yet")
+    r = sub.add_parser("reparse", help="load paid_unparsed fetches from their raw copies "
+                                       "(no API call)")
+    r.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR))
     args = parser.parse_args(argv)
 
-    ensure_tables()
-    if args.cmd == "starts":
+    if args.cmd == "starts":             # writes raw.games only
         for season in args.seasons:
             fill_start_times(season)
         return 0
+    ensure_tables()
     if args.cmd == "rematch":
         print(f"Matched {rematch_unmatched()} row(s)")
+        return 0
+    if args.cmd == "reparse":
+        out = reparse_unparsed(Path(args.raw_dir))
+        print(f"paid_unparsed fetches {out['unparsed']}: loaded {out['loaded']} "
+              f"({out['rows']} rows), raw copy missing {out['missing']}, "
+              f"still failing {out['failed']}")
+        if out["rows"]:
+            rematch_unmatched()
         return 0
 
     bookmakers = ",".join(_key_list(args.bookmakers))

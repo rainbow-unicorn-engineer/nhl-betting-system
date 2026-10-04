@@ -3,8 +3,12 @@ Tests for ingestion/odds_history.py: the purchase plan (start-time
 clusters, morning snapshots, spread order), the never-buy-twice check,
 parsing a recorded historical response (tests/fixtures/
 odds_api_historical_nhl.json, a trimmed real 2024-10-04 snapshot), the
-in-play drop, the credit caps, and key redaction. No network (the getter
-is a stub) and no database (the saver is a list).
+in-play drop, the credit caps, paid calls that fail after payment
+(paid_unparsed) and their re-parse, and key redaction. No network (the getter
+is a stub). The pure tests need no database (the saver is a list); the
+database tests at the end run only against a disposable copy (see
+tests/conftest.py) and write only synthetic rows (event ids starting
+"dbtest-", purpose "dbtest", season 20302031), which they delete.
 """
 import datetime as dt
 import json
@@ -12,8 +16,13 @@ import logging
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
+from config.settings import check_db_connection, engine
 from ingestion import odds_history as oh
+
+requires_db = pytest.mark.skipif(not check_db_connection(),
+                                 reason="needs a disposable database (see tests/conftest.py)")
 
 UTC = dt.timezone.utc
 FIXTURE = Path(__file__).parent / "fixtures" / "odds_api_historical_nhl.json"
@@ -353,6 +362,73 @@ class TestRawNames:
         assert oh.find_raw(tmp_path, stem) == p3
 
 
+class TestPaidUnparsed:
+    """A paid call that fails while parsing or storing is still logged
+    (paid_unparsed, its credits), counts as bought, and keeps its raw copy
+    for `reparse`."""
+
+    def run(self, plan, getter, saver, done, tmp_path):
+        return oh.run_fetch(plan, "h2h,totals", BOOKS, oh.Budget(max_credits=1000),
+                            TestParseSnapshot.GAMES, done, getter=getter, saver=saver,
+                            raw_dir=tmp_path, pause=0)
+
+    def test_store_failure_is_logged_as_paid_unparsed(self, body, tmp_path):
+        saved = []
+
+        def saver(rows, fetch):
+            if rows:
+                raise RuntimeError("insert failed")
+            saved.append(dict(fetch))
+
+        done, plan = [], _plan(2)
+        report = self.run(plan, _Getter(body), saver, done, tmp_path)
+        assert report.calls == 2 and report.credits == 40 and report.errors == 2
+        assert [f["status"] for f in saved] == ["paid_unparsed", "paid_unparsed"]
+        assert all(f["credits"] == 20 and f["n_rows"] == 0 for f in saved)
+        # parsed before the store failed: the snapshot window is logged too
+        assert saved[0]["snapshot_ts"] == dt.datetime(2024, 10, 4, 16, 45, 39)
+        assert len(list(tmp_path.iterdir())) == 2          # raw copies kept
+        # treated as bought: a re-run buys nothing
+        getter = _Getter(body)
+        again = self.run(plan, getter, saver, done, tmp_path)
+        assert again.calls == 0 and again.skipped == 2 and getter.calls == []
+        assert oh.covering_fetches(saved, "h2h,totals", BOOKS) == saved
+
+    def test_parse_failure_is_logged_as_paid_unparsed(self, body, tmp_path, monkeypatch):
+        def broken(*a, **k):
+            raise KeyError("bookmakers")
+
+        monkeypatch.setattr(oh, "parse_snapshot", broken)
+        saved = []
+        report = self.run(_plan(1), _Getter(body), lambda r, f: saved.append((r, dict(f))),
+                          [], tmp_path)
+        assert report.errors == 1 and report.credits == 20
+        ((rows, fetch),) = saved
+        assert rows == [] and fetch["status"] == "paid_unparsed" and fetch["credits"] == 20
+
+    def test_a_log_that_cannot_be_written_stops_the_run(self, body, tmp_path):
+        def saver(rows, fetch):
+            raise RuntimeError("database down")
+
+        getter = _Getter(body)
+        with pytest.raises(RuntimeError):
+            self.run(_plan(3), getter, saver, [], tmp_path)
+        assert len(getter.calls) == 1
+        assert len(list(tmp_path.iterdir())) == 1          # the paid copy survives
+
+    def test_raw_copy_reparses_to_the_same_rows(self, body, tmp_path):
+        plan = _plan(1)
+        saved = []
+        self.run(plan, _Getter(body), lambda r, f: saved.append((r, dict(f))), [], tmp_path)
+        path = oh.find_raw(tmp_path, oh.raw_stem("close", plan[0].requested_ts,
+                                                 "h2h,totals", BOOKS))
+        rows, update = oh.reparse_file(path, oh._naive(plan[0].requested_ts),
+                                       TestParseSnapshot.GAMES)
+        assert rows == saved[0][0]
+        assert update["status"] == "ok" and update["n_rows"] == 36
+        assert update["snapshot_ts"] == saved[0][1]["snapshot_ts"]
+
+
 # ── Start-time fill and HTTP ──────────────────────────────────────
 
 def test_int_header_is_case_blind():
@@ -398,3 +474,77 @@ def test_fetch_requires_a_credit_cap(monkeypatch, capsys):
     monkeypatch.setattr(oh, "ensure_tables", lambda: pytest.fail("ran without a cap"))
     with pytest.raises(SystemExit):
         oh.main(["fetch"])
+
+
+# ── Database (disposable copy only) ───────────────────────────────
+
+DB_SEASON = 20302031
+
+
+def _db_body(body):
+    """The fixture moved to 2031 with dbtest- event ids, so nothing it
+    writes can collide with real purchased rows on a cloned database."""
+    raw = json.dumps(body).replace("2024-10-", "2031-10-")
+    moved = json.loads(raw)
+    for ev in moved["data"]:
+        ev["id"] = "dbtest-" + ev["id"]
+    return moved
+
+
+@pytest.fixture()
+def db_clean():
+    oh.ensure_tables()
+
+    def clean():
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM raw.odds_history WHERE event_id LIKE 'dbtest-%'"))
+            conn.execute(text("DELETE FROM raw.odds_history_fetches WHERE purpose = 'dbtest'"))
+            conn.execute(text("DELETE FROM raw.games WHERE season IN (:a, :b)"),
+                         {"a": DB_SEASON, "b": DB_SEASON + 10001})
+
+    clean()
+    yield
+    clean()
+
+
+@requires_db
+class TestOnDatabase:
+    def test_status_column_is_widened_for_paid_unparsed(self, db_clean):
+        with engine.begin() as conn:
+            if conn.execute(text("SELECT COALESCE(MAX(LENGTH(status)), 0) "
+                                 "FROM raw.odds_history_fetches")).scalar() <= 10:
+                conn.execute(text("ALTER TABLE raw.odds_history_fetches "
+                                  "ALTER COLUMN status TYPE VARCHAR(10)"))
+        oh.ensure_tables()
+        oh.ensure_tables()                  # a second run changes nothing
+        with engine.connect() as conn:
+            width = conn.execute(text("""
+                SELECT character_maximum_length FROM information_schema.columns
+                WHERE table_schema = 'raw' AND table_name = 'odds_history_fetches'
+                  AND column_name = 'status'""")).scalar()
+        assert width == 16
+
+    def test_reparse_loads_a_paid_unparsed_fetch_from_its_raw_copy(self, body, db_clean,
+                                                                   tmp_path):
+        moved = _db_body(body)
+        requested = dt.datetime(2031, 10, 4, 16, 50)
+        oh.save_raw(tmp_path, oh.raw_stem("dbtest", requested, "h2h,totals", BOOKS), moved)
+        oh.store([], {"requested_ts": requested, "purpose": "dbtest", "season": DB_SEASON,
+                      "markets": "h2h,totals", "bookmakers": BOOKS, "snapshot_ts": None,
+                      "next_ts": None, "credits": 20, "n_events": 0, "n_rows": 0,
+                      "status": "paid_unparsed"})
+        out = oh.reparse_unparsed(tmp_path)
+        assert out["loaded"] >= 1
+        with engine.connect() as conn:
+            log = conn.execute(text("SELECT * FROM raw.odds_history_fetches "
+                                    "WHERE purpose = 'dbtest'")).mappings().one()
+            n = conn.execute(text("SELECT COUNT(*) FROM raw.odds_history "
+                                  "WHERE event_id LIKE 'dbtest-%'")).scalar()
+        assert (log["status"], log["n_rows"], log["credits"]) == ("ok", 36, 20)
+        assert log["snapshot_ts"] == dt.datetime(2031, 10, 4, 16, 45, 39)
+        assert n == 36
+        # nothing left to load: a second pass changes nothing
+        oh.reparse_unparsed(tmp_path)
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM raw.odds_history "
+                                     "WHERE event_id LIKE 'dbtest-%'")).scalar() == 36

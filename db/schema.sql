@@ -362,7 +362,7 @@ CREATE TABLE IF NOT EXISTS raw.odds_history_fetches (
     credits         INTEGER NOT NULL DEFAULT 0,    -- x-requests-last
     n_events        INTEGER NOT NULL DEFAULT 0,
     n_rows          INTEGER NOT NULL DEFAULT 0,
-    status          VARCHAR(10) NOT NULL,          -- ok, empty, error, probe
+    status          VARCHAR(16) NOT NULL,          -- ok, empty, error, paid_unparsed, probe
     fetched_at      TIMESTAMP NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_odds_history_fetches_ts ON raw.odds_history_fetches(requested_ts);

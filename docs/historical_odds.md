@@ -136,6 +136,7 @@ python -m ingestion.odds_history starts 20232024 20222023    # free: fill old se
 python -m ingestion.odds_history plan                        # what is left to buy, and its cost
 python -m ingestion.odds_history fetch --max-credits 2000 --reserve 6000 --max-minutes 8
 python -m ingestion.odds_history rematch                     # match stored rows whose game was missing
+python -m ingestion.odds_history reparse                     # load paid_unparsed calls from their raw copies (no API call)
 ```
 
 `fetch` stops before a call that would pass `--max-credits` (this run),
@@ -144,6 +145,10 @@ python -m ingestion.odds_history rematch                     # match stored rows
 remaining credits from the free `/sports` endpoint first and from every
 response after. Every paid response is also kept, gzipped, in
 `data/odds_history/` (git-ignored), so the data survives a database loss.
+A paid call that fails after payment (its response could not be parsed or
+stored) is still logged, as status `paid_unparsed` with the credits it
+cost, and counts as bought, so it is never paid for twice; `reparse`
+loads it later from the raw copy without another call.
 A copy is named `<purpose>_<requested time>_<hash>.json.gz`, where the
 hash is a short fingerprint of the markets and the book list, so the same
 time bought with other books gets its own file; an existing file is never
