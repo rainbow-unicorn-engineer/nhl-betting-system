@@ -324,6 +324,49 @@ CREATE INDEX IF NOT EXISTS idx_prop_snapshots_game ON raw.prop_snapshots(game_id
 CREATE INDEX IF NOT EXISTS idx_prop_snapshots_event ON raw.prop_snapshots(event_id, captured_at);
 CREATE INDEX IF NOT EXISTS idx_prop_snapshots_player ON raw.prop_snapshots(player_id, market);
 
+-- Past two-way prices (moneyline → who wins, totals → over/under the goals
+-- line) bought from The Odds API's paid historical endpoint
+-- (ingestion/odds_history.py). One row per snapshot, event, book, market and
+-- side; only pre-game prices (events that had started are dropped).
+CREATE TABLE IF NOT EXISTS raw.odds_history (
+    id              BIGSERIAL PRIMARY KEY,
+    snapshot_ts     TIMESTAMP NOT NULL,            -- the API's snapshot time, naive UTC
+    requested_ts    TIMESTAMP NOT NULL,            -- the date= asked for, naive UTC
+    event_id        VARCHAR(64) NOT NULL,          -- The Odds API event id
+    game_id         BIGINT REFERENCES raw.games(game_id),  -- NULL when unmatched
+    commence_time   TIMESTAMP,                     -- the API's puck drop, naive UTC
+    home_name       VARCHAR(40),                   -- as the API names the teams
+    away_name       VARCHAR(40),
+    book            VARCHAR(40) NOT NULL,          -- Odds API bookmaker key
+    market          VARCHAR(10) NOT NULL,          -- h2h or totals
+    side            VARCHAR(5) NOT NULL,           -- home, away, over, under
+    price           INTEGER NOT NULL,              -- American odds
+    point           NUMERIC(4,1),                  -- the total line; NULL for h2h
+    book_updated_at TIMESTAMP,                     -- the market's last_update, naive UTC
+    UNIQUE (snapshot_ts, event_id, book, market, side)
+);
+CREATE INDEX IF NOT EXISTS idx_odds_history_game ON raw.odds_history(game_id, market);
+CREATE INDEX IF NOT EXISTS idx_odds_history_snapshot ON raw.odds_history(snapshot_ts);
+
+-- Every historical purchase and what it cost, so a re-run resumes and never
+-- buys the same snapshot twice
+CREATE TABLE IF NOT EXISTS raw.odds_history_fetches (
+    id              BIGSERIAL PRIMARY KEY,
+    requested_ts    TIMESTAMP NOT NULL,            -- the date= asked for, naive UTC
+    purpose         VARCHAR(12) NOT NULL,          -- close, morning, probe
+    season          INTEGER,
+    markets         VARCHAR(60) NOT NULL,
+    bookmakers      VARCHAR(200) NOT NULL,
+    snapshot_ts     TIMESTAMP,                     -- what the API returned
+    next_ts         TIMESTAMP,                     -- the API's next_timestamp
+    credits         INTEGER NOT NULL DEFAULT 0,    -- x-requests-last
+    n_events        INTEGER NOT NULL DEFAULT 0,
+    n_rows          INTEGER NOT NULL DEFAULT 0,
+    status          VARCHAR(10) NOT NULL,          -- ok, empty, error, probe
+    fetched_at      TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_odds_history_fetches_ts ON raw.odds_history_fetches(requested_ts);
+
 -- Confirmed starting goalies scraped from Daily Faceoff (Phase 4).
 -- One row per (game_date, team), upserted as confirmations roll in.
 CREATE TABLE IF NOT EXISTS raw.starting_goalies (
