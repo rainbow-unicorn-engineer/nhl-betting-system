@@ -511,7 +511,12 @@ def _fix_by_hand(st, view: pd.DataFrame, legs: pd.DataFrame) -> None:
                 res = st.selectbox("Result", ["WIN", "LOSS", "PUSH", "VOID", "(not decided)"],
                                    key="fix_res")
                 if st.button("Save leg result"):
-                    ledger.set_leg_result(sid, leg_no, None if res.startswith("(") else res)
+                    out = ledger.set_leg_result(sid, leg_no,
+                                                None if res.startswith("(") else res)
+                    if out.get("kept_by_hand"):
+                        st.session_state["ledger_settled"] = (
+                            f"Leg saved. Bet #{sid} keeps the result you set by hand; to "
+                            f"let its legs decide again, set the whole bet back to Open.")
                     st.rerun()
             elif action == "Cash out":
                 amount = st.number_input("Cash-out amount in $", min_value=0.0, step=1.0,

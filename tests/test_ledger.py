@@ -514,3 +514,44 @@ class TestLedgerOnTheDatabase:
         assert s["status"] == "OPEN" and pd.isna(s["payout"])
         with pytest.raises(ValueError):
             ledger.settle_by_hand(sid, "MAYBE")
+
+    def test_a_lost_bet_pays_nothing(self, games):
+        sid = ledger.record_slip("bettor 2", PLATFORM, 10,
+                                 [LegInput("ml", "HOME", games[0], price_american=-110)])
+        with pytest.raises(ValueError, match="a lost bet pays nothing"):
+            ledger.settle_by_hand(sid, "LOST", 5)
+        s = ledger.load_slips().set_index("slip_id").loc[sid]
+        assert s["status"] == "OPEN"                 # refused before any change
+        ledger.settle_by_hand(sid, "LOST", 0)
+        s = ledger.load_slips().set_index("slip_id").loc[sid]
+        assert (s["status"], s["payout"], s["pnl"]) == ("LOST", 0.0, -10.0)
+
+    def test_a_leg_correction_keeps_a_result_set_by_hand(self, games):
+        """The book paid its own amount on a parlay: a later leg fix must not
+        silently recompute that payout from the legs."""
+        g1, g2 = games[0], games[1]
+        sid = ledger.record_slip("bettor 1", PLATFORM, 10, [
+            LegInput("ml", "HOME", g1, price_american=-150),
+            LegInput("other", "Z. Testshooter scores first", None, price_american=400)],
+            price_american=650)
+        ledger.settle_by_hand(sid, "WON", 47.0)
+        out = ledger.set_leg_result(sid, 2, "WIN")
+        assert out["kept_by_hand"] is True
+        s = ledger.load_slips().set_index("slip_id").loc[sid]
+        assert (s["status"], s["payout"], bool(s["settled_by_hand"])) == ("WON", 47.0, True)
+        legs = ledger.load_legs([sid]).set_index("leg_no")
+        assert legs.loc[2, "result"] == "WIN"        # the leg itself is saved
+
+        # back to OPEN by hand: the legs decide again (and the mark is gone)
+        ledger.settle_by_hand(sid, "OPEN")
+        out = ledger.set_leg_result(sid, 1, "WIN")
+        assert out["kept_by_hand"] is False and out["WON"] == 1
+        s = ledger.load_slips().set_index("slip_id").loc[sid]
+        assert (s["status"], s["payout"], bool(s["settled_by_hand"])) == ("WON", 75.0, False)
+
+        # an automatically settled slip is still re-worked by a correction
+        auto = ledger.record_slip("bettor 1", PLATFORM, 10,
+                                  [LegInput("ml", "HOME", g2, price_american=-150)])
+        ledger.settle_slips()
+        assert ledger.set_leg_result(auto, 1, "LOSS")["kept_by_hand"] is False
+        assert ledger.load_slips().set_index("slip_id").loc[auto, "status"] == "LOST"

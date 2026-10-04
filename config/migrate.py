@@ -75,6 +75,9 @@ COLUMNS = (
     # and faceoff columns (naive UTC). NULL = never, so those zeros are
     # defaults, not data
     ("raw", "skater_games", "stats_filled_at", "TIMESTAMP"),
+    # A slip whose result was set by hand (betting/ledger.settle_by_hand):
+    # a later leg correction must not overwrite it
+    ("betting", "slips", "settled_by_hand", "BOOLEAN NOT NULL DEFAULT FALSE"),
 )
 
 # (schema, table, statements): tables added after db/schema.sql first
@@ -294,6 +297,7 @@ TABLES = (
             settled_at      TIMESTAMP,
             notes           TEXT,
             is_paper        BOOLEAN NOT NULL DEFAULT FALSE,
+            settled_by_hand BOOLEAN NOT NULL DEFAULT FALSE,
             created_at      TIMESTAMP NOT NULL DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS idx_slips_who ON betting.slips(bettor, platform)",

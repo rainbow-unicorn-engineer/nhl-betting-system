@@ -616,7 +616,10 @@ def settle_slips() -> dict:
 def set_leg_result(slip_id: int, leg_no: int, result: Optional[str]) -> dict:
     """Set (or clear, with None) one leg's result by hand, e.g. a market
     'other' leg or a correction, then work the slip's result out again
-    from its legs (a cashed-out slip keeps its cash-out)."""
+    from its legs. A cashed-out slip keeps its cash-out, and a slip whose
+    result was set by hand (settle_by_hand) keeps that result and payout:
+    the returned counts then hold kept_by_hand=True. Setting the slip back
+    to OPEN by hand lets its legs decide again."""
     if result is not None and result not in LEG_RESULTS:
         raise ValueError(f"result must be one of {', '.join(LEG_RESULTS)} or empty")
     ensure_schema()
@@ -628,18 +631,28 @@ def set_leg_result(slip_id: int, leg_no: int, result: Optional[str]) -> dict:
                "s": int(slip_id), "n": int(leg_no)}).rowcount
         if not n:
             raise ValueError(f"slip {slip_id} has no leg {leg_no}")
+        kept = conn.execute(text("""
+            SELECT settled_by_hand AND status <> 'OPEN' FROM betting.slips WHERE slip_id = :s
+        """), {"s": int(slip_id)}).scalar()
+        if kept:
+            logger.info(f"slip {slip_id}: leg {leg_no} saved; the slip keeps the "
+                        f"result set by hand")
+            return {**{s: 0 for s in SETTLED_STATUSES}, "kept_by_hand": True}
         conn.execute(text("""
             UPDATE betting.slips SET status = 'OPEN', payout = NULL, settled_at = NULL
             WHERE slip_id = :s AND status NOT IN ('OPEN', 'CASHED_OUT')
         """), {"s": int(slip_id)})
-        return _settle_open_slips(conn, [slip_id])
+        return {**_settle_open_slips(conn, [slip_id]), "kept_by_hand": False}
 
 
 def settle_by_hand(slip_id: int, status: str, payout: Optional[float] = None) -> None:
     """Override a slip's status and payout: a cash-out (status CASHED_OUT,
     payout = the amount taken), a book's own ruling, or back to OPEN
     (payout cleared). A WON/CASHED_OUT slip needs the payout; LOST pays
-    0; PUSH/VOID pay the stake back (0 for a bonus bet) unless given."""
+    0 (any other payout is refused); PUSH/VOID pay the stake back (0 for a
+    bonus bet) unless given. The slip is marked settled_by_hand, so a later
+    leg correction (set_leg_result) keeps this result; OPEN clears the
+    mark, and the legs decide again."""
     status = status.upper()
     if status not in SLIP_STATUSES:
         raise ValueError(f"status must be one of {', '.join(SLIP_STATUSES)}")
@@ -660,11 +673,15 @@ def settle_by_hand(slip_id: int, status: str, payout: Optional[float] = None) ->
                 payout = 0.0 if status == "LOST" or row.is_bonus_bet else float(row.stake)
             if float(payout) < 0:
                 raise ValueError("a payout can't be negative")
+            if status == "LOST" and float(payout) != 0:
+                raise ValueError("a lost bet pays nothing: leave the payout empty or 0 "
+                                 "(for money back, use Cashed out, Push or Void)")
         conn.execute(text("""
-            UPDATE betting.slips SET status = :st, payout = :po, settled_at = :at
+            UPDATE betting.slips SET status = :st, payout = :po, settled_at = :at,
+                                     settled_by_hand = :hand
             WHERE slip_id = :id
         """), {"st": status, "po": None if payout is None else round(float(payout), 2),
-               "at": settled, "id": int(slip_id)})
+               "at": settled, "hand": status != "OPEN", "id": int(slip_id)})
 
 
 def delete_slip(slip_id: int) -> bool:
@@ -693,7 +710,7 @@ def load_slips() -> pd.DataFrame:
         s = pd.read_sql(text("""
             SELECT slip_id, bettor, platform, placed_at, stake, price_american,
                    is_parlay, is_bonus_bet, status, payout, settled_at, notes,
-                   is_paper,
+                   is_paper, settled_by_hand,
                    (SELECT COUNT(*) FROM betting.slip_legs l
                     WHERE l.slip_id = s.slip_id) AS n_legs
             FROM betting.slips s

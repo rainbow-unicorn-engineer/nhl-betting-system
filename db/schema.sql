@@ -622,6 +622,7 @@ CREATE TABLE IF NOT EXISTS betting.slips (
     settled_at      TIMESTAMP,                     -- naive UTC
     notes           TEXT,
     is_paper        BOOLEAN NOT NULL DEFAULT FALSE, -- practice bet: kept out of the balances
+    settled_by_hand BOOLEAN NOT NULL DEFAULT FALSE, -- result set by hand: a leg correction keeps it
     created_at      TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_slips_who ON betting.slips(bettor, platform);
