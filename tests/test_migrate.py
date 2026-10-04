@@ -148,7 +148,8 @@ def test_tables_hold_only_new_tables_with_their_ddl():
                      ("raw", "prop_odds_hist"), ("raw", "prop_odds_fetches"),
                      ("raw", "prop_snapshots"), ("raw", "lineups"),
                      ("raw", "lineup_fetches"), ("raw", "news_events"),
-                     ("raw", "news_state"), ("raw", "news_runs"), ("betting", "slips"),
+                     ("raw", "news_state"), ("raw", "news_runs"),
+                     ("raw", "pipeline_runs"), ("betting", "slips"),
                      ("betting", "slip_legs"), ("betting", "bankroll_txns")]
     for schema, table, statements in migrate.TABLES:
         create = _create_table(statements)

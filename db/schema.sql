@@ -408,6 +408,16 @@ CREATE TABLE IF NOT EXISTS raw.news_runs (
     notes           TEXT
 );
 
+-- Finished pipeline jobs, one row per job and local date (config/runs.py).
+-- The news monitor makes no pick before today's 'daily' row exists: until
+-- then last night's box scores, Elo and rolling stats are not loaded
+CREATE TABLE IF NOT EXISTS raw.pipeline_runs (
+    job             VARCHAR(20) NOT NULL,          -- daily
+    run_date        DATE NOT NULL,                 -- the local date the job ran for
+    finished_at     TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (job, run_date)
+);
+
 CREATE TABLE IF NOT EXISTS raw.shifts (
     shift_id        BIGSERIAL PRIMARY KEY,
     game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),

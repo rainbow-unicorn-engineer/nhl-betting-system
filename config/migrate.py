@@ -263,6 +263,17 @@ TABLES = (
             notes           TEXT
         )""",
     )),
+    # Finished pipeline jobs, one row per job and local date (config/runs.py).
+    # The news monitor makes no pick before today's 'daily' row exists
+    ("raw", "pipeline_runs", (
+        """
+        CREATE TABLE IF NOT EXISTS raw.pipeline_runs (
+            job             VARCHAR(20) NOT NULL,
+            run_date        DATE NOT NULL,
+            finished_at     TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (job, run_date)
+        )""",
+    )),
     # The bet ledger (betting/ledger.py): real bets as slips (a single bet
     # or a parlay) with their legs, and each bettor's deposits,
     # withdrawals and bonuses per platform. slips comes before slip_legs,

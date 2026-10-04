@@ -45,7 +45,10 @@ from NEWS_START_HOUR (8:00) local time until the day's last puck drop, it:
      (raw.odds_snapshots). A move of NEWS_MOVE_PTS (1.0) percentage points
      or more counts as moved;
   4. re-scores those games' date through the normal recommend path when a
-     game has no moneyline pick yet. Issued picks stay frozen. A new pick
+     game has no moneyline pick yet and today's daily run has finished
+     (raw.pipeline_runs, config/runs.py). Before that, last night's box
+     scores, Elo and rolling stats are not loaded, and an issued pick is
+     frozen, so the news is only recorded. Issued picks stay frozen. A new pick
      is allowed only for games whose price did NOT move: the stored price
      is the last paid snapshot's, and after a move it may no longer be on
      offer, so a pick at it would be a phantom edge (and would show a fake
@@ -66,6 +69,8 @@ list yet, the news run saves the first one.
 Settings (.env): NEWS_START_HOUR (8), NEWS_MIN_GAP_MINUTES (14, so a
 catch-up run right after a scheduled one does nothing), NEWS_MOVE_PTS
 (1.0). The lineup politeness settings are in ingestion/dailyfaceoff_lines.py.
+A NEWS_START_HOUR earlier than the daily run's time (9:00) only records
+news: no pick comes from news until today's daily run has finished.
 """
 import argparse
 import json
@@ -606,16 +611,30 @@ def rescore(events: List[dict], games: List[dict], now: datetime) -> None:
             moves[gid] = (None, f"market check failed: {e}")
         logger.info(f"Market check, game {gid}: {moves[gid][1]}")
 
+    try:
+        from config.runs import finished
+        daily_done = finished("daily", local_today())
+    except Exception as e:
+        logger.error(f"Could not read whether today's daily run finished "
+                     f"(non-fatal; no pick from news this run): {e}")
+        daily_done = False
+
     dates = {open_games[g]["date"] for g in news_games}
     frozen = set()
     for d in dates:
         frozen |= frozen_games(load_issued_picks(d))
-    rescored, failed, new_picks = set(), set(), set()
+    rescored, failed, new_picks, waiting = set(), set(), set(), set()
     for d, (todo, eligible) in rescore_plan(news_games, open_games, frozen,
                                             moves).items():
         if not todo:
             logger.info(f"News on {d}: every game with starter news already has "
                         f"its pick (kept as issued)")
+            continue
+        if not daily_done:
+            waiting |= set(todo)
+            logger.info(f"News on {d}: waiting for today's daily run (its box "
+                        f"scores, Elo and rolling stats are not loaded yet), so "
+                        f"the news is recorded and no game is re-scored")
             continue
         try:
             recs = generate_recommendations(d, only_games=eligible)
@@ -636,6 +655,9 @@ def rescore(events: List[dict], games: List[dict], now: datetime) -> None:
                 note += ". No new pick from this news: the stored price may be gone"
             if gid in failed:
                 note += ". Re-scoring failed (see the log)"
+            if gid in waiting:
+                note += (". Waiting for today's daily run: no pick from news "
+                         "before it has loaded last night's games")
             conn.execute(text("""
                 UPDATE raw.news_events SET rescored = :r, new_pick = :p,
                        market_moved = :m, market_note = :n

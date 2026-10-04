@@ -396,7 +396,7 @@ LIMIT 50;
 | `nhl-odds` | A free snapshot of the NHL's odds feed, right now |
 | `compare-feeds [--date YYYY-MM-DD] [--detail]` | The NHL feed against The Odds API for one date's games: price gaps and how often prices changed. Reads only |
 | `injuries` | Saves ESPN's injury list for today |
-| `news [--due]` | The news monitor: refreshes Daily Faceoff's starters and lines and ESPN's injury list, records what changed in `raw.news_events`, and re-scores games with starter news and no pick yet. No Odds API request. With `--due`, only on a game day from 8:00 local until the last puck drop, at most every 14 minutes |
+| `news [--due]` | The news monitor: refreshes Daily Faceoff's starters and lines and ESPN's injury list, records what changed in `raw.news_events`, and re-scores games with starter news and no pick yet (only once that day's `daily` run has finished). No Odds API request. With `--due`, only on a game day from 8:00 local until the last puck drop, at most every 14 minutes |
 | `nhl-stats [--season YYYYYYYY]` | Fills power-play, penalty-kill and faceoff stats: the current season's unfilled dates, or one whole season |
 
 `python pipeline.py --help` lists the commands, and `<command> --help` prints a command's options and runs nothing. An unknown command or option exits with code 2.
@@ -467,7 +467,7 @@ Settings come from `.env`. `.env.example` sets the first four rows and lists the
 | `ALERTS_MAX_AGE_MINUTES` | `30` | Only quotes this fresh count for arbitrage and middles |
 | `MIN_ARB_PROFIT` | `0.001` | Smallest locked-in arbitrage profit worth alerting |
 | `ALERTS_NOTIFY` | unset | `1` sends a macOS notification for each arbitrage alert |
-| `NEWS_START_HOUR` | `8` | `news --due` works from this local hour until the day's last puck drop |
+| `NEWS_START_HOUR` | `8` | `news --due` works from this local hour until the day's last puck drop. No pick comes from news before that day's `daily` run has finished, so news found earlier is only recorded |
 | `NEWS_MIN_GAP_MINUTES` | `14` | `news --due` skips a run when the last one started less than this many minutes ago |
 | `NEWS_MOVE_PTS` | `1.0` | After starter news, a book's fair chance moving this many percentage points or more since the last paid snapshot counts as the market having moved: no new pick from that news |
 | `LINEUPS_MIN_GAP_MINUTES` | `14` | A team's Daily Faceoff lines are fetched at most this often once its puck drop is near |

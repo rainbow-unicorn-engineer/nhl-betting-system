@@ -135,6 +135,9 @@ def _record_chain(monkeypatch, calls):
                         lambda season=None: calls.append("nhl_stats"))
     monkeypatch.setattr(pipeline, "props",
                         lambda **kw: pytest.fail("props never runs in a chain"))
+    from config import runs
+    monkeypatch.setattr(runs, "mark_finished",
+                        lambda job, run_date=None: calls.append(("finished", job)))
 
 
 def test_daily_adds_the_free_feeds_in_order(monkeypatch):
@@ -143,7 +146,35 @@ def test_daily_adds_the_free_feeds_in_order(monkeypatch):
     pipeline.daily()
     assert calls == ["daily_refresh", ("snapshot_odds", {}), "nhl_feed", "espn_lines",
                      "nhl_stats", "moneypuck", "features", "settle", "settle_ledger",
-                     "starters", "injuries", "recommend"]
+                     "starters", "injuries", "recommend", ("finished", "daily")]
+
+
+def test_daily_marks_itself_finished_only_at_the_end(monkeypatch):
+    """The news monitor makes no pick before today's daily marker: a daily
+    run that stops part-way (here the box-score refresh fails) writes none."""
+    from ingestion import nhl_api
+    calls = []
+    _record_chain(monkeypatch, calls)
+
+    def down():
+        raise RuntimeError("NHL API down")
+    monkeypatch.setattr(nhl_api, "daily_refresh", down)
+    with pytest.raises(RuntimeError):
+        pipeline.daily()
+    assert ("finished", "daily") not in calls
+
+
+def test_daily_marker_failure_is_non_fatal(monkeypatch, caplog):
+    from config import runs
+    calls = []
+    _record_chain(monkeypatch, calls)
+
+    def boom(job, run_date=None):
+        raise RuntimeError("database gone")
+    monkeypatch.setattr(runs, "mark_finished", boom)
+    pipeline.daily()
+    assert "Could not record the finished daily run" in caplog.text
+    assert calls[-1] == "recommend"
 
 
 def test_odds_pairs_its_snapshot_with_a_free_nhl_feed_snapshot(monkeypatch):

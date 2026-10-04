@@ -431,6 +431,10 @@ class TestRunOnDatabase:
         monkeypatch.setattr(recommend, "generate_recommendations", generate)
         monkeypatch.setattr(recommend, "load_issued_picks", lambda d: None)
         monkeypatch.setattr(recommend, "frozen_games", lambda issued: set())
+        from config import runs
+        self.daily_done = True
+        monkeypatch.setattr(runs, "finished",
+                            lambda job, run_date=None: job == "daily" and self.daily_done)
         yield
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM raw.news_events WHERE game_id = :g"), {"g": self.GAME})
@@ -504,6 +508,21 @@ class TestRunOnDatabase:
         assert ev[0]["new_pick"] is False
         assert "the stored price may be gone" in ev[0]["market_note"]
         assert self.recs == [(self.today, set())]
+
+    def test_no_pick_from_news_before_todays_daily_run(self):
+        """At 8:00 last night's games are not loaded yet: the news is
+        recorded with its market check, but nothing is re-scored."""
+        self._paid_snapshot()
+        self.daily_done = False
+        news.run_news()
+        self.goalies["BOS"] = ("Joonas Korpisalo", "Confirmed")
+        news.run_news()
+        ev = [e for e in self._events() if e["kind"] == "STARTER_CHANGED"]
+        assert len(ev) == 1
+        assert ev[0]["rescored"] is False and ev[0]["new_pick"] is False
+        assert ev[0]["market_moved"] is False
+        assert "Waiting for today's daily run" in ev[0]["market_note"]
+        assert self.recs == []
 
     def test_no_paid_snapshot_means_no_new_pick(self):
         news.run_news()

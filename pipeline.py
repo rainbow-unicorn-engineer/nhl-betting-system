@@ -329,7 +329,8 @@ def daily():
     from ingestion.odds_api import snapshot_odds
     from config.settings import CURRENT_SEASON
 
-    logger.info(f"DAILY REFRESH — {local_today()} (season {CURRENT_SEASON})")
+    run_date = local_today()
+    logger.info(f"DAILY REFRESH — {run_date} (season {CURRENT_SEASON})")
     if not _wait_for_network():
         return
     daily_refresh()
@@ -360,6 +361,14 @@ def daily():
     starters()
     injuries()      # ESPN keeps no history: save today's list before picks
     recommend()
+    # The marker the news monitor waits for: before it, today's data is not
+    # loaded, so news makes no pick (betting/news.py, config/runs.py)
+    try:
+        from config.runs import mark_finished
+        mark_finished("daily", run_date)
+    except Exception as e:
+        logger.error(f"Could not record the finished daily run (non-fatal; news "
+                     f"makes no pick today until it is recorded): {e}")
     logger.info("DAILY REFRESH COMPLETE")
 
 
