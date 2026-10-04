@@ -286,6 +286,9 @@ class TestValidate:
         assert (describe_leg("prop_sog", "OVER", 2.5, "BOS", "TOR", "D. Pastrnak")
                 == "BOS @ TOR: D. Pastrnak over 2.5 shots on goal")
         assert describe_leg("other", "TOR to win the Cup", None) == "TOR to win the Cup"
+        # a leg with no game reads its missing teams as NaN from the database
+        nan = float("nan")
+        assert describe_leg("other", "TOR to win the Cup", nan, nan, nan, nan) ==             "TOR to win the Cup"
 
 
 # ── Database: migration, recording, settlement, balances ───────────

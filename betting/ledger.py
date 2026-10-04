@@ -331,6 +331,8 @@ def running_pl(slips: pd.DataFrame) -> pd.DataFrame:
 def describe_leg(market: str, side: str, line, away: Optional[str] = None,
                  home: Optional[str] = None, player: Optional[str] = None) -> str:
     """One leg in plain words: 'BOS @ TOR: TOR win', 'Over 6.5 goals'."""
+    away, home, player = (None if v is None or (isinstance(v, float) and pd.isna(v))
+                          else v for v in (away, home, player))
     game = f"{away} @ {home}: " if away and home else ""
     side_u = (side or "").upper()
     team = home if side_u == "HOME" else away
@@ -685,7 +687,7 @@ def delete_txn(txn_id: int) -> bool:
 # ── Reading ────────────────────────────────────────────────────────
 
 def load_slips() -> pd.DataFrame:
-    """Every slip, newest first, with its cash P/L (pnl; None while OPEN)."""
+    """Every slip, newest first, with its cash P/L (pnl; NaN while OPEN)."""
     ensure_schema()
     with db.connect() as conn:
         s = pd.read_sql(text("""
@@ -699,8 +701,10 @@ def load_slips() -> pd.DataFrame:
         """), conn)
     for c in ("stake", "payout"):
         s[c] = s[c].astype(float)
-    s["pnl"] = [slip_pnl(st, sk, po, bool(b)) for st, sk, po, b in
-                zip(s["status"], s["stake"], s["payout"], s["is_bonus_bet"])]
+    s["pnl"] = pd.to_numeric(pd.Series(
+        [slip_pnl(st, sk, po, bool(b)) for st, sk, po, b in
+         zip(s["status"], s["stake"], s["payout"], s["is_bonus_bet"])],
+        index=s.index, dtype="object"), errors="coerce").astype(float)
     return s
 
 
