@@ -186,6 +186,30 @@ def test_new_steps_are_non_fatal(monkeypatch):
     pipeline.props(due=True)
 
 
+def test_news_is_non_fatal_and_passes_due(monkeypatch, caplog):
+    from betting import news
+
+    seen = []
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: True)
+    monkeypatch.setattr(news, "run_news", lambda due: seen.append(due))
+    pipeline.news(due=True)
+    pipeline.news()
+    assert seen == [True, False]
+
+    def boom(due):
+        raise RuntimeError("database gone")
+    monkeypatch.setattr(news, "run_news", boom)
+    pipeline.news(due=True)
+    assert "News monitor failed (non-fatal)" in caplog.text
+
+
+def test_news_waits_for_network(monkeypatch):
+    from betting import news
+    monkeypatch.setattr(pipeline, "_wait_for_network", lambda: False)
+    monkeypatch.setattr(news, "run_news", lambda due: pytest.fail("no network, no run"))
+    pipeline.news(due=True)
+
+
 def test_ledger_settlement_is_non_fatal(monkeypatch, caplog):
     from betting import ledger
 
@@ -243,7 +267,7 @@ def test_props_passes_due_and_markets_and_waits_for_network(monkeypatch):
 
 COMMANDS = ("setup", "status", "backfill", "features", "daily", "odds", "close",
             "recommend", "starters", "settle", "refresh", "props", "nhl-odds",
-            "compare-feeds", "injuries", "nhl-stats")
+            "compare-feeds", "injuries", "news", "nhl-stats")
 
 
 @pytest.mark.parametrize("command", COMMANDS)
@@ -290,6 +314,8 @@ def test_no_database_runs_nothing(monkeypatch):
     (["nhl-stats", "--season", "20252026"], ("nhl_stats", {"season": 20252026})),
     (["nhl-odds"], ("nhl_feed", {"skip_when_idle": False})),
     (["close", "--due"], ("close", {"due": True})),
+    (["news"], ("news", {"due": False})),
+    (["news", "--due"], ("news", {"due": True})),
     (["features", "--season", "20242025"], ("features", {"season": 20242025})),
 ])
 def test_commands_dispatch(monkeypatch, argv, expected):
@@ -305,6 +331,7 @@ def test_commands_dispatch(monkeypatch, argv, expected):
     monkeypatch.setattr(pipeline, "nhl_feed", lambda skip_when_idle: seen.append(
         ("nhl_feed", {"skip_when_idle": skip_when_idle})))
     monkeypatch.setattr(pipeline, "close", lambda due: seen.append(("close", {"due": due})))
+    monkeypatch.setattr(pipeline, "news", lambda due: seen.append(("news", {"due": due})))
     monkeypatch.setattr(pipeline, "features", lambda season: seen.append(
         ("features", {"season": season})))
     assert pipeline.main(argv) == 0
