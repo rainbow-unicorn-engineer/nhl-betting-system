@@ -12,6 +12,10 @@ Three things, each explained on screen in plain English:
   (N = the bettor's place in BETTORS, from 1), else BETTABLE_BOOKS, else
   every book.
 - The stake limits in use (betting/engine.py, .env-overridable).
+- News: today's team news from the news monitor (betting/news.py,
+  `pipeline.py news --due` every 15 minutes): starting goalies confirmed
+  or changed, players in and out, line and power-play changes, with the
+  time each was seen and what the system did about it.
 
 The pure helpers (labels, best prices, the per-game table) are tested in
 tests/test_today.py without Streamlit or a database.
@@ -85,6 +89,69 @@ def puck_drop(ts) -> str:
     if t.tzinfo is None:
         t = t.tz_localize("UTC")
     return to_local(t.to_pydatetime()).strftime("%a %b %d %I:%M %p %Z")
+
+
+NEWS_LABELS = {
+    "STARTER_CONFIRMED": "🥅 Starter confirmed",
+    "STARTER_CHANGED": "🔁 Starter changed",
+    "PLAYER_OUT": "❌ Player out",
+    "PLAYER_IN": "✅ Player in",
+    "LINE_CHANGE": "↔️ Line change",
+    "PP_UNIT_CHANGE": "⚡ Power-play change",
+}
+
+NEWS_SOURCES = {"dailyfaceoff": "Daily Faceoff starters",
+                "dailyfaceoff_lines": "Daily Faceoff lines", "espn": "ESPN injuries"}
+
+
+def clock(ts) -> str:
+    """A time (aware, or naive UTC) as the user's local clock time."""
+    if ts is None or pd.isna(ts):
+        return "—"
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    return to_local(t.to_pydatetime()).strftime("%I:%M %p").lstrip("0")
+
+
+def _flag(x) -> Optional[bool]:
+    return None if x is None or pd.isna(x) else bool(x)
+
+
+def news_action(row) -> str:
+    """What the system did about one news event, in words."""
+    if row.get("kind") not in ("STARTER_CONFIRMED", "STARTER_CHANGED"):
+        return "Noted (the win model doesn't use this yet)"
+    moved, rescored = _flag(row.get("market_moved")), _flag(row.get("rescored"))
+    price = {True: "price already moved", False: "price not moved yet",
+             None: "price move unknown"}[moved]
+    if rescored is None:
+        return "Not re-scored (the game had started, or re-scoring failed)"
+    if not rescored:
+        return f"Game already has its pick (kept); {price}"
+    if _flag(row.get("new_pick")):
+        return f"Re-scored: NEW PICK; {price}"
+    return f"Re-scored: no new pick; {price}"
+
+
+def news_table(events: pd.DataFrame) -> pd.DataFrame:
+    """raw.news_events rows (joined to the game) -> the panel's table."""
+    if events.empty:
+        return pd.DataFrame(columns=["Time", "Team", "Game", "News", "What",
+                                     "Before", "Now", "System", "Source"])
+    game = [f"{a} @ {h}" if isinstance(a, str) and isinstance(h, str) else "—"
+            for a, h in zip(events["away_team"], events["home_team"])]
+    return pd.DataFrame({
+        "Time": events["ts"].map(clock),
+        "Team": events["team"],
+        "Game": game,
+        "News": events["kind"].map(lambda k: NEWS_LABELS.get(k, k)),
+        "What": events["detail"].fillna(""),
+        "Before": events["previous"].fillna("—"),
+        "Now": events["current"].fillna("—"),
+        "System": [news_action(r) for r in events.to_dict("records")],
+        "Source": events["source"].map(lambda s: NEWS_SOURCES.get(s, s)),
+    })
 
 
 def _books(value: Optional[str]) -> frozenset:
@@ -304,6 +371,25 @@ PRICES_SQL = """
     ORDER BY s.game_id, s.book_name, s.captured_at DESC"""
 
 
+NEWS_SQL = """
+    SELECT e.event_id, e.ts, e.team, e.kind, e.source, e.detail, e.previous,
+           e.current, e.rescored, e.new_pick, e.market_moved, e.market_note,
+           g.away_team, g.home_team
+    FROM raw.news_events e LEFT JOIN raw.games g USING (game_id)
+    WHERE e.ts >= :since
+    ORDER BY e.ts DESC, e.event_id DESC LIMIT 300"""
+
+NEWS_RUN_SQL = """
+    SELECT MAX(finished_at) AS last_run, COUNT(*) AS runs
+    FROM raw.news_runs WHERE started_at >= :since"""
+
+
+def local_midnight_utc() -> datetime:
+    """The start of today in the user's zone, as an aware UTC time."""
+    now = to_local(datetime.now(timezone.utc))
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+
 def load_book_prices(game_ids: List[int], max_age_hours: float,
                      read: Callable = _read) -> pd.DataFrame:
     asof = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -364,6 +450,9 @@ def render(st, read: Callable = _read) -> None:
         st.warning(w)
 
     st.divider()
+    render_news(st, read)
+
+    st.divider()
     st.subheader("Prices by book")
     games = read(UPCOMING_SQL, {"today": local_today()})
     who = bettor_books()
@@ -410,3 +499,47 @@ def render(st, read: Callable = _read) -> None:
             "Puck drop (your time)": unpriced["start_time_utc"].map(puck_drop),
             "Game": unpriced["away_team"] + " @ " + unpriced["home_team"],
         }), width="stretch", hide_index=True)
+
+
+def render_news(st, read: Callable = _read) -> None:
+    """The 📰 News panel: today's news events, newest first."""
+    st.subheader("📰 News")
+    st.caption(
+        "Team news seen today, newest first, checked every 15 minutes from "
+        "8:00 until the last puck drop (`pipeline.py news --due`): **starting "
+        "goalies** → the goalie who starts, the biggest single news item for a "
+        "win bet; **players in or out** of the lineup or the injury list; "
+        "**line changes** → which forwards play together; **power-play "
+        "changes** → who is on the first unit sent out when the other team "
+        "takes a penalty. Prices react to news, so news seen before the price "
+        "moves is an edge. For starter news on a game with no pick yet the "
+        "system re-scores the game; it issues a new pick only when the free "
+        "NHL odds feed shows the price has not moved since the last paid odds "
+        "snapshot, because a price that moved may no longer be on offer. "
+        "Picks already issued never change.")
+    since = local_midnight_utc()
+    try:
+        events = read(NEWS_SQL, {"since": since})
+        runs = read(NEWS_RUN_SQL, {"since": since})
+    except Exception:
+        st.info("No news yet: the news monitor creates its tables on its first "
+                "run (`python pipeline.py news`).")
+        return
+    last = runs["last_run"].iloc[0] if not runs.empty else None
+    if last is None or pd.isna(last):
+        st.caption("No news check has run today yet.")
+    else:
+        st.caption(f"Last check: {clock(last)} ({int(runs['runs'].iloc[0])} "
+                   f"check(s) today).")
+    if events.empty:
+        st.info("No news today so far.")
+        return
+    counts = events["kind"].value_counts()
+    st.caption(" · ".join(f"{NEWS_LABELS.get(k, k)}: {n}" for k, n in counts.items()))
+    st.dataframe(news_table(events), width="stretch", hide_index=True)
+    starters = events[events["kind"].isin(["STARTER_CONFIRMED", "STARTER_CHANGED"])
+                      & events["market_note"].notna()]
+    if not starters.empty:
+        with st.expander("Price check details for starter news"):
+            for r in starters.itertuples():
+                st.markdown(f"- **{clock(r.ts)} {r.team}**: {r.market_note}")

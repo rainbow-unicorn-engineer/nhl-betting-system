@@ -160,6 +160,21 @@ def _tab_script():
     t0 = pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timedelta(hours=1)
 
     def read(sql, params=None):
+        if "raw.news_events" in sql:
+            return pd.DataFrame({
+                "event_id": [2, 1], "ts": [t0, t0 - pd.Timedelta(minutes=15)],
+                "team": ["BOS", "MTL"], "kind": ["STARTER_CHANGED", "PP_UNIT_CHANGE"],
+                "source": ["dailyfaceoff", "dailyfaceoff_lines"],
+                "detail": ["Joonas Korpisalo is now expected to start instead of "
+                           "Jeremy Swayman", "power-play unit 1 changed"],
+                "previous": ["Jeremy Swayman (Likely)", "A, B, C, D, E"],
+                "current": ["Joonas Korpisalo (Confirmed)", "A, B, C, D, F"],
+                "rescored": [True, None], "new_pick": [False, None],
+                "market_moved": [True, None],
+                "market_note": ["moved: at draftkings ...", None],
+                "away_team": ["NYR", "MTL"], "home_team": ["BOS", "OTT"]})
+        if "raw.news_runs" in sql:
+            return pd.DataFrame({"last_run": [t0], "runs": [9]})
         if "betting.recommendations" in sql:
             return pd.DataFrame({
                 "start_time_utc": [pd.Timestamp("2026-10-10 23:00", tz="UTC")],
@@ -187,13 +202,58 @@ def test_tab_renders_without_a_database(monkeypatch):
     at = AppTest.from_function(_tab_script, default_timeout=60)
     at.run()
     assert not at.exception, at.exception
-    assert [s.value for s in at.subheader] == ["Pending picks", "Prices by book"]
+    assert [s.value for s in at.subheader] == ["Pending picks", "📰 News",
+                                               "Prices by book"]
     picks = at.dataframe[0].value
     assert list(picks["Bet"]) == ["NYR win"] and list(picks["Edge"]) == ["+6.9 pts"]
-    best = at.dataframe[1].value
+    events = at.dataframe[1].value
+    assert list(events["News"]) == ["🔁 Starter changed", "⚡ Power-play change"]
+    assert list(events["Game"]) == ["NYR @ BOS", "MTL @ OTT"]
+    assert events["System"].iloc[0] == "Re-scored: no new pick; price already moved"
+    assert any("9 check(s) today" in c.value for c in at.caption)
+    best = at.dataframe[2].value
     assert list(best["Best for bettor 1"]) == ["+130 at kalshi", "-150 at kalshi"]
     assert list(best["Best price anywhere"]) == ["+130 at kalshi", "-140 at fanduel"]
     assert [m.label for m in at.metric] == ["Per bet", "Per day", "Per game",
                                             "Bets per game"]
-    assert len(at.expander) == 1           # one priced game
+    assert len(at.expander) == 2           # the price-check details + one priced game
     assert any("MTL @ OTT" in str(d.value.get("Game", "")) for d in at.dataframe)
+
+
+def test_news_tab_without_its_tables_says_so():
+    from streamlit.testing.v1 import AppTest
+
+    def script():
+        import streamlit as st
+        from dashboard import today
+
+        def read(sql, params=None):
+            raise RuntimeError('relation "raw.news_events" does not exist')
+        today.render_news(st, read)
+    at = AppTest.from_function(script, default_timeout=60)
+    at.run()
+    assert not at.exception
+    assert "creates its tables on its first run" in at.info[0].value
+
+
+class TestNewsTable:
+    def test_clock_is_local_time(self, monkeypatch):
+        from dashboard import today
+        monkeypatch.setattr(today, "to_local", lambda dt: dt.astimezone(
+            __import__("zoneinfo").ZoneInfo("America/Chicago")))
+        assert today.clock(pd.Timestamp("2026-10-10 23:05")) == "6:05 PM"
+        assert today.clock(None) == "—"
+
+    def test_what_the_system_did(self):
+        from dashboard.today import news_action
+        base = {"kind": "STARTER_CONFIRMED"}
+        assert news_action({**base, "rescored": True, "new_pick": True,
+                            "market_moved": False}) == "Re-scored: NEW PICK; price not moved yet"
+        assert news_action({**base, "rescored": False, "market_moved": None})             == "Game already has its pick (kept); price move unknown"
+        assert news_action({**base, "rescored": None}).startswith("Not re-scored")
+        assert news_action({"kind": "LINE_CHANGE"}).startswith("Noted")
+
+    def test_empty(self):
+        from dashboard.today import news_table
+        assert list(news_table(pd.DataFrame())) == ["Time", "Team", "Game", "News", "What",
+                                                   "Before", "Now", "System", "Source"]
