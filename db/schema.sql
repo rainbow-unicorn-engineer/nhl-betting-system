@@ -523,6 +523,59 @@ CREATE TABLE IF NOT EXISTS betting.bankroll_log (
     clv_avg             NUMERIC(5,3)
 );
 
+-- ── The bet ledger (betting/ledger.py): bets the bettors really placed ──
+-- A slip is one bet ticket: a single bet (one leg) or a parlay (several
+-- legs that must all win). Bettor labels come from .env BETTORS (default
+-- "bettor 1,bettor 2"); platforms are free text. Timestamps are naive UTC.
+CREATE TABLE IF NOT EXISTS betting.slips (
+    slip_id         BIGSERIAL PRIMARY KEY,
+    bettor          VARCHAR(40) NOT NULL,          -- a label from .env BETTORS
+    platform        VARCHAR(40) NOT NULL,          -- the sportsbook or exchange
+    placed_at       TIMESTAMP NOT NULL,            -- naive UTC
+    stake           NUMERIC(10,2) NOT NULL CHECK (stake > 0),
+    price_american  INTEGER NOT NULL,              -- the slip's odds; for a parlay the combined price
+    is_parlay       BOOLEAN NOT NULL DEFAULT FALSE,
+    is_bonus_bet    BOOLEAN NOT NULL DEFAULT FALSE, -- staked with promo credit: a win pays the profit only
+    status          VARCHAR(10) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'WON', 'LOST', 'PUSH', 'VOID', 'CASHED_OUT')),
+    payout          NUMERIC(10,2),                 -- cash paid back, stake included; NULL while OPEN
+    settled_at      TIMESTAMP,                     -- naive UTC
+    notes           TEXT,
+    is_paper        BOOLEAN NOT NULL DEFAULT FALSE, -- practice bet: kept out of the balances
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_slips_who ON betting.slips(bettor, platform);
+CREATE INDEX IF NOT EXISTS idx_slips_status ON betting.slips(status);
+
+CREATE TABLE IF NOT EXISTS betting.slip_legs (
+    slip_id         BIGINT NOT NULL REFERENCES betting.slips(slip_id) ON DELETE CASCADE,
+    leg_no          SMALLINT NOT NULL,
+    game_id         BIGINT REFERENCES raw.games(game_id),  -- NULL only for market 'other'
+    market          VARCHAR(10) NOT NULL CHECK (market IN ('ml', 'pl', 'total', 'prop_sog', 'other')),
+    side            VARCHAR(80) NOT NULL,          -- HOME/AWAY (ml, pl), OVER/UNDER (total, prop_sog), free text (other)
+    line            NUMERIC(5,1),                  -- pl: the side's handicap (-1.5); total/prop_sog: the line
+    price_american  INTEGER,                       -- the leg's own odds (NULL if the ticket did not show them)
+    player_id       INTEGER,                       -- prop_sog: raw.players id
+    rec_id          BIGINT REFERENCES betting.recommendations(rec_id),  -- the system pick it came from, if any
+    result          VARCHAR(5) CHECK (result IN ('WIN', 'LOSS', 'PUSH', 'VOID')),  -- NULL = not decided yet
+    settled_at      TIMESTAMP,
+    PRIMARY KEY (slip_id, leg_no)
+);
+CREATE INDEX IF NOT EXISTS idx_slip_legs_game ON betting.slip_legs(game_id);
+
+-- Money in and out of each bettor's account on each platform. Balance =
+-- deposits - withdrawals + bonuses + adjustments + settled bet P/L - stakes
+-- of open bets (betting/ledger.balance_table)
+CREATE TABLE IF NOT EXISTS betting.bankroll_txns (
+    txn_id          BIGSERIAL PRIMARY KEY,
+    bettor          VARCHAR(40) NOT NULL,
+    platform        VARCHAR(40) NOT NULL,
+    ts              TIMESTAMP NOT NULL,            -- naive UTC
+    kind            VARCHAR(10) NOT NULL CHECK (kind IN ('DEPOSIT', 'WITHDRAWAL', 'BONUS', 'ADJUSTMENT')),
+    amount          NUMERIC(10,2) NOT NULL,        -- positive; ADJUSTMENT may be negative
+    note            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bankroll_txns_who ON betting.bankroll_txns(bettor, platform);
+
 -- ============================================================
 -- Utility: Updated-at trigger
 -- ============================================================

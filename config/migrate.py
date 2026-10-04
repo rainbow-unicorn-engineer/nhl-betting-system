@@ -186,6 +186,63 @@ TABLES = (
         "CREATE INDEX IF NOT EXISTS idx_prop_snapshots_player "
         "ON raw.prop_snapshots(player_id, market)",
     )),
+    # The bet ledger (betting/ledger.py): real bets as slips (a single bet
+    # or a parlay) with their legs, and each bettor's deposits,
+    # withdrawals and bonuses per platform. slips comes before slip_legs,
+    # which references it
+    ("betting", "slips", (
+        """
+        CREATE TABLE IF NOT EXISTS betting.slips (
+            slip_id         BIGSERIAL PRIMARY KEY,
+            bettor          VARCHAR(40) NOT NULL,
+            platform        VARCHAR(40) NOT NULL,
+            placed_at       TIMESTAMP NOT NULL,
+            stake           NUMERIC(10,2) NOT NULL CHECK (stake > 0),
+            price_american  INTEGER NOT NULL,
+            is_parlay       BOOLEAN NOT NULL DEFAULT FALSE,
+            is_bonus_bet    BOOLEAN NOT NULL DEFAULT FALSE,
+            status          VARCHAR(10) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'WON', 'LOST', 'PUSH', 'VOID', 'CASHED_OUT')),
+            payout          NUMERIC(10,2),
+            settled_at      TIMESTAMP,
+            notes           TEXT,
+            is_paper        BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_slips_who ON betting.slips(bettor, platform)",
+        "CREATE INDEX IF NOT EXISTS idx_slips_status ON betting.slips(status)",
+    )),
+    ("betting", "slip_legs", (
+        """
+        CREATE TABLE IF NOT EXISTS betting.slip_legs (
+            slip_id         BIGINT NOT NULL REFERENCES betting.slips(slip_id) ON DELETE CASCADE,
+            leg_no          SMALLINT NOT NULL,
+            game_id         BIGINT REFERENCES raw.games(game_id),
+            market          VARCHAR(10) NOT NULL CHECK (market IN ('ml', 'pl', 'total', 'prop_sog', 'other')),
+            side            VARCHAR(80) NOT NULL,
+            line            NUMERIC(5,1),
+            price_american  INTEGER,
+            player_id       INTEGER,
+            rec_id          BIGINT REFERENCES betting.recommendations(rec_id),
+            result          VARCHAR(5) CHECK (result IN ('WIN', 'LOSS', 'PUSH', 'VOID')),
+            settled_at      TIMESTAMP,
+            PRIMARY KEY (slip_id, leg_no)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_slip_legs_game ON betting.slip_legs(game_id)",
+    )),
+    ("betting", "bankroll_txns", (
+        """
+        CREATE TABLE IF NOT EXISTS betting.bankroll_txns (
+            txn_id          BIGSERIAL PRIMARY KEY,
+            bettor          VARCHAR(40) NOT NULL,
+            platform        VARCHAR(40) NOT NULL,
+            ts              TIMESTAMP NOT NULL,
+            kind            VARCHAR(10) NOT NULL CHECK (kind IN ('DEPOSIT', 'WITHDRAWAL', 'BONUS', 'ADJUSTMENT')),
+            amount          NUMERIC(10,2) NOT NULL,
+            note            TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_bankroll_txns_who "
+        "ON betting.bankroll_txns(bettor, platform)",
+    )),
 )
 
 _done = False

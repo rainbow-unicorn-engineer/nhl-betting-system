@@ -146,7 +146,8 @@ def test_tables_hold_only_new_tables_with_their_ddl():
     names = [(s, t) for s, t, _ in migrate.TABLES]
     assert names == [("raw", "nhl_feed_snapshots"), ("raw", "injuries"),
                      ("raw", "prop_odds_hist"), ("raw", "prop_odds_fetches"),
-                     ("raw", "prop_snapshots")]
+                     ("raw", "prop_snapshots"), ("betting", "slips"),
+                     ("betting", "slip_legs"), ("betting", "bankroll_txns")]
     for schema, table, statements in migrate.TABLES:
         create = _create_table(statements)
         assert f"CREATE TABLE IF NOT EXISTS {schema}.{table} (" in create
