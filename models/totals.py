@@ -623,18 +623,80 @@ def _check_weights(w) -> np.ndarray:
     return w
 
 
+def dc_tau(pmf_h: np.ndarray, pmf_a: np.ndarray, rho: float) -> np.ndarray:
+    """(n, K+1, K+1) Dixon-Coles factors (v3 experiment, variant T2/T3):
+    1 everywhere except the four low scores, with lh, la the two sides'
+    rates (each PMF's mean):
+        tau(0,0) = 1 - lh*la*rho   tau(0,1) = 1 + lh*rho
+        tau(1,0) = 1 + la*rho      tau(1,1) = 1 - rho
+    (home goals first). rho > 0 moves probability from 0-0 and 1-1 to
+    1-0 and 0-1; rho < 0 the other way. Factors are floored at 0."""
+    n, k1 = pmf_h.shape
+    tau = np.ones((n, k1, k1))
+    if rho == 0.0:
+        return tau
+    k = np.arange(k1)
+    lh, la = pmf_h @ k, pmf_a @ k
+    tau[:, 0, 0] = 1.0 - lh * la * rho
+    tau[:, 0, 1] = 1.0 + lh * rho
+    tau[:, 1, 0] = 1.0 + la * rho
+    tau[:, 1, 1] = 1.0 - rho
+    return np.clip(tau, 0.0, None)
+
+
 def joint_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
-              margin_weights=MARGIN_WEIGHTS) -> np.ndarray:
+              margin_weights=MARGIN_WEIGHTS, rho: float = 0.0) -> np.ndarray:
     """(n, K+1, K+1) joint regulation-score distribution from per-side
     PMFs: their product, each cell times its margin bucket's weight,
     renormalized per game to sum to 1. margin_weights=None keeps the
-    plain independent product."""
+    plain independent product. rho != 0 also multiplies in the
+    Dixon-Coles factors (dc_tau) before renormalizing."""
     joint = pmf_h[:, :, None] * pmf_a[:, None, :]
-    if margin_weights is None:
+    if margin_weights is None and rho == 0.0:
         return joint
-    w = _check_weights(margin_weights)
-    joint = joint * w[margin_buckets(pmf_h.shape[1])][None]
+    if margin_weights is not None:
+        w = _check_weights(margin_weights)
+        joint = joint * w[margin_buckets(pmf_h.shape[1])][None]
+    if rho != 0.0:
+        joint = joint * dc_tau(pmf_h, pmf_a, float(rho))
     return joint / joint.sum(axis=(1, 2), keepdims=True)
+
+
+DC_RHO_BOUNDS = (-0.2, 0.2)
+
+
+def fit_dc_rho(pmf_h: np.ndarray, pmf_a: np.ndarray, y_home, y_away,
+               margin_weights=MARGIN_WEIGHTS) -> float:
+    """Maximum-likelihood Dixon-Coles rho from training games only, given
+    the per-side PMFs and the (already fitted) margin weights. Only the
+    four low-score cells change, so a game's log-likelihood moves by
+    log tau(observed cell) - log(sum of joint x tau)."""
+    from scipy.optimize import minimize_scalar
+
+    k1 = pmf_h.shape[1]
+    joint = joint_pmf(pmf_h, pmf_a, margin_weights)
+    k = np.arange(k1)
+    lh, la = pmf_h @ k, pmf_a @ k
+    h = np.clip(np.asarray(y_home).astype(int), 0, k1 - 1)
+    a = np.clip(np.asarray(y_away).astype(int), 0, k1 - 1)
+    cells = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    mass = np.stack([joint[:, i, j] for i, j in cells], axis=1)     # (n, 4)
+    obs = np.stack([(h == i) & (a == j) for i, j in cells], axis=1)
+
+    def taus(rho):
+        t = np.stack([1.0 - lh * la * rho, 1.0 + lh * rho,
+                      1.0 + la * rho, np.full_like(lh, 1.0 - rho)], axis=1)
+        return np.clip(t, 1e-12, None)
+
+    def nll(rho):
+        t = taus(rho)
+        z = 1.0 + (mass * (t - 1.0)).sum(axis=1)
+        log_obs = np.where(obs, np.log(t), 0.0).sum(axis=1)
+        return -np.mean(log_obs - np.log(z))
+
+    res = minimize_scalar(nll, bounds=DC_RHO_BOUNDS, method="bounded",
+                          options={"xatol": 1e-6})
+    return float(res.x)
 
 
 def fit_margin_weights(pmf_h: np.ndarray, pmf_a: np.ndarray,
@@ -672,20 +734,26 @@ def fit_margin_weights(pmf_h: np.ndarray, pmf_a: np.ndarray,
     return np.exp(np.append(res.x, 0.0))
 
 
-def total_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
-              margin_weights=MARGIN_WEIGHTS) -> np.ndarray:
-    """Settlement-total distribution from two per-side regulation PMFs
-    (n, K+1) -> (n, 2K+2): the joint (margin-reweighted by default; see
-    joint_pmf) summed along each total, with every regulation tie shifted
-    up one goal (the OT/SO winner's credited goal)."""
-    n, k1 = pmf_h.shape
-    joint = joint_pmf(pmf_h, pmf_a, margin_weights)        # (n, K+1, K+1)
-    out = np.zeros((n, 2 * k1))
+def total_from_joint(joint: np.ndarray) -> np.ndarray:
+    """(n, K+1, K+1) regulation joint -> (n, 2K+2) settlement-total PMF:
+    each cell's mass goes to h + a, and a regulation tie (h == a) to
+    h + a + 1 (the OT/SO winner's credited goal)."""
+    n, k1, _ = joint.shape
     h_idx, a_idx = np.meshgrid(np.arange(k1), np.arange(k1), indexing="ij")
     t_idx = np.where(h_idx == a_idx, h_idx + a_idx + 1, h_idx + a_idx)
-    np.add.at(out, (np.arange(n)[:, None, None],
-                    np.broadcast_to(t_idx, joint.shape)), joint)
-    return out
+    to_total = np.zeros((k1 * k1, 2 * k1))
+    to_total[np.arange(k1 * k1), t_idx.ravel()] = 1.0
+    return joint.reshape(n, k1 * k1) @ to_total
+
+
+def total_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
+              margin_weights=MARGIN_WEIGHTS, rho: float = 0.0) -> np.ndarray:
+    """Settlement-total distribution from two per-side regulation PMFs
+    (n, K+1) -> (n, 2K+2): the joint (margin-reweighted by default, and
+    Dixon-Coles adjusted when rho != 0; see joint_pmf) summed along each
+    total, with every regulation tie shifted up one goal (the OT/SO
+    winner's credited goal)."""
+    return total_from_joint(joint_pmf(pmf_h, pmf_a, margin_weights, rho))
 
 
 def prob_over(tpmf: np.ndarray, line) -> tuple:
@@ -1238,6 +1306,409 @@ def _register(pooled: dict, meta, names: list) -> None:
     logger.info(f"Registered {MODEL_NAME} {MODEL_VERSION} in models.model_registry")
 
 
+# ── v3 experiment: market offset + Dixon-Coles (pre-registered) ────
+#
+# Module docstring, "v3 experiment", has the variants, metrics and the
+# pass rule. Everything here is evaluation only and writes nothing.
+
+V3_VARIANTS = ("T0", "T1", "T2", "T3")
+V3_REFERENCES = ("M", "B", "B_dc")      # market alone, the two baselines
+MARKET_SCALE_RANGE = (0.25, 4.0)        # bisection bracket for the factor
+MARKET_BISECT_STEPS = 40
+MIN_PRICED_TRAIN = 200                  # fewer: priced games use M's rates
+GATE_SE = 2.0                           # pass rule (1)
+GATE_FOLDS = 4                          # pass rule (2)
+CAL_MAX_TOTAL = 11                      # calibration buckets 0..10, 11+
+
+# Unibet cleaning (docstring, source d)
+UNIBET_LINE = 5.5
+UNIBET_OVERROUND = (0.035, 0.065)
+UNIBET_FAIR = (0.25, 0.80)
+UNIBET_ML_MAX = 1000
+
+
+def market_lambdas(fair_over, line, base_h, base_a,
+                   margin_weights=MARGIN_WEIGHTS, rho: float = 0.0,
+                   steps: int = MARKET_BISECT_STEPS) -> tuple:
+    """Per game, the rates (base_h * c, base_a * c) whose total PMF
+    (margin weights, rho) gives P(over line | no push) = fair_over: the
+    market's expected scoring put through this model's own machinery, with
+    the home/away split of the base rates. c is found by bisection on
+    log c inside MARKET_SCALE_RANGE (P(over) rises with c); a price outside
+    what the range can reach gets the nearest end. Pure."""
+    fair = np.asarray(fair_over, dtype=float)
+    line = np.asarray(line, dtype=float)
+    base_h = np.asarray(base_h, dtype=float)
+    base_a = np.asarray(base_a, dtype=float)
+    lo = np.full(len(fair), np.log(MARKET_SCALE_RANGE[0]))
+    hi = np.full(len(fair), np.log(MARKET_SCALE_RANGE[1]))
+    for _ in range(steps):
+        mid = 0.5 * (lo + hi)
+        k = np.exp(mid)
+        tp = total_pmf(poisson_pmf(base_h * k), poisson_pmf(base_a * k),
+                       margin_weights, rho)
+        po, pp = prob_over(tp, line)
+        p = po / np.clip(1.0 - pp, 1e-12, None)
+        up = p < fair
+        lo, hi = np.where(up, mid, lo), np.where(up, hi, mid)
+    k = np.exp(0.5 * (lo + hi))
+    return (np.clip(base_h * k, *LAMBDA_CLIP),
+            np.clip(base_a * k, *LAMBDA_CLIP))
+
+
+def clean_unibet(rows: pd.DataFrame) -> pd.DataFrame:
+    """Unibet closing over/under rows that pass the pre-registered checks
+    (line 5.5, overround 3.5-6.5%, no-vig P(over) 0.25-0.80, both
+    moneyline prices under 1000 in size), as quotes. rows: game_id,
+    over_under, over_price, under_price, home_ml, away_ml. Pure."""
+    from features.util import american_implied_prob
+    cols = ["game_id", "book_name", "line", "over_price", "under_price"]
+    r = rows.dropna(subset=["over_under", "over_price", "under_price"])
+    if r.empty:
+        return pd.DataFrame(columns=cols)
+    po = r["over_price"].astype(float).map(american_implied_prob)
+    pu = r["under_price"].astype(float).map(american_implied_prob)
+    over_round = po + pu - 1.0
+    fair = po / (po + pu)
+    ml_ok = ((r["home_ml"].astype(float).abs() < UNIBET_ML_MAX)
+             & (r["away_ml"].astype(float).abs() < UNIBET_ML_MAX))
+    ok = ((r["over_under"].astype(float) == UNIBET_LINE)
+          & over_round.between(*UNIBET_OVERROUND)
+          & fair.between(*UNIBET_FAIR) & ml_ok)
+    out = r[ok].rename(columns={"over_under": "line"})
+    return out.assign(book_name="espn_Unibet")[cols].reset_index(drop=True)
+
+
+def history_closing_quotes(rows: pd.DataFrame) -> pd.DataFrame:
+    """Each book's closing over/under quote from raw.odds_history rows
+    (game_id, book, side, price, point, snapshot_ts, start_utc): the last
+    snapshot strictly before puck drop that has both sides at the same
+    point. Pure."""
+    cols = ["game_id", "book_name", "line", "over_price", "under_price"]
+    r = rows[rows["snapshot_ts"] < rows["start_utc"]]
+    r = r.dropna(subset=["price", "point"])
+    if r.empty:
+        return pd.DataFrame(columns=cols)
+    key = ["game_id", "book", "snapshot_ts"]
+    over = r[r["side"] == "over"].drop_duplicates(key, keep="last")
+    under = r[r["side"] == "under"].drop_duplicates(key, keep="last")
+    both = over.merge(under, on=key, suffixes=("_o", "_u"))
+    both = both[both["point_o"].astype(float) == both["point_u"].astype(float)]
+    last = (both.sort_values("snapshot_ts")
+            .drop_duplicates(["game_id", "book"], keep="last"))
+    return pd.DataFrame({
+        "game_id": last["game_id"].to_numpy(),
+        "book_name": last["book"].to_numpy(),
+        "line": last["point_o"].astype(float).to_numpy(),
+        "over_price": last["price_o"].astype(int).to_numpy(),
+        "under_price": last["price_u"].astype(int).to_numpy()})
+
+
+_HISTORY_TOTALS_SQL = """
+    SELECT o.game_id, o.book, o.side, o.price, o.point, o.snapshot_ts,
+           (g.start_time_utc AT TIME ZONE 'UTC') AS start_utc
+    FROM raw.odds_history o
+    JOIN raw.games g USING (game_id)
+    WHERE o.market = 'totals' AND g.game_state IN ('FINAL', 'OFF')
+      AND g.start_time_utc IS NOT NULL
+"""
+
+_UNIBET_SQL = """
+    SELECT h.game_id, h.over_under, h.over_price, h.under_price,
+           h.home_ml, h.away_ml
+    FROM raw.historical_odds h
+    JOIN raw.games g USING (game_id)
+    WHERE h.provider = 'Unibet' AND g.game_state IN ('FINAL', 'OFF')
+"""
+
+
+def load_v3_quotes(conn=None) -> pd.DataFrame:
+    """Every pre-registered over/under source as quote rows (game_id,
+    book_name, line, over_price, under_price, source): live snapshots,
+    ESPN DraftKings closing, raw.odds_history closing, cleaned Unibet.
+    Read-only."""
+    if conn is None:
+        with engine.connect() as c:
+            return load_v3_quotes(c)
+    parts = []
+    snap = load_market_quotes(conn)
+    if not snap.empty:
+        parts.append(snap.assign(source=np.where(
+            snap["book_name"].astype(str).str.startswith("espn_"),
+            "draftkings_espn", "snapshot")))
+    hist = pd.read_sql(text(_HISTORY_TOTALS_SQL), conn)
+    if not hist.empty:
+        hist["snapshot_ts"] = pd.to_datetime(hist["snapshot_ts"])
+        hist["start_utc"] = pd.to_datetime(hist["start_utc"])
+        parts.append(history_closing_quotes(hist).assign(source="odds_history"))
+    uni = pd.read_sql(text(_UNIBET_SQL), conn)
+    parts.append(clean_unibet(uni).assign(source="unibet_espn"))
+    parts = [p for p in parts if not p.empty]
+    cols = ["game_id", "book_name", "line", "over_price", "under_price",
+            "source"]
+    return (pd.concat(parts, ignore_index=True)[cols] if parts
+            else pd.DataFrame(columns=cols))
+
+
+def quote_sources(quotes: pd.DataFrame) -> pd.Series:
+    """game_id -> its quote source ('mixed' when several)."""
+    if quotes.empty or "source" not in quotes:
+        return pd.Series(dtype=object)
+    return quotes.groupby("game_id")["source"].agg(
+        lambda s: s.iloc[0] if s.nunique() == 1 else "mixed")
+
+
+def total_calibration(tpmf: np.ndarray, totals: np.ndarray,
+                      max_total: int = CAL_MAX_TOTAL) -> dict:
+    """Mean predicted P(total = t) vs the observed share, t = 0..max-1 and
+    max+ (one bucket), with the largest gap and the chi-square
+    sum((obs - exp)^2 / exp) over counts. Pure."""
+    t = np.clip(np.asarray(totals).astype(int), 0, max_total)
+    pred = np.hstack([tpmf[:, :max_total],
+                      tpmf[:, max_total:].sum(axis=1, keepdims=True)])
+    expected = pred.sum(axis=0)
+    observed = np.bincount(t, minlength=max_total + 1).astype(float)
+    n = len(t)
+    chi2 = float(np.sum((observed - expected) ** 2 / np.clip(expected, 1e-9,
+                                                             None)))
+    return {"pred": (expected / n).round(4).tolist(),
+            "obs": (observed / n).round(4).tolist(),
+            "max_gap": float(np.max(np.abs(observed - expected)) / n),
+            "chi2": chi2}
+
+
+def not_worse_than_market(mc: dict) -> bool:
+    """Pass rule (3): enough priced games and the model's log loss is not
+    worse than the market's at 95% (diff - 1.96 SE <= 0)."""
+    return (mc.get("n", 0) >= MARKET_CHECK_MIN_GAMES
+            and np.isfinite(mc.get("diff_se", np.nan))
+            and mc["diff"] - 1.96 * mc["diff_se"] <= 0)
+
+
+def v3_passes(s: dict) -> bool:
+    """The pre-registered pass rule (1)-(3) on one variant's summary."""
+    return (s["diff"] <= -GATE_SE * s["diff_se"]
+            and s["folds_won"] >= GATE_FOLDS
+            and not_worse_than_market(s["market_check"]))
+
+
+def choose_v3(summaries: dict):
+    """The variant the pre-registered rule adopts (None when none of
+    T1-T3 passes): the lowest pooled NLL, unless a simpler passing
+    variant is within 1 paired SE of it."""
+    passing = [v for v in V3_VARIANTS[1:] if v in summaries
+               and v3_passes(summaries[v])]
+    if not passing:
+        return None
+    best = min(passing, key=lambda v: summaries[v]["nll"])
+    for v in passing:                          # in order: simplest first
+        if v == best:
+            return v
+        d = summaries[v]["nll"] - summaries[best]["nll"]
+        if d <= summaries[v]["vs"].get(best, {}).get("se", np.inf):
+            return v
+    return best
+
+
+def _paired(a: np.ndarray, b: np.ndarray) -> dict:
+    d = a - b
+    return {"diff": float(d.mean()),
+            "se": float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1
+            else float("nan")}
+
+
+def run_totals_v3(market_quotes=None, variants=V3_VARIANTS) -> dict:
+    """The pre-registered v3 walk-forward (module docstring). Registers and
+    writes nothing. market_quotes: rows like load_v3_quotes (None loads
+    them). Returns {"summaries", "folds", "chosen", "rho", "oof"}."""
+    for v in variants:
+        if v not in V3_VARIANTS:
+            raise ValueError(f"unknown v3 variant {v!r}")
+    Xh_c, Xa_c, y_h, y_a, meta, names_c = load_totals_dataset(
+        variant="C", with_roles=True)
+    n_a = len(ATTACK_FEATURES)
+    if list(names_c[:n_a]) != list(ATTACK_FEATURES):
+        raise RuntimeError("variant C columns must start with variant A's")
+    feats = {"A": (Xh_c[:, :n_a], Xa_c[:, :n_a]), "C": (Xh_c, Xa_c)}
+
+    env_h = env_rates(meta["date"], y_h, ENV_PRIOR_RATE["home"])
+    env_a = env_rates(meta["date"], y_a, ENV_PRIOR_RATE["away"])
+    folds = walk_forward_folds(meta)
+    totals = meta["total"].to_numpy()
+    seasons, dates = meta["season"].to_numpy(), meta["date"].to_numpy()
+    is_po = meta["is_playoff"].to_numpy(dtype=bool)
+    n = len(meta)
+
+    if market_quotes is None:
+        market_quotes = load_v3_quotes()
+    mkt = market_over_probs(market_quotes).set_index("game_id")
+    line = meta["game_id"].map(mkt["line"]).to_numpy(dtype=float)
+    fair = meta["game_id"].map(mkt["fair_over"]).to_numpy(dtype=float)
+    priced = np.isfinite(line) & np.isfinite(fair)
+    source = meta["game_id"].map(quote_sources(market_quotes)).to_numpy(
+        dtype=object)
+    logger.info(f"v3 dataset: {n} games, {priced.sum()} priced, "
+                f"{len(folds)} folds")
+
+    names = list(variants) + list(V3_REFERENCES)
+    nll = {v: np.full(n, np.nan) for v in names}
+    tie = {v: np.full(n, np.nan) for v in names}
+    p_over = {v: np.full(n, np.nan) for v in names}
+    p_push = {v: np.full(n, np.nan) for v in names}
+    tpmfs = {v: np.full((n, 2 * (MAX_GOALS + 1)), np.nan) for v in names}
+    fold_rows = []
+    rhos = {}
+    need_rho = any(v in ("T2", "T3") for v in variants)
+
+    for fold in folds:
+        tr, val = fold.train_idx, fold.val_idx
+        pe_tr = (poisson_pmf(env_h[tr]), poisson_pmf(env_a[tr]))
+        w = fit_margin_weights(*pe_tr, y_h[tr], y_a[tr])
+        rho = fit_dc_rho(*pe_tr, y_h[tr], y_a[tr], w) if need_rho else 0.0
+        rhos[int(fold.val_season)] = rho
+
+        def env_model(fs):
+            Xh, Xa = feats[fs]
+            fm = fit_totals_fold(Xh, Xa, y_h, y_a, env_h, env_a, tr,
+                                 meta["date"], is_playoff=is_po)
+            lh, la = predict_lambdas(fm, Xh[val], Xa[val],
+                                     env_h[val], env_a[val])
+            adj = booster_adjustment(lh, la, env_h[val], env_a[val])
+            return apply_drift(lh, la, drift_shift(seasons[val], dates[val],
+                                                   adj))
+
+        tr_p, val_p = tr[priced[tr]], val[priced[val]]
+        mrates = {}
+
+        def market_rates(r):
+            if r not in mrates:
+                idx = np.concatenate([tr_p, val_p])
+                mh, ma = np.full(n, np.nan), np.full(n, np.nan)
+                if len(idx):
+                    mh[idx], ma[idx] = market_lambdas(
+                        fair[idx], line[idx], env_h[idx], env_a[idx], w, r)
+                mrates[r] = (mh, ma)
+            return mrates[r]
+
+        def market_model(fs, r):
+            mh, ma = market_rates(r)
+            if len(val_p) == 0:
+                return np.array([]), np.array([])
+            if len(tr_p) < MIN_PRICED_TRAIN:
+                return mh[val_p], ma[val_p]
+            Xh, Xa = feats[fs]
+            fm = fit_totals_fold(Xh, Xa, y_h, y_a, mh, ma, tr_p,
+                                 meta["date"], is_playoff=is_po)
+            lh, la = predict_lambdas(fm, Xh[val_p], Xa[val_p],
+                                     mh[val_p], ma[val_p])
+            adj = booster_adjustment(lh, la, mh[val_p], ma[val_p])
+            return apply_drift(lh, la, drift_shift(seasons[val_p],
+                                                   dates[val_p], adj))
+
+        pos = {g: i for i, g in enumerate(val)}
+        loc_p = np.array([pos[g] for g in val_p], dtype=int)
+
+        def combine(fallback, market):
+            lh, la = fallback[0].copy(), fallback[1].copy()
+            if len(loc_p):
+                lh[loc_p], la[loc_p] = market
+            return lh, la
+
+        env_val = (env_h[val], env_a[val])
+        rates = {"B": (env_val, 0.0), "B_dc": (env_val, rho)}
+        lam_t0 = env_model("A")
+        rates["M"] = (combine(env_val, tuple(x[val_p] for x in
+                                             market_rates(0.0))), 0.0)
+        if "T0" in variants:
+            rates["T0"] = (lam_t0, 0.0)
+        if "T1" in variants:
+            rates["T1"] = (combine(lam_t0, market_model("A", 0.0)), 0.0)
+        if "T2" in variants:
+            rates["T2"] = (combine(lam_t0, market_model("A", rho)), rho)
+        if "T3" in variants:
+            rates["T3"] = (combine(env_model("C"), market_model("C", rho)),
+                           rho)
+
+        row = {"val_season": int(fold.val_season), "n_val": len(val),
+               "n_priced": int(len(val_p)), "n_priced_train": int(len(tr_p)),
+               "margin_weights": [round(float(x), 3) for x in w],
+               "rho": round(rho, 4)}
+        for v, ((lh, la), r) in rates.items():
+            joint = joint_pmf(poisson_pmf(lh), poisson_pmf(la), w, r)
+            tp = total_from_joint(joint)
+            tpmfs[v][val] = tp
+            nll[v][val] = nll_of_totals(tp, totals[val])
+            tie[v][val] = np.trace(joint, axis1=1, axis2=2)
+            if len(val_p):
+                po, pp = prob_over(tp[loc_p], line[val_p])
+                p_over[v][val_p], p_push[v][val_p] = po, pp
+            row[v] = float(np.mean(nll[v][val]))
+        fold_rows.append(row)
+        logger.info(f"  fold {row['val_season']}: rho={rho:+.4f} priced "
+                    f"{row['n_priced']}/{row['n_val']} | " + " ".join(
+                        f"{v}={row[v]:.4f}" for v in names if v in row))
+
+    scored = ~np.isnan(nll["B"])
+    reg_tie = (y_h == y_a)
+    summaries = {}
+    for v in names:
+        base = "B_dc" if v in ("T2", "T3") else "B"
+        s = {"nll": float(np.mean(nll[v][scored])),
+             "baseline": base,
+             "baseline_nll": float(np.mean(nll[base][scored])),
+             "n_scored": int(scored.sum())}
+        pb = _paired(nll[v][scored], nll[base][scored])
+        s["diff"], s["diff_se"] = pb["diff"], pb["se"]
+        s["folds_won"] = int(sum(
+            np.mean(nll[v][f.val_idx]) < np.mean(nll[base][f.val_idx])
+            for f in folds))
+        s["vs"] = {u: _paired(nll[v][scored], nll[u][scored])
+                   for u in names if u != v}
+        s["tie_pred"] = float(np.mean(tie[v][scored]))
+        s["tie_actual"] = float(np.mean(reg_tie[scored]))
+        s["calibration"] = total_calibration(tpmfs[v][scored], totals[scored])
+        s["push_pred"] = {k: float(np.mean(tpmfs[v][scored][:, k]))
+                          for k in (5, 6, 7)}
+        s["push_actual"] = {k: float(np.mean(totals[scored] == k))
+                            for k in (5, 6, 7)}
+        pr = scored & priced
+        s["market_check"] = market_check(p_over[v][pr], p_push[v][pr],
+                                         fair[pr], totals[pr], line[pr])
+        s["market_by_source"] = {
+            str(src): market_check(p_over[v][m], p_push[v][m], fair[m],
+                                   totals[m], line[m])
+            for src in sorted(set(source[pr]))
+            for m in [pr & (source == src)]}
+        s["passes"] = v in V3_VARIANTS and v3_passes(s)
+        s["beats_market"] = bool(s["market_check"].get("beats_market"))
+        summaries[v] = s
+
+    chosen = choose_v3({v: summaries[v] for v in variants})
+    for v in names:
+        s = summaries[v]
+        mc = s["market_check"]
+        logger.info(
+            f"{v:5s} nll={s['nll']:.4f} vs {s['baseline']} "
+            f"{s['baseline_nll']:.4f} ({s['diff']:+.4f} ± {s['diff_se']:.4f},"
+            f" {s['folds_won']}/{len(folds)} folds) vs T0 "
+            f"{s['vs'].get('T0', {'diff': 0.0})['diff']:+.4f} | tie "
+            f"{s['tie_pred']:.3f}/{s['tie_actual']:.3f} chi2 "
+            f"{s['calibration']['chi2']:.1f} | market "
+            + (f"{mc['model_log_loss']:.4f} vs {mc['market_log_loss']:.4f} "
+               f"({mc['diff']:+.4f} ± {mc['diff_se']:.4f}, n={mc['n']})"
+               if mc.get("n") else "none")
+            + (" PASSES" if s["passes"] else ""))
+    logger.info(f"v3 adopted by the pre-registered rule: {chosen}")
+
+    oof = meta.loc[scored, ["game_id", "season", "date", "total"]].copy()
+    for v in names:
+        oof[f"nll_{v}"] = nll[v][scored]
+    oof["priced"] = priced[scored]
+    oof["source"] = source[scored]
+    return {"summaries": summaries, "folds": fold_rows, "chosen": chosen,
+            "rho": rhos, "oof": oof}
+
+
 def main(argv=None) -> dict:
     """Command line: run the walk-forward evaluation and register the
     model (inactive), or with --no-register only report. --help runs
@@ -1249,7 +1720,12 @@ def main(argv=None) -> dict:
                     "models.model_registry")
     parser.add_argument("--no-register", action="store_true",
                         help="evaluate and report only; write nothing")
+    parser.add_argument("--v3", action="store_true",
+                        help="run the pre-registered v3 experiment (market "
+                             "offset + Dixon-Coles); writes nothing")
     args = parser.parse_args(argv)
+    if args.v3:
+        return run_totals_v3()
     return run_totals(register=not args.no_register)
 
 
