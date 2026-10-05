@@ -133,6 +133,7 @@ def _record_chain(monkeypatch, calls):
     monkeypatch.setattr(pipeline, "nhl_feed", lambda **kw: calls.append("nhl_feed"))
     monkeypatch.setattr(pipeline, "nhl_stats",
                         lambda season=None: calls.append("nhl_stats"))
+    monkeypatch.setattr(pipeline, "free_data", lambda: calls.append("free_data"))
     monkeypatch.setattr(pipeline, "props",
                         lambda **kw: pytest.fail("props never runs in a chain"))
     from config import runs
@@ -146,7 +147,8 @@ def test_daily_adds_the_free_feeds_in_order(monkeypatch):
     pipeline.daily()
     assert calls == ["daily_refresh", ("snapshot_odds", {}), "nhl_feed", "espn_lines",
                      "nhl_stats", "moneypuck", "features", "settle", "settle_ledger",
-                     "starters", "injuries", "recommend", ("finished", "daily")]
+                     "starters", "injuries", "recommend", ("finished", "daily"),
+                     "free_data"]
 
 
 def test_daily_marks_itself_finished_only_at_the_end(monkeypatch):
@@ -174,7 +176,7 @@ def test_daily_marker_failure_is_non_fatal(monkeypatch, caplog):
     monkeypatch.setattr(runs, "mark_finished", boom)
     pipeline.daily()
     assert "Could not record the finished daily run" in caplog.text
-    assert calls[-1] == "recommend"
+    assert calls[-2:] == ["recommend", "free_data"]
 
 
 def test_odds_pairs_its_snapshot_with_a_free_nhl_feed_snapshot(monkeypatch):
@@ -215,6 +217,24 @@ def test_new_steps_are_non_fatal(monkeypatch):
     pipeline.nhl_stats()
     pipeline.nhl_stats(20252026)
     pipeline.props(due=True)
+
+
+def test_free_data_runs_each_loader_and_each_is_non_fatal(monkeypatch, caplog):
+    from ingestion import kalshi, nhl_game_info, nhl_shifts
+    calls = []
+
+    def boom(*a, **k):
+        calls.append("shifts")
+        raise RuntimeError("NHL stats API down")
+    monkeypatch.setattr(nhl_shifts, "fetch_missing", boom)
+    monkeypatch.setattr(nhl_game_info, "backfill",
+                        lambda: calls.append("game_info") or {"stopped_early": 1})
+    monkeypatch.setattr(kalshi, "run", lambda: calls.append("kalshi") or {"markets": 2})
+    pipeline.free_data()
+    assert calls == ["shifts", "game_info", "kalshi"]
+    assert "NHL shift charts failed (non-fatal)" in caplog.text
+    assert "Scratches and officials: stopped early" in caplog.text
+    assert "Kalshi" not in caplog.text
 
 
 def test_news_is_non_fatal_and_passes_due(monkeypatch, caplog):
@@ -304,7 +324,7 @@ def test_props_passes_due_and_markets_and_waits_for_network(monkeypatch):
 
 COMMANDS = ("setup", "status", "backfill", "features", "daily", "odds", "close",
             "recommend", "starters", "settle", "refresh", "props", "nhl-odds",
-            "compare-feeds", "injuries", "news", "nhl-stats")
+            "compare-feeds", "injuries", "news", "nhl-stats", "free-data")
 
 
 @pytest.mark.parametrize("command", COMMANDS)
@@ -354,6 +374,7 @@ def test_no_database_runs_nothing(monkeypatch):
     (["news"], ("news", {"due": False})),
     (["news", "--due"], ("news", {"due": True})),
     (["features", "--season", "20242025"], ("features", {"season": 20242025})),
+    (["free-data"], ("free_data", {})),
 ])
 def test_commands_dispatch(monkeypatch, argv, expected):
     seen = []
@@ -371,6 +392,7 @@ def test_commands_dispatch(monkeypatch, argv, expected):
     monkeypatch.setattr(pipeline, "news", lambda due: seen.append(("news", {"due": due})))
     monkeypatch.setattr(pipeline, "features", lambda season: seen.append(
         ("features", {"season": season})))
+    monkeypatch.setattr(pipeline, "free_data", lambda: seen.append(("free_data", {})))
     assert pipeline.main(argv) == 0
     assert seen == [expected]
 

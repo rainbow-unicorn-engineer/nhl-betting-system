@@ -19,6 +19,7 @@ prints that command's options and runs nothing):
     python pipeline.py injuries                     # ESPN injury list snapshot (free)
     python pipeline.py news [--due]                 # Team news: starters, lines, injuries (free)
     python pipeline.py nhl-stats [--season S]       # Power-play, penalty-kill, faceoff stats (free)
+    python pipeline.py free-data                    # Shift charts, scratches/officials, Kalshi prices (free)
 
 Machine roles: each machine has its own .env, Odds API key and database.
 The picks jobs are daily, odds, close and news --due; the props jobs are
@@ -243,6 +244,29 @@ def nhl_stats(season=None):
         logger.error(f"NHL stats fill failed (non-fatal): {e}")
 
 
+def free_data():
+    """The free loaders that need no key (each step non-fatal, each
+    resumable, so a step that fails is simply retried by the next run):
+    NHL shift charts for newly finished games (raw.shifts), scratches and
+    officials for any game the box-score refresh missed (raw.game_scratches,
+    raw.game_officials), and Kalshi's NHL game-winner markets with price
+    candles for newly settled ones (raw.kalshi_markets, raw.kalshi_candles).
+    A normal day is a few dozen requests. See ingestion/nhl_shifts.py,
+    ingestion/nhl_game_info.py and ingestion/kalshi.py."""
+    steps = (("NHL shift charts", "ingestion.nhl_shifts", "fetch_missing"),
+             ("Scratches and officials", "ingestion.nhl_game_info", "backfill"),
+             ("Kalshi markets", "ingestion.kalshi", "run"))
+    import importlib
+    for label, module, func in steps:
+        try:
+            counts = getattr(importlib.import_module(module), func)()
+            if counts.get("stopped_early") or counts.get("candles_stopped_early")                     or counts.get("listing_failed"):
+                logger.error(f"{label}: stopped early (non-fatal; the next run "
+                             f"resumes): {counts}")
+        except Exception as e:
+            logger.error(f"{label} failed (non-fatal): {e}")
+
+
 def props(due: bool = False, markets=None):
     """Player-props snapshot from The Odds API into raw.prop_snapshots
     (non-fatal). The props machine's job, never part of `daily`. Morning:
@@ -369,6 +393,8 @@ def daily():
     except Exception as e:
         logger.error(f"Could not record the finished daily run (non-fatal; news "
                      f"makes no pick today until it is recorded): {e}")
+    # After the marker: nothing above reads these, so they never delay picks
+    free_data()
     logger.info("DAILY REFRESH COMPLETE")
 
 
@@ -463,7 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("daily", "The picks machine's daily run: schedule and box scores, odds "
                  "snapshot (3 credits), free NHL-feed snapshot, ESPN lines, "
                  "power-play stats, shots, features, settlement, starters, "
-                 "injuries, picks")
+                 "injuries, picks, then the free loaders (free-data)")
     add("odds", "Odds snapshot (3 credits) + free NHL-feed snapshot + starters + "
                 "picks for games without one + arbitrage/middle alerts")
     p = add("close", "Closing-line snapshot before puck drop: moneyline only "
@@ -507,6 +533,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--season", type=_season_value, default=None, metavar="YYYYYYYY",
                    help="fill this whole season (about 27 requests; default: only "
                         "the current season's dates with unfilled rows)")
+    add("free-data", "Free loaders, no key: NHL shift charts, scratches and "
+                     "officials, Kalshi game-winner markets and price candles")
     return parser
 
 
@@ -563,6 +591,9 @@ def main(argv=None) -> int:
         news(due=args.due)
     elif cmd == "nhl-stats":
         nhl_stats(args.season)
+    elif cmd == "free-data":
+        if _wait_for_network():
+            free_data()
     return 0
 
 
