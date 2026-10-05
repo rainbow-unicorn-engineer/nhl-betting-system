@@ -110,6 +110,7 @@ Layer 5: INTERFACE   → dashboard/ → Streamlit (daily slate, bankroll, CLV re
 
 ### Model stack (layered, each feeds the next)
 - **Layer A — xG:** LightGBM per-shot goal probability. Blueprint: JNoel71/xG-Model. ~28 shot features, dual venue adjustment (Krzywicki + Schuckers-Curro). Target AUC > 0.77.
+  - **Status (2026-10-04):** built and tested (`features/xg.py`, `models/xg.py`, opt-in). It fails its pre-registered gate against MoneyPuck's xG (AUC 0.761 vs 0.787 on the same 605k held-out shots; log loss 0.0086 worse), though it is better calibrated. Swapping it into the moneyline features made walk-forward log loss 0.0018 worse (2.4 SE). The feature store keeps MoneyPuck's xG; ours is a fallback if MoneyPuck stops.
 - **Layer B — Goalie quality:** XGBoost save-prob + Monte Carlo PMF + Buhlmann shrinkage. Blueprint: saiemgilani. Outputs shrunk quality rating + goals-allowed PMF.
 - **Layer C — Game outcome:** LightGBM home-win probability + isotonic calibration. Blueprints: JNoel71/Game-Prediction (features), gschwaeb (betting), evjrob (Bayesian priors). Target log loss < 0.675, ECE < 0.02.
 - **Layer D — Totals:** Convolve home/away goal PMFs → total-goals distribution → price any O/U line.
@@ -169,6 +170,7 @@ Full column definitions in `db/schema.sql`.
 
 ## 9. Key Learnings (running log)
 
+- **Our own xG can't match MoneyPuck's from `raw.shots` alone (2026-10-04).** Trained walk-forward on earlier seasons, 24 shot inputs reach AUC 0.761 vs MoneyPuck's 0.787 on the same shots, and the moneyline model does worse with it (+0.0018 log loss). MoneyPuck sees the previous non-shot event (faceoffs, hits, giveaways, blocks) and shooter handedness, and has probably been fitted on the seasons we test on. Closing the gap needs NHL play-by-play events, not more tuning. Player xG features also don't help the props model (+0.00008 NLL whichever xG feeds them).
 - **Import name gotcha:** `nhl-api-py` → `from nhlpy import NHLClient`. (Cost us a smoke-test failure in Phase 1.)
 - **NHL API migration:** Old `statsapi.web.nhl.com` was deprecated in 2023. Anything built on it is broken. Current API is `api-web.nhle.com`.
 - **Accuracy ceiling:** ~62% is the public-model ceiling for NHL game prediction. JNoel71 hit 63.2% with 600+ features. Do not chase accuracy past this — chase *calibration* and *CLV*.

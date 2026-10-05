@@ -120,6 +120,79 @@ registry entry and failed its market check).
 How to run (read-only; writes nothing to the database):
     python -m models.xg --evaluate      # shot-level gate, X1 and X2
     python -m models.xg --downstream    # gate + moneyline + props test
+
+STATUS (run 2026-10-04, read-only; pre-registration committed in 3dae426
+before the first real-data run)
+=====================================================================
+
+VERDICT: the gate FAILS (AUC and log loss), so by the downstream rule
+our xG is NOT adopted. The feature store keeps MoneyPuck's xG; this
+module stays an opt-in experiment. No production default changed.
+
+Check first: the MoneyPuck arm rebuilt in memory (team xG sums, goalie
+GSAx and high-danger counts, the league GSAx/60 prior) equals the stored
+SQL path exactly for 2021-22 and 2022-23.
+
+Shot level, pooled over 605,110 held-out shots of 2021-22 .. 2025-26
+(43,047 goals; no shot lacked a MoneyPuck value):
+
+  variant  AUC ours / MP    log loss ours / MP   diff (SE)           ECE ours / MP  gate
+  X1       0.7578 / 0.7865  0.22581 / 0.21605    +0.00976 (0.00025)  0.0054 / 0.0110  FAIL
+  X2       0.7608 / 0.7865  0.22465 / 0.21605    +0.00860 (0.00025)  0.0048 / 0.0110  FAIL
+
+(SE clustered by game: 0.00026 for both. ECE = decile ECE; equal-width
+ECE X2 0.0045 vs MP 0.0103.) X2 passes calibration (2) and fails AUC (1,
+needs >= 0.7815) and log loss (3, it is about 35 SE worse). The prior-
+event inputs help (X2 beats X1 by 0.003 AUC, 0.0012 log loss), but not
+nearly enough.
+
+X2 by season (AUC ours / MP; log loss diff, SE about 0.00055):
+  2021-22 0.7596 / 0.7978  +0.0142    2024-25 0.7665 / 0.7785  +0.0029
+  2022-23 0.7559 / 0.7905  +0.0131    2025-26 0.7607 / 0.7764  +0.0039
+  2023-24 0.7624 / 0.7901  +0.0088
+MoneyPuck's lead is largest in the oldest seasons and shrinks to about
+0.012-0.016 AUC in the two newest, consistent with the caveat written in
+advance (MoneyPuck's model has probably been fitted on the older seasons
+we test on). Even the newest seasons fail the 0.005 bar.
+
+Reliability by decile, X2 (mean xG -> actual goal rate): ours tracks the
+diagonal everywhere except the top decile (0.251 -> 0.224); MoneyPuck
+under-predicts deciles 4-7 (e.g. 0.061 -> 0.077) and over-predicts the
+top decile (0.312 -> 0.254). Ours is the better-calibrated, MoneyPuck's
+the sharper (→ better at telling a good chance from a bad one), and
+sharpness is what AUC and log loss reward.
+
+Downstream (run anyway, for information; the rule fails at (a)):
+- Moneyline, 6,993 games, pooled walk-forward log loss MP 0.66132,
+  OUR 0.66311: OUR - MP = +0.00179 (SE 0.00075), about 2.4 SE WORSE.
+  By season: 2021-22 +0.0006, 2022-23 -0.0002, 2023-24 -0.0007,
+  2024-25 +0.0044 (SE 0.0026), 2025-26 +0.0048 (SE 0.0022). (b) FAILS.
+- Props, 248,589 player-games, NLL P0 1.578181, P_MP 1.578261,
+  P_OUR 1.578263: OUR - MP = +0.000002 (SE 0.00003). (c) passes. But
+  adding the five player xG features makes the props model slightly
+  WORSE whichever xG feeds them (P_MP - P0 = +0.00008, SE 0.000035,
+  about 2.3 SE): the props model doesn't want xG features at all.
+- Decision: a_gate False, b_moneyline_not_worse False,
+  c_props_within_1se True -> adopt False.
+
+Fixed after the first run, method unchanged: props_comparison crashed
+scoring NLL because props_sog.nb_nll takes one dispersion at a time and
+each row carries its own fold's; nb_nll_rows scores each row with its own
+fold's value, as run_props itself does. The props arms were not refitted
+differently.
+
+The other attempt at this track (branch model/xg-layer-a, file
+experiments/2026-10-04-xg-layer-a.md) pre-registered a different bar
+(AUC >= 0.77, log loss within +0.002 of MoneyPuck, equal-width ECE <=
+0.01, empty-net shots excluded, temperature scaling, a totals value
+check). This module's pre-registration is the one that governs. For the
+record, X2 fails that bar too (AUC 0.761, log loss +0.0086).
+
+What would close the gap (not tried; each would need its own pre-
+registration): the previous NON-shot event (faceoff, hit, giveaway,
+blocked shot) with its location and time, from the NHL play-by-play;
+shooter handedness (off-wing shots); per-rink location corrections fitted
+by us.
 """
 import logging
 from pathlib import Path
@@ -134,7 +207,7 @@ logger = logging.getLogger("nhl.models.xg")
 
 MODEL_NAME = "xg_lgbm"
 MODEL_VERSION = "v1"
-GATE_PASSED = None          # set by hand from STATUS after the run
+GATE_PASSED = False         # STATUS: AUC and log loss fail vs MoneyPuck (2026-10-04)
 CAL_FRAC = 0.15
 EARLY_STOP = 100
 CROSSFIT_FOLDS = 5
