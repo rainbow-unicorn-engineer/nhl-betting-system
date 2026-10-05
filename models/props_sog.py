@@ -364,6 +364,25 @@ DRIFT_PRIOR_ROWS = 2000
 # v1 (M1); set by the pre-registered decision rule recorded in STATUS.
 DRIFT_CORRECT = True
 
+# v3 variants (pre-registration above): features and the offset the
+# booster starts from. B1 = the v2 exposure baseline, B3 = the fixed one.
+from features.player_shots import FEATURES, FEATURES_PP, FEATURES_USAGE  # noqa: E402
+
+VARIANTS = {
+    "P0": {"features": list(FEATURES), "offset": "B1"},
+    "P1": {"features": list(FEATURES) + FEATURES_PP, "offset": "B1"},
+    "P2": {"features": list(FEATURES) + FEATURES_PP + FEATURES_USAGE,
+           "offset": "B1"},
+    "P3": {"features": list(FEATURES) + FEATURES_PP + FEATURES_USAGE,
+           "offset": "B3"},
+}
+ADOPT_ORDER = ("P1", "P2", "P3")
+ADOPT_SE = 2.0                 # Pk must beat the adopted one by >= 2 SE
+ADOPT_MIN_FOLDS = 3            # ... and in >= 3 of 5 folds
+# The variant run_props reports as M by default, set by the v3 adoption
+# rule (STATUS).
+DEFAULT_VARIANT = "P0"
+
 LGBM_PARAMS = {
     "objective": "poisson",
     "learning_rate": 0.03,
@@ -575,13 +594,15 @@ def score_block(y, mus: dict, alphas: dict) -> dict:
 
 def _paired_diffs(out: dict, nll: dict) -> None:
     """Paired NLL differences (and SEs) of each model key vs B1 and B0,
-    and M2 - M1 when both variants are present."""
+    M2 - M1 when both variants are present, and B3 - B1."""
     for m in ("M", "M1", "M2"):
         for b in ("B1", "B0"):
             if m in nll and b in nll:
                 out[f"diff_{m}_{b}"], out[f"se_{m}_{b}"] = _paired(nll[m], nll[b])
     if "M1" in nll and "M2" in nll:
         out["diff_M2_M1"], out["se_M2_M1"] = _paired(nll["M2"], nll["M1"])
+    if "B3" in nll and "B1" in nll:
+        out["diff_B3_B1"], out["se_B3_B1"] = _paired(nll["B3"], nll["B1"])
 
 
 def gate(pooled: dict, folds: list, key: str = "M") -> dict:
@@ -617,12 +638,15 @@ def drift_decision(pooled: dict, folds: list) -> dict:
 
 
 def run_props(register: bool = False, frame: pd.DataFrame = None,
-              params=None, drift_correct_m: bool | None = None) -> dict:
-    """Walk-forward evaluation of M, B1 and B0 (module docstring).
+              params=None, drift_correct_m: bool | None = None,
+              variant: str | None = None) -> dict:
+    """Walk-forward evaluation of M, B1, B0 and B3 (module docstring).
+    variant (default DEFAULT_VARIANT): one of VARIANTS, i.e. the booster's
+    features and its offset (B1 or B3); the gate is always against B1.
     Both booster variants are scored from the same fitted booster: M1 (v1,
-    no correction) and M2 (in-season drift correction); "M" — the model the
-    gate and the output speak for — is M2 when drift_correct_m (default
-    DRIFT_CORRECT), else M1.
+    no correction) and M2 (in-season drift correction, relative to the
+    variant's offset); "M" — the model the gate and the output speak for —
+    is M2 when drift_correct_m (default DRIFT_CORRECT), else M1.
     register=True raises: there is no registry entry for this model."""
     if register:
         raise RuntimeError(
@@ -630,25 +654,32 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             "based evaluation yet (it has not been checked against prop "
             "prices). Run "
             "with register=False.")
-    from features.player_shots import FEATURES
+    if variant is None:
+        variant = DEFAULT_VARIANT
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown variant {variant!r} (have {sorted(VARIANTS)})")
+    spec = VARIANTS[variant]
+    feats = spec["features"]
 
     df = load_props_dataset(frame)
-    X = df[FEATURES].to_numpy(dtype=float)
+    X = df[feats].to_numpy(dtype=float)
     y = df["sog"].to_numpy(dtype=float)
     meta = df[["season", "date"]]
     folds = walk_forward_folds(meta)
-    logger.info(f"Props SOG dataset: {len(df)} eligible player-games x "
-                f"{len(FEATURES)} features, {len(folds)} folds "
-                f"(purge {PURGE_DAYS}d)")
+    logger.info(f"Props SOG dataset ({variant}, offset {spec['offset']}): "
+                f"{len(df)} eligible player-games x {len(feats)} features, "
+                f"{len(folds)} folds (purge {PURGE_DAYS}d)")
 
     if drift_correct_m is None:
         drift_correct_m = DRIFT_CORRECT
     active = "M2" if drift_correct_m else "M1"
-    oof = {k: np.full(len(df), np.nan) for k in ("M", "M1", "M2", "B1", "B0")}
+    oof = {k: np.full(len(df), np.nan)
+           for k in ("M", "M1", "M2", "B1", "B0", "B3")}
     oof_alpha = {k: np.full(len(df), np.nan) for k in oof}
     oof_shift = np.full(len(df), np.nan)
     fold_metrics = []
     b0_all = np.clip(df["b0_mean"].to_numpy(float), *MU_CLIP)
+    b3_all = np.clip(df["b3_mean"].to_numpy(float), *MU_CLIP)
     seasons = df["season"].to_numpy()
     dates = df["date"].to_numpy()
 
@@ -658,18 +689,24 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         ratio = drift_ratio(df["league_sog60"].to_numpy(), train_mean)
         base = np.clip(exposure_baseline(df["shrunk_sog60"], df["exp_toi"],
                                          ratio), *MU_CLIP)
-        fm = fit_fold(X, y, base, tr, df["date"], params)
-        m1_val = predict(fm, X[val], base[val])
-        m1_tr = predict(fm, X[tr], base[tr])
+        off = base if spec["offset"] == "B1" else b3_all
+        if not np.isfinite(off[np.concatenate([tr, val])]).all():
+            raise ValueError(f"non-finite {spec['offset']} offset in fold "
+                             f"{fold.val_season}")
+        fm = fit_fold(X, y, off, tr, df["date"], params)
+        m1_val = predict(fm, X[val], off[val])
+        m1_tr = predict(fm, X[tr], off[tr])
         # M2: the booster's running same-season adjustment (earlier dates
         # only) divided out — on the validation season, and within each
         # training season from the in-sample predictions (for the alpha)
-        m2_val, shift_val = drift_correct(m1_val, base[val], seasons[val],
+        m2_val, shift_val = drift_correct(m1_val, off[val], seasons[val],
                                           dates[val])
-        m2_tr, _ = drift_correct(m1_tr, base[tr], seasons[tr], dates[tr])
+        m2_tr, _ = drift_correct(m1_tr, off[tr], seasons[tr], dates[tr])
         oof_shift[val] = shift_val
-        mu = {"M1": m1_val, "M2": m2_val, "B1": base[val], "B0": b0_all[val]}
-        mu_tr = {"M1": m1_tr, "M2": m2_tr, "B1": base[tr], "B0": b0_all[tr]}
+        mu = {"M1": m1_val, "M2": m2_val, "B1": base[val], "B0": b0_all[val],
+              "B3": b3_all[val]}
+        mu_tr = {"M1": m1_tr, "M2": m2_tr, "B1": base[tr], "B0": b0_all[tr],
+                 "B3": b3_all[tr]}
         alphas = {k: fit_nb_alpha(y[tr], mu_tr[k]) for k in mu}
         mu["M"], alphas["M"] = mu[active], alphas[active]
         for k, v in mu.items():
@@ -723,6 +760,7 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             pooled[f"ece{tag}_{k}"] = expected_calibration_error(hit, p)
     _paired_diffs(pooled, nll)
     pooled["model"] = active
+    pooled["variant"] = variant
     pooled["gate"] = gate(pooled, fold_metrics)
     pooled["gate_passed"] = pooled["gate"]["passed"]
     pooled["gate_M1"] = gate(pooled, fold_metrics, "M1")
@@ -745,7 +783,84 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         out[f"mu_{k}"] = oof[k][scored]
         out[f"alpha_{k}"] = oof_alpha[k][scored]
     out["log_c"] = oof_shift[scored]
-    return {"folds": fold_metrics, "pooled": pooled, "oof": out}
+    return {"folds": fold_metrics, "pooled": pooled, "oof": out,
+            "variant": variant}
+
+
+# ── v3: comparing variants and the adoption rule ───────────────────
+
+def row_nll(res: dict, key: str = "M") -> pd.Series:
+    """Per scored player-game, the NLL of the actual SOG under `key`'s
+    mean and its own fold alpha, indexed by (player_id, game_id)."""
+    o = res["oof"]
+    nll = nb_nll_rows(o["sog"], o[f"mu_{key}"], o[f"alpha_{key}"])
+    return pd.Series(nll, index=pd.MultiIndex.from_frame(
+        o[["player_id", "game_id"]]), name=key).sort_index()
+
+
+def nb_nll_rows(y, mu, alpha) -> np.ndarray:
+    """NB NLL with a per-row alpha (each fold has its own)."""
+    y, mu, alpha = (np.asarray(y, float), np.asarray(mu, float),
+                    np.asarray(alpha, float))
+    out = np.empty(len(y))
+    for a in np.unique(alpha):
+        sel = alpha == a
+        out[sel] = nb_nll(y[sel], mu[sel], a)
+    return out
+
+
+def compare_variants(res_new: dict, res_old: dict) -> dict:
+    """Paired comparison of two runs' M on the same player-games: pooled
+    NLL(new) - NLL(old) with its paired SE, and the folds in which new's
+    NLL is lower."""
+    a, b = row_nll(res_new), row_nll(res_old)
+    if not a.index.equals(b.index):
+        raise ValueError("the two runs scored different player-games")
+    diff, se = _paired(a.to_numpy(), b.to_numpy())
+    fo = {int(f["val_season"]): f["nll_M"] for f in res_old["folds"]}
+    fn = {int(f["val_season"]): f["nll_M"] for f in res_new["folds"]}
+    if set(fo) != set(fn):
+        raise ValueError("the two runs have different folds")
+    wins = sum(fn[s] < fo[s] for s in fn)
+    return {"diff": diff, "se": se, "folds_won": int(wins),
+            "n_folds": len(fn),
+            "fold_diffs": {s: fn[s] - fo[s] for s in sorted(fn)}}
+
+
+def adoption(results: dict, start: str = "P0",
+             order=ADOPT_ORDER) -> dict:
+    """The pre-registered v3 adoption rule. results: variant -> run_props
+    result. A starts at `start`; each Pk in `order` replaces A if (a) Pk
+    passes the gate vs B1, (b) NLL(Pk) - NLL(A) <= -ADOPT_SE paired SE
+    and (c) Pk's NLL is lower than A's in >= ADOPT_MIN_FOLDS folds."""
+    adopted = start
+    steps = []
+    for k in order:
+        if k not in results:
+            continue
+        cmp_ = compare_variants(results[k], results[adopted])
+        a = bool(results[k]["pooled"]["gate"]["passed"])
+        b = bool(cmp_["diff"] <= -ADOPT_SE * cmp_["se"])
+        c = bool(cmp_["folds_won"] >= ADOPT_MIN_FOLDS)
+        steps.append({"variant": k, "against": adopted, "gate_passed": a,
+                      "nll_by_2se": b, "folds_ok": c,
+                      **{f"cmp_{x}": v for x, v in cmp_.items()},
+                      "adopted": a and b and c})
+        if a and b and c:
+            adopted = k
+    return {"adopted": adopted, "steps": steps}
+
+
+def run_v3(frame: pd.DataFrame = None, params=None,
+           variants=("P0",) + ADOPT_ORDER) -> dict:
+    """Every v3 variant on one feature frame, then the adoption rule.
+    Read only (run_props with register=False)."""
+    if frame is None:
+        from features.player_shots import load_player_features
+        frame = load_player_features()
+    results = {v: run_props(register=False, frame=frame, params=params,
+                            variant=v) for v in variants}
+    return {"results": results, "decision": adoption(results)}
 
 
 def _print_report(res: dict) -> None:
@@ -771,11 +886,24 @@ def main(argv=None):
                     "registers)")
     parser.add_argument("--evaluate", action="store_true",
                         help="run the evaluation and print the metrics")
+    parser.add_argument("--variant", choices=sorted(VARIANTS), default=None,
+                        help=f"v3 variant to evaluate (default "
+                             f"{DEFAULT_VARIANT})")
+    parser.add_argument("--v3", action="store_true",
+                        help="run every v3 variant and the adoption rule")
     args = parser.parse_args(argv)
+    if args.v3:
+        out = run_v3()
+        for v, res in out["results"].items():
+            print(f"== {v}")
+            _print_report(res)
+        import json
+        print(json.dumps(out["decision"], indent=1, default=float))
+        return out
     if not args.evaluate:
         parser.print_help()
         return None
-    res = run_props(register=False)
+    res = run_props(register=False, variant=args.variant)
     _print_report(res)
     return res
 

@@ -520,9 +520,10 @@ class TestWalkForwardWiring:
         P.run_props(frame=frame, params=params)
         data = P.load_props_dataset(frame)
         folds = P.walk_forward_folds(data[["season", "date"]])
-        assert len(calls) == 4 * len(folds)
+        assert len(calls) == 5 * len(folds)
         last = folds[-1]
-        m1, m2, b1 = calls[-4], calls[-3], calls[-2]   # order M1, M2, B1, B0
+        # order M1, M2, B1, B0, B3
+        m1, m2, b1 = calls[-5], calls[-4], calls[-3]
         tr = data.iloc[last.train_idx]
         assert tr["season"].nunique() == 2        # two training seasons
         shift = P.drift_shift(tr["season"], tr["date"], np.log(m1 / b1))
