@@ -112,7 +112,46 @@ over/under leg stays subject to the totals model's own gate
 Production OT_BETA: refit by the same method on every completed game
 2020-21 through 2025-26 and written into OT_BETA by hand.
 
-STATUS: pending (evaluation not yet run).
+STATUS (2026-10-04): GATE FAILED. The bet checker keeps withholding a
+verdict on same-game slips (WITHHELD); GATE_PASSED stays False.
+2,408 games: 1,398 in 2024-25 (10-book consensus; every 2024-25 game
+had a half-point line) and 1,010 in 2025-26 (DraftKings). Out-of-fold
+OT_BETA 0.345 (2024-25 fold) and 0.366 (2025-26 fold). Joint minus
+independence, 4-way log loss (negative = joint better; z = diff / SE):
+  A  +0.00005  SE 0.00046  z +0.11   fail   (2024-25 +0.00027, 2025-26 -0.00025)
+  B  +0.00008  SE 0.00046  z +0.18   fail   (+0.00032, -0.00024)
+  C  +0.00005  SE 0.00046  z +0.10   fail   (+0.00027, -0.00026)
+  D  +0.00011  SE 0.00052  z +0.20   fail   (+0.00036, -0.00025)
+  E  +0.00011  SE 0.00049  z +0.22   fail   (+0.00033, -0.00021)
+  F  +0.00031  SE 0.00052  z +0.61   fail   (+0.00071, -0.00024)
+(4-way log loss itself: A 1.35807 joint vs 1.35802 independence.)
+No variant comes close; each is slightly behind independence pooled,
+ahead in 2025-26 and behind in 2024-25.
+What the numbers say:
+- The joint model says "favourite wins AND over" happens 0.44 points
+  more often than the product (A: 30.14% vs 29.70% on average). In the
+  data it happened 29.07% of the time; the realised link between the
+  two legs (covariance of the favourite-win and over surprises) was
+  +0.0011 ± 0.0050 (prediction +0.0044): the right sign, about a
+  quarter of the size, and well inside the noise.
+- The test could not have passed. If the joint model were exactly
+  right, its expected gain would be 0.00027 per game against an SE of
+  0.00047 (z -0.57): the chance of clearing 2 SE with 2,408 games was
+  about 8%, and an expected z of -2 needs about 30,000 games (more than
+  twenty NHL seasons). So this is "not proven", not "proven wrong": the
+  dependence is too small to measure on two seasons of one game market.
+- The margin reweighting (D vs A) and the overtime lean (E vs A) change
+  the result by less than 0.0001; so does the base grid (C vs A).
+- The production overtime lean refit on every completed game 2020-21
+  through 2025-26 is 0.2931 (OT_BETA): overtime is close to a coin flip,
+  the stronger side wins it slightly more often.
+What it means for betting: a book's same-game parlay price builds in
+some correlation, so treating the legs as independent (or using this
+joint model) gives an EV that cannot be trusted either way. The checker
+keeps saying so. The pricer stays available for research (price_legs).
+Re-run when far more priced games exist (live 2026-27 snapshots add
+about 1,300 games a season) or when a sharper market tests it (books'
+own same-game parlay prices, if they are ever collected).
 
 Run: python -m betting.sgp --evaluate   (read-only; writes nothing)
 """
@@ -133,8 +172,8 @@ GATE_PASSED = False
 PASS_SE = 2.0
 VALIDATION_SEASONS = (20242025, 20252026)
 # Production overtime lean (see joint_grid step 4); set by hand from the
-# evaluation's fit on every completed game 2020-21..2025-26
-OT_BETA = 0.0
+# evaluation's fit on every completed game 2020-21..2025-26 (2026-10-04)
+OT_BETA = 0.2931
 OT_PROB_CLIP = (0.02, 0.98)
 TARGET_CLIP = (0.005, 0.995)
 ELO_HOME_ADV = 50.0
@@ -652,6 +691,49 @@ def summarize(scored: pd.DataFrame) -> dict:
     return out
 
 
+def power_if_true(data: pd.DataFrame, variant: str = "A") -> dict:
+    """How well the test could detect the joint model if it were exactly
+    right (reported, not decisive): per game, the expected joint-minus-
+    independence log loss under the joint's own probabilities (minus the
+    KL divergence → how far apart two sets of probabilities are) and its
+    variance. Returns the expected diff, its SE, z, the chance of
+    clearing PASS_SE with these games, and the games an expected z of
+    -PASS_SE would need."""
+    from scipy.stats import norm
+
+    from models.totals import poisson_pmf
+    spec = VARIANTS[variant]
+    kl, var = [], []
+    for r in data.itertuples(index=False):
+        lh, la = ((r.lam_h, r.lam_a) if spec["base"] == "model"
+                  else (r.env_h, r.env_a))
+        w = (np.array([r.w0, r.w1, r.w2, r.w3, r.w4])
+             if spec["weights"] == "fold" else None)
+        p_home = r.p_home if spec["p_home"] == "market" else r.p_lgbm
+        g, q = joint_grid(poisson_pmf(np.array([lh]))[0],
+                          poisson_pmf(np.array([la]))[0], p_home=p_home,
+                          p_over=r.p_over if spec["tilt_total"] else None,
+                          line=r.line, margin_weights=w,
+                          beta=r.beta if spec["beta"] == "fit" else 0.0)
+        f = final_scores(g, q)
+        pj = np.clip(four_way(f, r.p_home >= 0.5, r.line), 1e-12, None)
+        pi = np.clip(four_way_independent(f, r.p_home >= 0.5, r.line),
+                     1e-12, None)
+        dd = np.log(pi) - np.log(pj)        # joint minus independence
+        kl.append(float(-(pj @ dd)))
+        var.append(float(pj @ dd ** 2 - (pj @ dd) ** 2))
+    kl, var = np.array(kl), np.array(var)
+    n = len(kl)
+    exp_diff, se = -float(kl.mean()), float(np.sqrt(var.sum()) / n)
+    return {"n": n, "expected_diff": exp_diff, "se": se,
+            "z": exp_diff / se if se > 0 else float("nan"),
+            "power": float(norm.cdf((-PASS_SE * se - exp_diff) / se))
+            if se > 0 else float("nan"),
+            "games_needed": int(np.ceil((PASS_SE * np.sqrt(var.mean())
+                                         / kl.mean()) ** 2))
+            if kl.mean() > 0 else None}
+
+
 def build_validation_data(with_lgbm: bool = True) -> pd.DataFrame:
     """Validation games with markets, outcomes, out-of-fold totals rates,
     fold OT_BETA and (with_lgbm) the win model's out-of-fold P(home)."""
@@ -695,6 +777,8 @@ def evaluate(variants: Sequence[str] = tuple(VARIANTS)) -> dict:
         report["variants"][v] = summarize(score_games(d, v))
     report["gate_passed"] = all(report["variants"][v]["passes"]
                                 for v in DECISIVE if v in report["variants"])
+    if "A" in variants:
+        report["power_A"] = power_if_true(data, "A")
     report["production_ot_beta"] = production_ot_beta()
     return report
 
@@ -715,6 +799,12 @@ def format_report(report: dict) -> str:
                          f" / {b['fav_over_indep']:.4f}")
     lines.append(f"  decisive variants {DECISIVE}: GATE "
                  f"{'PASSED' if report['gate_passed'] else 'FAILED'}")
+    if "power_A" in report:
+        p = report["power_A"]
+        lines.append(f"  if A were exactly right: expected diff "
+                     f"{p['expected_diff']:+.5f} (SE {p['se']:.5f}, z "
+                     f"{p['z']:+.2f}), chance of passing {p['power']:.0%}, "
+                     f"games needed for z -{PASS_SE:g}: {p['games_needed']}")
     lines.append(f"  production OT_BETA (2020-21..2025-26): "
                  f"{report['production_ot_beta']:.4f}")
     return "\n".join(lines)

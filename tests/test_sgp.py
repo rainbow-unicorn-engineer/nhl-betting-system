@@ -305,6 +305,23 @@ class TestScoring:
         assert summ["n"] == 3 and 20242025 in summ["by_season"]
 
 
+def test_power_if_true_is_small_for_a_weak_link():
+    data = pd.DataFrame({
+        "game_id": range(200), "season": 20242025,
+        "p_home": np.linspace(0.35, 0.7, 200), "line": 6.5, "p_over": 0.5,
+        "lam_h": 3.0, "lam_a": 2.9, "env_h": 3.0, "env_a": 2.8,
+        "w0": 1.15, "w1": 0.51, "w2": 0.72, "w3": 1.34, "w4": 1.0,
+        "beta": 0.3})
+    p = sgp.power_if_true(data, "A")
+    assert p["n"] == 200 and p["expected_diff"] < 0      # joint helps if true
+    assert 0 < p["power"] < 0.5 and p["games_needed"] > 200
+
+
+def test_failed_gate_keeps_the_checker_withholding():
+    """The pre-registered result (STATUS): the joint pricer is not used."""
+    assert sgp.GATE_PASSED is False
+
+
 def test_cli_without_evaluate_runs_nothing(capsys):
     assert sgp.main([]) is None
     assert "--evaluate" in capsys.readouterr().out
