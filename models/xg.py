@@ -467,13 +467,25 @@ def ml_comparison(shots: pd.DataFrame, ours_col: str = XG_COL) -> dict:
 
 # ── Downstream: props ──────────────────────────────────────────────
 
+def nb_nll_rows(y, mu, alpha) -> np.ndarray:
+    """Per-row negative-binomial NLL when each row carries its own fold's
+    dispersion alpha (props_sog.nb_nll takes one alpha at a time)."""
+    from models.props_sog import nb_nll
+    y, mu, alpha = (np.asarray(v, float) for v in (y, mu, alpha))
+    out = np.empty(len(y))
+    for a in np.unique(alpha):
+        sel = alpha == a
+        out[sel] = nb_nll(y[sel], mu[sel], float(a))
+    return out
+
+
 def props_comparison(shots: pd.DataFrame, ours_col: str = XG_COL,
                      frame: pd.DataFrame = None) -> dict:
     """P0 (today's props v2), P_MP and P_OUR (+ PROPS_XG_FEATURES);
     paired per-player-game NLL of the reported model M."""
     from features.player_shots import FEATURES, load_player_features
     from features.xg import PROPS_XG_FEATURES, player_xg_features
-    from models.props_sog import nb_nll, run_props
+    from models.props_sog import run_props
 
     if frame is None:
         frame = load_player_features()
@@ -490,8 +502,7 @@ def props_comparison(shots: pd.DataFrame, ours_col: str = XG_COL,
             keys = kk
         elif not np.array_equal(keys, kk):
             raise RuntimeError("props arms scored different player-games")
-        nll[k] = nb_nll(o["sog"].to_numpy(float), o["mu_M"].to_numpy(float),
-                        o["alpha_M"].to_numpy(float))
+        nll[k] = nb_nll_rows(o["sog"], o["mu_M"], o["alpha_M"])
     games = keys[:, 1]
     out = {"n": int(len(keys)),
            **{f"nll_{k}": float(v.mean()) for k, v in nll.items()},

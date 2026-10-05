@@ -230,6 +230,15 @@ class TestMetrics:
         assert not MX.downstream_decision(True, ml_ok, pr_bad)["adopt"]
         assert not MX.downstream_decision(True, ml_ok, pr_ok)["moneyline_improves_2se"]
 
+    def test_nb_nll_rows_uses_each_rows_own_alpha(self):
+        from models.props_sog import nb_nll
+        y = np.array([0.0, 2.0, 3.0, 1.0])
+        mu = np.array([1.5, 2.0, 2.5, 1.0])
+        alpha = np.array([0.2, 0.2, 0.5, 0.0])
+        got = MX.nb_nll_rows(y, mu, alpha)
+        want = [float(nb_nll(y[i:i + 1], mu[i:i + 1], alpha[i])[0]) for i in range(4)]
+        np.testing.assert_allclose(got, want)
+
 
 class TestFeatureStoreHelpers:
     def shots(self):
