@@ -20,6 +20,7 @@ Terms used below:
 | 2026-10-02 | Shots-on-goal props model v1 | `models/props_sog.py`, `features/player_shots.py` | Passed as a forecaster: beat both baselines in 5/5 seasons, about 19 SE. |
 | 2026-10-03 | Props model v2: in-season drift correction | `models/props_sog.py` (`DRIFT_CORRECT`) | Adopted by its rule, but marginally: −1.8 SE vs v1, with worse pooled calibration. The drift's real cause is in the baseline. |
 | 2026-10-03 | Props market check vs ESPN BET and DraftKings | `models/props_market_check.py` | Does not beat the market: the book's no-vig price had lower log loss, about 3 SE pooled. Flat-bet ROI intervals all include 0. |
+| 2026-10-04 | Same-game parlay joint pricer: win x over/under (variants A-F) | `betting/sgp.py` | Fails: no variant beats multiplying the two chances (A +0.00005 ± 0.00046 log loss over 2,408 games; best z +0.10). Underpowered by nature: an exactly right model would need ~30,000 games to pass. The checker keeps withholding same-game verdicts. |
 
 ## Re-running
 
@@ -27,6 +28,7 @@ Terms used below:
 .venv\Scripts\python -m models.totals                 # totals walk-forward and gate (registers the production model)
 .venv\Scripts\python -m models.props_sog --evaluate    # props walk-forward and gate (read-only)
 .venv\Scripts\python -m models.props_market_check     # props vs the market (read-only)
+.venv\Scripts\python -m betting.sgp --evaluate          # same-game parlay pricer vs independence (read-only)
 ```
 
 The goalie variants run from Python: `models.totals.run_totals(register=False, variant="C", with_roles=True)`.

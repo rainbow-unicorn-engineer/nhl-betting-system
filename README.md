@@ -50,7 +50,7 @@ The design choice behind everything else is calibration over accuracy. Research 
 | 2 | Feature store (team form, goalie quality, rest and travel, Elo ratings) and a baseline model | Done: walk-forward log loss 0.6829, under its 0.69 gate |
 | 3 | Moneyline model, betting engine, backtest, dashboard, daily recommendations, totals model, bet checker, arbitrage and middle alerts | Done. The totals model failed its gate, and its 2026-09-29 rebuild (v2) fails the stricter gate too: it is more accurate, but the team stats still add nothing beyond the league's scoring rate. Totals betting is off |
 | 4 | Live-season operations | In progress. Done: paper settlement, the CLV ledger, confirmed starters, locked picks with a pre-game closing snapshot, per-game bet limits, named-bookmaker odds requests (Kalshi and Polymarket included, at half the credits), the free NHL odds feed stored beside The Odds API, ESPN injuries, power-play stats, ESPN opening and over/under prices, props-line collection (history from ESPN, live from The Odds API), a bet ledger for real singles and parlays with balances, and the news monitor (starting goalies, line combinations and injuries every 15 minutes on game days, re-scoring a game when its starter changes). Remaining: cloud migration, a daily recommendation digest, and the rest of the Odds API historical backfill (2024-25 closing prices are in; 2023-24 and 2022-23 are not) |
-| 5 | Other sports and same-game parlays | Not started |
+| 5 | Other sports and same-game parlays | A same-game parlay pricer exists (`betting/sgp.py`) but failed its pre-registered test on 2024-25 and 2025-26 closing prices (2026-10-04), so the checker still gives same-game slips no verdict. Other sports not started |
 
 Where the evidence stands, from [docs/phase3_results.md](docs/phase3_results.md):
 
@@ -149,6 +149,7 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 
 - **Moneyline (`lgbm_market`).** A LightGBM model, a gradient-boosted decision-tree library, that starts from the market's own probability and learns corrections to it instead of rediscovering the market from scratch. Games without a line fall back to a market-blind version. Temperature scaling calibrates the output. The recommendation job retrains it from the database on every run.
 - **Totals (`poisson_totals` v2).** Predicts each side's regulation goals, then combines the two into a total-goals distribution that can price any over/under line. Version 2 (2026-09-29) fixes two measured faults. It reweights the combined score distribution by winning margin, because real games end tied in regulation more often (22% against the 17% that independent scores imply) and by one goal less often. And it removes the model's drift within a season, using only games played before the one being priced. The walk-forward error score (NLL, negative log-likelihood: lower is better) improved from 2.1867 to 2.1801, and over/under log loss at the DraftKings line from 0.7051 to 0.6958 over 1,011 games (0.693 is a coin flip). But the gate now gives the baseline, the league's recent scoring rate, the same margin fix, and the baseline still wins, 2.1787, with the model ahead in only 2 of 5 seasons. So the team stats add nothing, `GATE_PASSED` stays False, and the predictions are stored for the bet checker and the alerts but never bet. The checker and alerts get the margin fix automatically. A new market check compares the model with the no-vig over/under price; 24 priced games are too few to judge (it needs 200). The likely route to a totals edge is to start from the market's own total, once 2026-27 over/under snapshots build up.
+- **Same-game parlay pricer (`betting/sgp.py`, research only).** A same-game parlay is one slip with several bets on the same game; its legs are linked (if the favourite wins, the game was a little more likely to go over), so multiplying their chances is wrong. The pricer builds one game's score grid from the totals model, reshapes it to match a win probability (and optionally the market's over/under price), and prices any mix of win, total, team-total and puck-line legs from it. Its pre-registered test (4-outcome log loss of "favourite or underdog" x "over or under", against simply multiplying the same two chances, 2,408 games) failed: joint +0.00005 worse than independence, with a standard error (→ the size of the random noise in that number) of 0.00046; every variant was within the noise. The test could hardly have passed: even an exactly right model would need about 30,000 games. So the bet checker keeps withholding a verdict on same-game slips. `python -m betting.sgp --evaluate` re-runs it (read-only).
 - **Baseline (`baseline_logreg`).** Logistic regression kept as a check that the features carry real signal without look-ahead.
 
 ### The daily chain
@@ -407,6 +408,7 @@ LIMIT 50;
 | Module | Use |
 |---|---|
 | `betting.checker --leg "MTL@BUF ml away -125" --leg "SJS@WSH total over 6.5 -110"` | Is this bet or parlay +EV? Uses stored model probabilities; add `--date`, `--price` for a boosted parlay, `--bankroll` |
+| `betting.sgp --evaluate` | Re-runs the same-game parlay pricer's pre-registered test against 2024-25 and 2025-26 closing prices (read-only, a minute or less). Without `--evaluate` it prints its options and runs nothing |
 | `betting.recommend --date 2026-01-15 --simulate --dry-run` | Replays a past slate as if it were upcoming, writing nothing. Also takes `--bankroll` and `--edge-min` |
 | `betting.settle --report` | CLV and ROI report, with a count of settled bets that have a CLV |
 | `betting.ledger [--no-settle]` | Settles the bet ledger's open bets, then prints each bettor's balance and profit/loss per platform |
@@ -430,7 +432,7 @@ LIMIT 50;
 | `ingestion.odds_api [--markets h2h,spreads,totals]` | One odds snapshot: 3 credits for the default markets, 1 for `h2h`, with the default books. Skipped, at no cost, when no game starts in the next 24 hours |
 | `config.migrate [--seed-venues]` | Creates any tables and adds any columns a database made from an older `db/schema.sql` is missing. Pipeline commands do this on their own. `--seed-venues` also applies `db/seed_venues.sql` |
 
-`--help` prints the options and runs nothing for `pipeline.py` and each of its commands, `betting.checker`, `betting.recommend`, `betting.settle`, `betting.alerts`, `betting.promo`, `betting.montecarlo`, `ingestion.odds_api`, `ingestion.odds_history`, `ingestion.espn_odds`, `ingestion.espn_props`, `ingestion.espn_injuries`, `ingestion.nhl_stats`, `ingestion.nhl_odds`, `ingestion.props_odds`, `ingestion.dailyfaceoff`, `ingestion.dailyfaceoff_lines`, `betting.news`, `models.totals`, and `config.migrate`, so it never spends credits or writes to the database. `models.baseline`, `models.lgbm`, and `betting.backtest` take no options and start their full run whatever you pass them.
+`--help` prints the options and runs nothing for `pipeline.py` and each of its commands, `betting.checker`, `betting.sgp`, `betting.recommend`, `betting.settle`, `betting.alerts`, `betting.promo`, `betting.montecarlo`, `ingestion.odds_api`, `ingestion.odds_history`, `ingestion.espn_odds`, `ingestion.espn_props`, `ingestion.espn_injuries`, `ingestion.nhl_stats`, `ingestion.nhl_odds`, `ingestion.props_odds`, `ingestion.dailyfaceoff`, `ingestion.dailyfaceoff_lines`, `betting.news`, `models.totals`, and `config.migrate`, so it never spends credits or writes to the database. `models.baseline`, `models.lgbm`, and `betting.backtest` take no options and start their full run whatever you pass them.
 
 ## Configuration
 
@@ -608,7 +610,7 @@ ingestion/             nhl_api, moneypuck, odds_api, espn_odds, dailyfaceoff (st
 features/              team, goalie, schedule, and Elo builders; build_all orchestrates
 models/                baseline, lgbm (moneyline), totals; artifacts/ holds calibration plots
 betting/               engine, recommend, settle, backtest, checker, alerts, promo, ledger (real bets),
-                       news (the news monitor), montecarlo
+                       news (the news monitor), montecarlo, sgp (same-game parlay pricer, research only)
 dashboard/app.py       Streamlit control room: Today, Check a bet, My bets, Model, Backtest and Bankroll tabs
 dashboard/my_bets.py   The My bets tab: record real bets and parlays, results, balances
 dashboard/today.py     The Today tab: pending picks, stake limits in use, today's news, prices by book
