@@ -82,8 +82,14 @@ ORDER BY gg.player_id, g.season, g.date, gg.game_id
 """
 
 
-def load_goalie_base(season: Optional[int] = None) -> pd.DataFrame:
-    """Load per-appearance goalie stats joined with per-goalie shot xG."""
+def load_goalie_base(season: Optional[int] = None,
+                     xg_sums: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Load per-appearance goalie stats joined with per-goalie shot xG.
+
+    xg_sums (optional; models/xg.py's downstream test): per (game_id,
+    goalie_id) xga_shots, hd_att, hd_goals from another per-shot xG column
+    (features.xg.goalie_xg_sums). They replace MoneyPuck's before GSAx is
+    computed; the xG-free counts (fen_att, fen_goals) are kept."""
     season_filter = "AND g.season = :season" if season else ""
     sql = BASE_SQL.format(season_filter=season_filter)
     params = {"hd": HD_XG_THRESHOLD}
@@ -91,17 +97,27 @@ def load_goalie_base(season: Optional[int] = None) -> pd.DataFrame:
         params["season"] = season
     with engine.connect() as conn:
         df = pd.read_sql(text(sql), conn, params=params)
+    if xg_sums is not None:
+        df = df.drop(columns=["xga_shots", "hd_att", "hd_goals"]).merge(
+            xg_sums[["game_id", "goalie_id", "xga_shots", "hd_att", "hd_goals"]],
+            on=["game_id", "goalie_id"], how="left")
 
     # GSAx per appearance: expected minus actual goals on unblocked attempts
     df["gsax"] = df["xga_shots"] - df["fen_goals"]
     return df
 
 
-def league_priors(season: int) -> Tuple[float, float]:
+def league_priors(season: int, xg_shots: Optional[pd.DataFrame] = None,
+                  xg_col: Optional[str] = None) -> Tuple[float, float]:
     """
     Point-in-time league priors for shrinkage targets: the PREVIOUS season's
     league SV% and league GSAx/60. Falls back to long-run constants when no
     prior season exists in the DB.
+
+    xg_shots / xg_col (optional; models/xg.py's downstream test): compute
+    the GSAx/60 prior from that per-shot xG column instead of MoneyPuck's,
+    with features.xg.gsax60_prior, which repeats the SQL below exactly
+    (including its TOI being counted once per joined shot row).
     """
     prev = season - 10001  # 20212022 -> 20202021
     with engine.connect() as conn:
@@ -110,20 +126,30 @@ def league_priors(season: int) -> Tuple[float, float]:
             FROM raw.goalie_games gg JOIN raw.games g USING (game_id)
             WHERE g.season = :prev AND gg.toi_seconds > 0
         """), {"prev": prev}).one()
-        gsax_row = conn.execute(text("""
-            SELECT 3600.0 * SUM(s.xg_moneypuck - s.is_goal::int)
-                   / NULLIF(SUM(gg.toi_seconds), 0) AS gsax60
-            FROM raw.goalie_games gg
-            JOIN raw.games g USING (game_id)
-            LEFT JOIN raw.shots s ON s.game_id = gg.game_id
-                                 AND s.goalie_id = gg.player_id
-            WHERE g.season = :prev AND gg.toi_seconds > 0
-        """), {"prev": prev}).one()
+        if xg_shots is None:
+            gsax60 = conn.execute(text("""
+                SELECT 3600.0 * SUM(s.xg_moneypuck - s.is_goal::int)
+                       / NULLIF(SUM(gg.toi_seconds), 0) AS gsax60
+                FROM raw.goalie_games gg
+                JOIN raw.games g USING (game_id)
+                LEFT JOIN raw.shots s ON s.game_id = gg.game_id
+                                     AND s.goalie_id = gg.player_id
+                WHERE g.season = :prev AND gg.toi_seconds > 0
+            """), {"prev": prev}).one().gsax60
+        else:
+            from features.xg import gsax60_prior
+            apps = pd.read_sql(text("""
+                SELECT gg.game_id, gg.player_id, gg.toi_seconds
+                FROM raw.goalie_games gg JOIN raw.games g USING (game_id)
+                WHERE g.season = :prev AND gg.toi_seconds > 0
+            """), conn, params={"prev": prev})
+            gsax60 = gsax60_prior(apps, xg_shots[xg_shots["season"] == prev],
+                                  xg_col)
 
     if row.sv is None:
         logger.info(f"No prior season for {season}; using fallback league priors.")
         return LEAGUE_SV_FALLBACK, LEAGUE_GSAX60_FALLBACK
-    gsax60 = gsax_row.gsax60 if gsax_row.gsax60 is not None else LEAGUE_GSAX60_FALLBACK
+    gsax60 = gsax60 if gsax60 is not None else LEAGUE_GSAX60_FALLBACK
     return float(row.sv), float(gsax60)
 
 

@@ -517,13 +517,16 @@ def drift_decision(pooled: dict, folds: list) -> dict:
 
 
 def run_props(register: bool = False, frame: pd.DataFrame = None,
-              params=None, drift_correct_m: bool | None = None) -> dict:
+              params=None, drift_correct_m: bool | None = None,
+              features: list | None = None) -> dict:
     """Walk-forward evaluation of M, B1 and B0 (module docstring).
     Both booster variants are scored from the same fitted booster: M1 (v1,
     no correction) and M2 (in-season drift correction); "M" — the model the
     gate and the output speak for — is M2 when drift_correct_m (default
     DRIFT_CORRECT), else M1.
-    register=True raises: there is no registry entry for this model."""
+    register=True raises: there is no registry entry for this model.
+    features: the input columns (default features.player_shots.FEATURES;
+    models/xg.py's props test adds its player xG columns)."""
     if register:
         raise RuntimeError(
             "props_sog registration is disabled: the model has no price-"
@@ -532,6 +535,7 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             "with register=False.")
     from features.player_shots import FEATURES
 
+    FEATURES = list(FEATURES if features is None else features)
     df = load_props_dataset(frame)
     X = df[FEATURES].to_numpy(dtype=float)
     y = df["sog"].to_numpy(dtype=float)
