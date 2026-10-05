@@ -470,9 +470,112 @@ CREATE TABLE IF NOT EXISTS raw.shifts (
     start_time      INTEGER NOT NULL,          -- seconds into period
     end_time        INTEGER,
     duration        INTEGER,
-    team            VARCHAR(3)
+    team            VARCHAR(3),
+    nhl_shift_id    BIGINT,                    -- the NHL's own row id (ingestion/nhl_shifts.py)
+    shift_number    SMALLINT                   -- the player's 1st, 2nd, ... shift of the game
 );
 CREATE INDEX IF NOT EXISTS idx_shifts_game ON raw.shifts(game_id);
+
+-- Shift-chart fetch log (ingestion/nhl_shifts.py): one row per game
+CREATE TABLE IF NOT EXISTS raw.shift_fetches (
+    game_id         BIGINT PRIMARY KEY REFERENCES raw.games(game_id),
+    status          VARCHAR(10) NOT NULL,          -- ok, partial, empty, error
+    n_shifts        INTEGER NOT NULL DEFAULT 0,
+    n_players       SMALLINT NOT NULL DEFAULT 0,
+    n_goal_events   SMALLINT NOT NULL DEFAULT 0,
+    attempts        SMALLINT NOT NULL DEFAULT 1,
+    problem         TEXT,
+    fetched_at      TIMESTAMP NOT NULL
+);
+
+-- Scratches, officials and head coaches from the NHL right-rail page
+-- (ingestion/nhl_game_info.py); raw.game_info is also its fetch log
+CREATE TABLE IF NOT EXISTS raw.game_info (
+    game_id             BIGINT PRIMARY KEY REFERENCES raw.games(game_id),
+    status              VARCHAR(10) NOT NULL,          -- ok, empty, error
+    home_coach          VARCHAR(80),
+    away_coach          VARCHAR(80),
+    n_scratches_home    SMALLINT NOT NULL DEFAULT 0,
+    n_scratches_away    SMALLINT NOT NULL DEFAULT 0,
+    n_referees          SMALLINT NOT NULL DEFAULT 0,
+    n_linesmen          SMALLINT NOT NULL DEFAULT 0,
+    attempts            SMALLINT NOT NULL DEFAULT 1,
+    problem             TEXT,
+    fetched_at          TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS raw.game_scratches (
+    game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
+    team            VARCHAR(3) NOT NULL,
+    player_id       INTEGER NOT NULL,
+    player_name     VARCHAR(80),
+    PRIMARY KEY (game_id, player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_game_scratches_player ON raw.game_scratches(player_id, game_id);
+
+CREATE TABLE IF NOT EXISTS raw.game_officials (
+    game_id         BIGINT NOT NULL REFERENCES raw.games(game_id),
+    role            VARCHAR(10) NOT NULL,          -- referee, linesman
+    official_name   VARCHAR(80) NOT NULL,
+    sweater_number  SMALLINT,
+    PRIMARY KEY (game_id, role, official_name)
+);
+CREATE INDEX IF NOT EXISTS idx_game_officials_name ON raw.game_officials(official_name, game_id);
+
+-- Kalshi NHL game-winner markets and their price candles (ingestion/kalshi.py)
+CREATE TABLE IF NOT EXISTS raw.kalshi_markets (
+    ticker              VARCHAR(64) PRIMARY KEY,
+    event_ticker        VARCHAR(64) NOT NULL,
+    series_ticker       VARCHAR(32) NOT NULL,
+    game_id             BIGINT REFERENCES raw.games(game_id),
+    event_date          DATE,
+    kalshi_team         VARCHAR(8),
+    team                VARCHAR(3),
+    is_home             BOOLEAN,
+    title               TEXT,
+    yes_sub_title       VARCHAR(80),
+    status              VARCHAR(16),
+    result              VARCHAR(10),
+    settlement_value    NUMERIC(6,4),
+    settlement_ts       TIMESTAMPTZ,
+    open_time           TIMESTAMPTZ,
+    close_time          TIMESTAMPTZ,
+    expected_expiration TIMESTAMPTZ,
+    last_price          NUMERIC(6,4),
+    volume              NUMERIC(18,2),
+    open_interest       NUMERIC(18,2),
+    source              VARCHAR(10) NOT NULL,          -- live, historical
+    raw                 JSONB NOT NULL,
+    listed_at           TIMESTAMP NOT NULL,
+    candles_status      VARCHAR(10),                   -- NULL = not fetched; ok, empty, error
+    candles_attempts    SMALLINT NOT NULL DEFAULT 0,
+    candles_problem     TEXT,
+    candles_fetched_at  TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_kalshi_markets_game ON raw.kalshi_markets(game_id);
+CREATE INDEX IF NOT EXISTS idx_kalshi_markets_event ON raw.kalshi_markets(event_ticker);
+
+CREATE TABLE IF NOT EXISTS raw.kalshi_candles (
+    ticker          VARCHAR(64) NOT NULL REFERENCES raw.kalshi_markets(ticker),
+    period_minutes  SMALLINT NOT NULL,
+    end_period_ts   TIMESTAMPTZ NOT NULL,
+    yes_bid_open    NUMERIC(6,4),
+    yes_bid_high    NUMERIC(6,4),
+    yes_bid_low     NUMERIC(6,4),
+    yes_bid_close   NUMERIC(6,4),
+    yes_ask_open    NUMERIC(6,4),
+    yes_ask_high    NUMERIC(6,4),
+    yes_ask_low     NUMERIC(6,4),
+    yes_ask_close   NUMERIC(6,4),
+    price_open      NUMERIC(6,4),
+    price_high      NUMERIC(6,4),
+    price_low       NUMERIC(6,4),
+    price_close     NUMERIC(6,4),
+    price_mean      NUMERIC(6,4),
+    volume          NUMERIC(18,2),
+    open_interest   NUMERIC(18,2),
+    PRIMARY KEY (ticker, period_minutes, end_period_ts)
+);
 
 -- ============================================================
 -- FEATURES SCHEMA (computed, point-in-time correct)
