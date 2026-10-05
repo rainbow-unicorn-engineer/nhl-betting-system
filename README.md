@@ -100,6 +100,9 @@ INTERFACE   dashboard/                    Streamlit control room
 | ESPN summary API | One reference line per past game: the closing moneyline, puck line and total, and, where ESPN has them, the opening moneylines and total and the over/under and puck-line prices, opening and closing. The book varies by season | Free, no key, undocumented |
 | ESPN injury list | Every listed player's status (day-to-day, out, injured reserve, suspended), injury and expected return | Free, no key; the current list only, so it is saved daily |
 | ESPN core API | Past player-prop prices for 2025-26: DraftKings on some dates and in the playoffs, ESPN BET opening prices in October and November 2025 | Free, no key, undocumented |
+| NHL shift charts (`api.nhle.com/stats/rest/en/shiftcharts`) | Every shift of every player in every past game: who was on the ice together, so the real lines and power-play units | Free, no key, undocumented; one request a game |
+| NHL right-rail page (`api-web.nhle.com/v1/gamecenter/{id}/right-rail`) | Per game: scratched players (on the roster, did not dress), the referees and linesmen, the head coaches | Free, no key, undocumented; the same page the team stats come from |
+| Kalshi public API (`api.elections.kalshi.com/trade-api/v2`) | Every NHL game-winner market since the 2025 playoffs: settlement, and hourly and pre-game 1-minute price candles with bid and ask | Free, no key for market data |
 | Daily Faceoff | Projected starting goalies, each tagged Confirmed or a softer status; each team's line combinations (forward lines, defence pairs, power-play and penalty-kill units, goalies, injured reserve, game-time decisions) | Scraped from the pages' embedded data: one request per run for the starters, at most one per team per run for the lines. robots.txt allows these pages; can break without notice |
 
 Research notes behind the 2026-09-29 feeds work are in [docs/research/](docs/research/).
@@ -141,6 +144,16 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 
 `python pipeline.py nhl-stats` fills each skater's power-play and penalty-kill ice time, power-play goals and assists, and faceoffs won and lost in `raw.skater_games`, from the NHL stats API. The box-score load always left those columns at zero. The daily run (and the props machine's `refresh`) fills newly finished games, usually 3 requests; `--season 20252026` fills a whole season in about 27 requests and a minute. It only updates rows the box-score load already stored, and `stats_filled_at` records which rows have real values. A week of December 2025 filled 1,980 of 1,980 player-games: 1,266 with power-play time, 1,168 with penalty-kill time, and no row with more power-play goals than goals or more special-teams time than total time.
 
+### Shift charts, scratches and Kalshi prices
+
+Three free loaders, no key, each resumable (a stopped run picks up where it left off) and polite (at most about 3 requests a second to the NHL, 5 to Kalshi, with retries on "too many requests" and server errors):
+
+- **Shift charts** → `python -m ingestion.nhl_shifts` loads every shift (→ one stretch a player spends on the ice, about 45 seconds) of every finished game into `raw.shifts`, with a fetch log in `raw.shift_fetches`. They show who actually played together: the real lines and power-play units (→ the group sent out when the other team has a player in the penalty box) of every past game.
+- **Scratches and officials** → `python -m ingestion.nhl_game_info` stores, per game, the scratched players (→ on the roster but not dressed) in `raw.game_scratches`, the referees and linesmen in `raw.game_officials`, and the head coaches in `raw.game_info` (also the fetch log). The daily box-score load already downloads this page for team stats, so new games cost no extra request. Scratches are known about 30-60 minutes before puck drop, so a model may use them for the close but not in the morning.
+- **Kalshi** → `python -m ingestion.kalshi --backfill` loads Kalshi's NHL game-winner markets (→ "Will this team win?" contracts that pay $1, so the price is the market's probability) into `raw.kalshi_markets`, matched to `raw.games`, and their price candles (→ open, high, low and close of the bid, ask and traded price over an hour, or a minute in the 3 hours before puck drop) into `raw.kalshi_candles`. `--report` prints the pre-game closing price summary. Prices are before Kalshi's taker fee (0.07 × p × (1 − p) per contract). Kalshi also trades during games: never use a candle that ends after `start_time_utc` as a pre-game price.
+
+`python pipeline.py free-data` runs all three for new games; `daily` runs it at the end. Coverage and what was odd: [docs/data_sources.md](docs/data_sources.md#213-free-loaders-shift-charts-scratches-and-officials-kalshi-built-2026-10-04).
+
 ### Player props on the props machine
 
 `python pipeline.py props` takes one snapshot of every game starting in the next 24 hours into `raw.prop_snapshots`; `props --due`, every 15 minutes, takes one more just before each puck drop (games starting within 16 minutes with no prop snapshot in the last 16). Listing the games is free. Each game then costs 1 credit per market returned, and nothing when no book has posted props yet. The default market is shots on goal (`PROPS_MARKETS=player_shots_on_goal`); a morning and a pre-game snapshot of every game is at most 308 (February) to 464 (January) credits a month on the 2026-27 schedule, inside the free 500. Four markets need the paid 20K plan. Each line is matched to a game in `raw.games` (so the schedule must be current) and each player to `raw.players`; an unmatched name is stored with no player id and logged. No props are bet: there is no props model yet.
@@ -168,6 +181,7 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 11. Pulls starting goalies from Daily Faceoff (non-fatal).
 12. Saves ESPN's injury list (non-fatal).
 13. Scores the day's slate and writes recommendations for games that don't have one yet (non-fatal).
+14. Runs the free loaders (`free-data`, each non-fatal): shift charts for newly finished games, scratches and officials for any game the box-score refresh missed, and Kalshi's market list with candles for newly settled markets. This comes after the picks, so it never delays them.
 
 "Today" is the local date: in `LOCAL_TIMEZONE` when that is set, otherwise in the machine's time zone. `CURRENT_SEASON` is the season containing that date (see [Configuration](#configuration)).
 
@@ -251,6 +265,9 @@ python -m config.migrate --seed-venues      # arena coordinates and time zones; 
 python pipeline.py backfill                 # 2020-21 through the current season: games, game logs, MoneyPuck shots; about 20 minutes a season; safe to re-run
 python -m ingestion.espn_odds               # free historical reference lines with their prices; resumable
 python -m ingestion.nhl_stats --season 20252026   # power-play stats; repeat for each season, about a minute each
+python -m ingestion.nhl_shifts              # shift charts, every finished game; about 45 minutes; resumable
+python -m ingestion.nhl_game_info           # scratches, officials, coaches; about 45 minutes; resumable
+python -m ingestion.kalshi --backfill       # Kalshi NHL markets and candles; about 25 minutes; resumable
 python pipeline.py features                 # every season
 python -m models.lgbm                       # walk-forward evaluation; registers the moneyline model
 python -m models.totals                     # registers the totals model
@@ -397,6 +414,7 @@ LIMIT 50;
 | `nhl-odds` | A free snapshot of the NHL's odds feed, right now |
 | `compare-feeds [--date YYYY-MM-DD] [--detail]` | The NHL feed against The Odds API for one date's games: price gaps and how often prices changed. Reads only |
 | `injuries` | Saves ESPN's injury list for today |
+| `free-data` | The free loaders for new games: NHL shift charts, scratches and officials, Kalshi markets and candles. No key, no credits |
 | `news [--due]` | The news monitor: refreshes Daily Faceoff's starters and lines and ESPN's injury list, records what changed in `raw.news_events`, and re-scores games with starter news and no pick yet (only once that day's `daily` run has finished). No Odds API request. With `--due`, only on a game day from 8:00 local until the last puck drop, at most every 14 minutes |
 | `nhl-stats [--season YYYYYYYY]` | Fills power-play, penalty-kill and faceoff stats: the current season's unfilled dates, or one whole season |
 
@@ -421,6 +439,9 @@ LIMIT 50;
 | `ingestion.espn_props --season S [--limit N] [--refresh]` | Past player-prop prices from ESPN into `raw.prop_odds_hist`; resumable |
 | `ingestion.espn_injuries [--date YYYY-MM-DD]` | ESPN's injury list; the date must be within a day of today, because ESPN has no history |
 | `ingestion.nhl_stats --season S \| --from YYYY-MM-DD [--to ...] \| --missing` | Power-play, penalty-kill and faceoff stats for a season, a date range, or the current season's unfilled dates. Exits 1 if any request window failed |
+| `ingestion.nhl_shifts [--season S] [--limit N] [--retry-empty] [--report]` | Shift charts into `raw.shifts` for every finished game not fetched yet; `--report` prints coverage by season and fetches nothing. Exits 1 if it stopped after 25 failures in a row |
+| `ingestion.nhl_game_info [--season S] [--limit N] [--retry-empty] [--report]` | Scratches, referees, linesmen and head coaches from the right-rail page; same options |
+| `ingestion.kalshi [--backfill] [--limit N] [--retry-empty] [--report]` | Kalshi's NHL game-winner markets and candles. Without `--backfill` only the live listing (the daily form); `--report` prints coverage and the pre-game closing-price summary |
 | `ingestion.nhl_odds snapshot \| compare [--date D] [--detail]` | The NHL feed: one snapshot, or the comparison report |
 | `ingestion.props_odds [--due] [--markets M]` | One props snapshot, as `pipeline.py props` |
 | `ingestion.dailyfaceoff [--date YYYY-MM-DD]` | Starters for one date |
@@ -430,7 +451,7 @@ LIMIT 50;
 | `ingestion.odds_api [--markets h2h,spreads,totals]` | One odds snapshot: 3 credits for the default markets, 1 for `h2h`, with the default books. Skipped, at no cost, when no game starts in the next 24 hours |
 | `config.migrate [--seed-venues]` | Creates any tables and adds any columns a database made from an older `db/schema.sql` is missing. Pipeline commands do this on their own. `--seed-venues` also applies `db/seed_venues.sql` |
 
-`--help` prints the options and runs nothing for `pipeline.py` and each of its commands, `betting.checker`, `betting.recommend`, `betting.settle`, `betting.alerts`, `betting.promo`, `betting.montecarlo`, `ingestion.odds_api`, `ingestion.odds_history`, `ingestion.espn_odds`, `ingestion.espn_props`, `ingestion.espn_injuries`, `ingestion.nhl_stats`, `ingestion.nhl_odds`, `ingestion.props_odds`, `ingestion.dailyfaceoff`, `ingestion.dailyfaceoff_lines`, `betting.news`, `models.totals`, and `config.migrate`, so it never spends credits or writes to the database. `models.baseline`, `models.lgbm`, and `betting.backtest` take no options and start their full run whatever you pass them.
+`--help` prints the options and runs nothing for `pipeline.py` and each of its commands, `betting.checker`, `betting.recommend`, `betting.settle`, `betting.alerts`, `betting.promo`, `betting.montecarlo`, `ingestion.odds_api`, `ingestion.odds_history`, `ingestion.espn_odds`, `ingestion.espn_props`, `ingestion.espn_injuries`, `ingestion.nhl_stats`, `ingestion.nhl_shifts`, `ingestion.nhl_game_info`, `ingestion.kalshi`, `ingestion.nhl_odds`, `ingestion.props_odds`, `ingestion.dailyfaceoff`, `ingestion.dailyfaceoff_lines`, `betting.news`, `models.totals`, and `config.migrate`, so it never spends credits or writes to the database. `models.baseline`, `models.lgbm`, and `betting.backtest` take no options and start their full run whatever you pass them.
 
 ## Configuration
 
@@ -590,6 +611,7 @@ With a database, 696 of the 697 pass against a copy of the live data, in about a
 - **`test_baseline`** re-registers `baseline_logreg` in `models.model_registry`.
 - **`test_nhl_api`**, **`test_checker`**, and **`test_dailyfaceoff`** insert synthetic rows and delete them: games with ids 9999020001 to 9999020004 (the last three in January 2031), predictions, and a 2026-01-15 starting goalie (replacing, then deleting, any real row for that team and date).
 - **The feed tests** insert synthetic games and delete them with everything they wrote: `test_nhl_stats` (game 9999020101), `test_props_odds` (9999020201), `test_espn_odds` (9999020301), `test_espn_props` (9999020302), and `test_nhl_odds` (9999030001 and 9999030002, on 2031-02-15). `test_espn_injuries` writes and deletes injury snapshots dated 2031-01-14 and 2031-01-15. They also create the new tables and columns if the database lacks them.
+- **The free-loader tests** (`test_nhl_shifts`, `test_nhl_game_info`, `test_kalshi`) insert synthetic season-20302031 games (2030020001 to 2030020003, 2030020011, 2030020021) and Kalshi tickers starting `KXNHLGAME-30`, and delete them with everything they wrote. Their pure tests run on trimmed real responses (`tests/fixtures/nhl_shiftcharts_2025020500.json`, `nhl_right_rail_2025020500.json`, `kalshi_nhl.json`); `test_polite` needs nothing.
 - **`test_ledger`** and **`test_my_bets`** insert synthetic games (9990000101 to 9990000104, 9990000201 and 9990000202), players 99999901 to 99999903 with box-score rows, and bets and deposits on the platforms `zz-ledger-test` and `zz-dashboard-test`, then delete all of it. `test_ledger` also runs the schema upgrade, which creates the ledger tables if the database lacks them. `test_my_bets` renders the whole dashboard with Streamlit's test runner.
 - **`test_news`** empties the five news tables (`raw.news_events`, `news_state`, `news_runs`, `lineups`, `lineup_fetches`), adds game 2099020001 (BOS against MTL, today) with odds and NHL-feed rows, and deletes the game and those rows afterwards. It replaces today's BOS and MTL starting goalies, and saves today's injury list when the database has none (its own injury-save test stubs that write). **`test_runs`** writes and deletes `raw.pipeline_runs` rows dated 2099-01-02. **`test_dailyfaceoff_lines`** writes and deletes lines for the made-up team `ZZZ`.
 - **`test_recommend`**'s per-game limit test issues and deletes a totals pick and moneyline picks on 2026-01-15 games; **`test_totals`** reads ESPN DraftKings prices inside a transaction it rolls back.
@@ -604,7 +626,8 @@ config/migrate.py      Creates the tables and adds the columns an older database
 db/                    schema.sql (applied by Docker on first start), seed_venues.sql
 ingestion/             nhl_api, moneypuck, odds_api, espn_odds, dailyfaceoff (starters), dailyfaceoff_lines
                        (line combinations); nhl_odds (free NHL feed), nhl_stats (power-play stats),
-                       espn_injuries, espn_props, props_odds (live props)
+                       espn_injuries, espn_props, props_odds (live props); nhl_shifts (shift charts),
+                       nhl_game_info (scratches, officials), kalshi (exchange prices), polite (shared HTTP client)
 features/              team, goalie, schedule, and Elo builders; build_all orchestrates
 models/                baseline, lgbm (moneyline), totals; artifacts/ holds calibration plots
 betting/               engine, recommend, settle, backtest, checker, alerts, promo, ledger (real bets),
