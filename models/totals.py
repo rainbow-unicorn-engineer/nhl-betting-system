@@ -236,6 +236,61 @@ before any variant ran; code run_totals_v3, opt-in)
   checker give totals legs a BET verdict, and a model that is merely "not
   worse" than the market has no proven edge, so it would bet noise. If no
   variant passes, v2 stays the default and GATE_PASSED stays False.
+- STATUS (2026-10-04, v3 experiment): NO VARIANT PASSES. v2 stays the
+  default, MODEL_VERSION stays "v2", GATE_PASSED stays False. Run once,
+  as pre-registered (python -m models.totals --v3, read-only, ~20 s).
+  Data: 7,979 games in the 5 validation seasons' dataset, 7,140 priced
+  (Unibet 4,732 after cleaning — exactly the 926 / 1,378 / 1,359 / 1,069
+  counted before the pre-registration; odds_history 1,398 games from
+  13,969 book quotes; DraftKings 1,010); 6,214 priced validation games,
+  6,143 without a push at the line. T0 reproduced v2 exactly.
+  Pooled NLL (6,993 scored games), vs the matched baseline, folds won:
+    T0  2.1801  vs B    2.1787  +0.0014 ± 0.0011  2/5
+    T1  2.1770  vs B    2.1787  -0.0017 ± 0.0016  3/5
+    T2  2.1771  vs B_dc 2.1787  -0.0016 ± 0.0016  3/5
+    T3  2.1764  vs B_dc 2.1787  -0.0023 ± 0.0016  3/5
+    M   2.1740  vs B    2.1787  -0.0047 ± 0.0012  5/5 (reference only)
+  vs T0: T1 -0.0031 ± 0.0012, T2 -0.0030 ± 0.0012, T3 -0.0037 ± 0.0012,
+  M -0.0061 ± 0.0015. vs M: T1 +0.0030 ± 0.0010, T2 +0.0031 ± 0.0010,
+  T3 +0.0025 ± 0.0009 (the boosters make the market worse).
+  Per fold (2021-22..2025-26), T1 / T3 / M / B: 2.1913 / 2.1902 /
+  2.1877 / 2.1986; 2.1592 / 2.1584 / 2.1544 / 2.1605; 2.1772 / 2.1767 /
+  2.1762 / 2.1763; 2.2040 / 2.2051 / 2.2011 / 2.2016; 2.1532 / 2.1516 /
+  2.1504 / 2.1563. Fitted rho per fold: -0.0005, +0.0083, -0.0018,
+  +0.0055, -0.0060 — no low-score dependence left once the margin
+  weights are in, so T2 is T1 to 4 decimals.
+  Market check (over/under log loss at the main line vs no-vig, n=6,143):
+    T0 0.6871  T1 0.6844  T2 0.6844  T3 0.6840  B 0.6852  vs market
+    0.6815; diffs +0.0056 ± 0.0013, +0.0028 ± 0.0008, +0.0029 ± 0.0009,
+    +0.0024 ± 0.0008, +0.0037 ± 0.0012. Every variant is WORSE than the
+    market at 95%. By source, T3 minus market: Unibet +0.0024 ± 0.0010
+    (n=3,806), 2024-25 consensus +0.0036 ± 0.0022 (n=1,327), DraftKings
+    2025-26 +0.0010 ± 0.0015 (n=1,010). The plain environment baseline
+    B is level with the 2024-25 ten-book consensus (+0.0002 ± 0.0024)
+    but 0.0069 ± 0.0028 behind DraftKings 2025-26 and 0.0041 ± 0.0016
+    behind Unibet.
+  Calibration (pooled): regulation tie rate predicted 0.218 (T0-T3) /
+  0.222 (M, B) vs actual 0.2225. Total-goals distribution chi-square
+  (12 buckets) T0 33.8, T1 38.9, T2 38.9, T3 39.2, M 37.4, B 31.6 —
+  all clearly off, the same way: too much mass on 11+ goals (predicted
+  0.054-0.057 vs 0.0465) and 2 goals, too little on 6, 7 and 8.
+  Push rates at totals 5 / 6 / 7: T3 0.217 / 0.104 / 0.197 vs actual
+  0.219 / 0.112 / 0.205 (6 and 7 are under-predicted by every variant).
+  Rule outcome: T1-T3 fail (1) (about 1-1.4 SE, not 2), (2) (3 of 5
+  folds) and (3) (worse than the market). M passes (1) and (2) but is
+  not adoptable: it IS the market.
+  What it means: starting from the market total helps the NLL (M beats
+  the environment in every season), but no booster on top of it — team
+  stats, goalie roles or rho — adds anything the closing price lacks;
+  each one makes the market's over/under probability worse. What would
+  flip GATE_PASSED: a new pre-registered variant that beats its baseline
+  by >= 2 SE in >= 4/5 folds AND beats the no-vig market's over/under
+  log loss with 95% confidence (diff + 1.96 SE < 0) on >= 200 priced
+  games. None of T1-T3 is close (their best upper bound is +0.0040).
+  Not pre-registered here and left untested: the home/away split from
+  the moneyline instead of the environment's (an older draft of this
+  experiment did that); it changes the regulation-tie and push shape,
+  not the expected total, so it is unlikely to close the market gap.
 """
 import logging
 

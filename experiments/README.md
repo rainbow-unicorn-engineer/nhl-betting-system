@@ -20,6 +20,7 @@ Terms used below:
 | 2026-10-02 | Shots-on-goal props model v1 | `models/props_sog.py`, `features/player_shots.py` | Passed as a forecaster: beat both baselines in 5/5 seasons, about 19 SE. |
 | 2026-10-03 | Props model v2: in-season drift correction | `models/props_sog.py` (`DRIFT_CORRECT`) | Adopted by its rule, but marginally: −1.8 SE vs v1, with worse pooled calibration. The drift's real cause is in the baseline. |
 | 2026-10-03 | Props market check vs ESPN BET and DraftKings | `models/props_market_check.py` | Does not beat the market: the book's no-vig price had lower log loss, about 3 SE pooled. Flat-bet ROI intervals all include 0. |
+| 2026-10-04 | Totals v3: start from the market's over/under price (T1), plus a Dixon-Coles low-score term (T2; → one number that makes 0-0, 1-0, 0-1 and 1-1 scores more or less likely than independent team scores would), plus goalie-role inputs (T3) | `models/totals.py` (`--v3`, opt-in) | No variant passes. Best was T3 at −0.0023 ± 0.0016 vs baseline (3/5 seasons), and every variant's over/under log loss is worse than the no-vig market (T3 +0.0024 ± 0.0008, 6,143 games). The market's price alone beats the baseline in 5/5 seasons; the model's corrections on top only make it worse. The low-score term came out at about 0. v2 stays the default; no totals bets. |
 
 ## Re-running
 
@@ -27,6 +28,7 @@ Terms used below:
 .venv\Scripts\python -m models.totals                 # totals walk-forward and gate (registers the production model)
 .venv\Scripts\python -m models.props_sog --evaluate    # props walk-forward and gate (read-only)
 .venv\Scripts\python -m models.props_market_check     # props vs the market (read-only)
+.venv\Scripts\python -m models.totals --v3           # totals v3 experiment vs the market (read-only, ~20 s)
 ```
 
 The goalie variants run from Python: `models.totals.run_totals(register=False, variant="C", with_roles=True)`.
