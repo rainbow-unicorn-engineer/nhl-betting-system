@@ -46,8 +46,11 @@ Acceptance checks (written 2026-10-04, before the backfill ran; the
 backfill passes only if all hold, and each miss is reported):
   S1  at least 99% of finished regular-season and playoff games in each
       season 2020-21 to 2025-26 end with status 'ok';
-  S2  in 'ok' games, box-score players (raw.skater_games, raw.goalie_games)
-      with no shift are at most 0.5% of box-score player-games;
+  S2  in 'ok' games, box-score players who played (raw.skater_games,
+      raw.goalie_games, toi_seconds > 0) with no shift are at most 0.5% of
+      those player-games. (Amended before the backfill, after a 3-game
+      trial: the first wording counted backup goalies, who dress with 0
+      ice time and never take a shift.)
   S3  in 'ok' games, the median absolute gap between a skater's summed
       shift durations and raw.skater_games.toi_seconds is at most 5 seconds.
 
@@ -327,8 +330,8 @@ def fetch_missing(season: Optional[int] = None, retry_empty: bool = False,
 
 def coverage(db=None) -> List[dict]:
     """Per season: finished games, fetch outcomes, stored shifts, and
-    box-score players (raw.skater_games + raw.goalie_games) of fetched
-    games who have no shift."""
+    box-score players who played (raw.skater_games + raw.goalie_games,
+    toi_seconds > 0) in 'ok' games but have no shift (check S2)."""
     ensure_tables(db)
     with (db or engine).connect() as conn:
         rows = conn.execute(text("""
@@ -337,8 +340,8 @@ def coverage(db=None) -> List[dict]:
                 WHERE game_state = 'OFF' AND game_type IN (2, 3)
             ),
             box AS (
-                SELECT game_id, player_id FROM raw.skater_games
-                UNION SELECT game_id, player_id FROM raw.goalie_games
+                SELECT game_id, player_id FROM raw.skater_games WHERE toi_seconds > 0
+                UNION SELECT game_id, player_id FROM raw.goalie_games WHERE toi_seconds > 0
             ),
             shifted AS (SELECT DISTINCT game_id, player_id FROM raw.shifts),
             missing AS (
