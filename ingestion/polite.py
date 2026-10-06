@@ -102,6 +102,13 @@ class PoliteClient:
             return None
 
     def get_json(self, url: str, params: Optional[dict] = None) -> Reply:
+        return self._get(url, params, as_text=False)
+
+    def get_text(self, url: str, params: Optional[dict] = None) -> Reply:
+        """As get_json, but the body is the response text (an HTML page)."""
+        return self._get(url, params, as_text=True)
+
+    def _get(self, url: str, params: Optional[dict], as_text: bool) -> Reply:
         problem, http_status = "no attempt made", None
         for attempt in range(1, self.retries + 1):
             self._wait_turn()
@@ -123,7 +130,7 @@ class PoliteClient:
                                  f"HTTP {resp.status_code}")
                 else:
                     try:
-                        body = resp.json()
+                        body = resp.text if as_text else resp.json()
                         self._answered()
                         return Reply("ok", body, resp.status_code)
                     except ValueError:

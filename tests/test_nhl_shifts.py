@@ -33,10 +33,19 @@ class StubClient:
     def __init__(self, replies):
         self.replies = list(replies)
         self.calls = []
+        self.urls = []
 
     def get_json(self, url, params=None):
         self.calls.append(params)
+        self.urls.append(url)
         return self.replies.pop(0)
+
+    get_text = get_json
+
+
+TOI_FIXTURE = Path(__file__).parent / "fixtures" / "nhl_toi_report_2024021235_TH_excerpt.htm"
+BOX_FIXTURE = Path(__file__).parent / "fixtures" / "nhl_boxscore_2024021235_excerpt.json"
+HTML_GAME = 2024021235
 
 
 def shift(pid, start="00:00", end="00:40", sid=None, game=GAME, period=1, dur="00:40"):
@@ -118,11 +127,77 @@ def test_fetch_games_stops_after_repeated_errors(monkeypatch):
     stored = []
     monkeypatch.setattr(ns, "ensure_tables", lambda db=None: None)
     monkeypatch.setattr(ns, "store_game", lambda gid, rows, goals, status, problem=None,
-                        db=None: stored.append((gid, status)))
+                        db=None, source="api": stored.append((gid, status)))
     client = StubClient([Reply("error", problem="down")] * 10)
     counts = ns.fetch_games(list(range(10)), client=client, max_consecutive_errors=3)
     assert counts["stopped_early"] == 1 and counts["error"] == 3
     assert [s for _, s in stored] == ["error"] * 3     # each failure is logged
+
+
+def test_parse_recorded_toi_report():
+    # Two real players from the home report of 2024021235 (BUF), each with
+    # a shift table and a per-period summary table that must be skipped
+    shifts = ns.parse_toi_report(TOI_FIXTURE.read_text(encoding="utf-8"))
+    by_num = {}
+    for r in shifts:
+        by_num.setdefault(r["sweater"], []).append(r)
+    assert set(by_num) == {4, 9}
+    assert len(by_num[4]) == 27 and by_num[4][-1]["shift_number"] == 27
+    assert by_num[4][0] == {"sweater": 4, "shift_number": 1, "period": 1,
+                            "start_time": 36, "end_time": 76, "duration": 40}
+    box = json.loads(BOX_FIXTURE.read_text(encoding="utf-8"))
+    toi = {p["sweaterNumber"]: ns.mmss(p["toi"])
+           for g in ("forwards", "defense") for p in box["playerByGameStats"]["homeTeam"][g]}
+    for num, rows in by_num.items():      # the shifts add up to the box-score ice time
+        assert sum(r["duration"] for r in rows) == toi[num]
+    assert ns.parse_toi_report("") == [] and ns.parse_toi_report(None) == []
+
+
+def test_html_rows_map_sweaters_to_players():
+    page = TOI_FIXTURE.read_text(encoding="utf-8")
+    box = json.loads(BOX_FIXTURE.read_text(encoding="utf-8"))
+    rows, unmatched = ns.html_rows(HTML_GAME, {"H": page}, box)
+    assert unmatched == 0
+    assert {r["player_id"] for r in rows} == {8481524, 8484145}
+    assert {r["team"] for r in rows} == {"BUF"} and all(r["nhl_shift_id"] is None for r in rows)
+    # The same report read as the visitors': sweater 4 and 9 are not CAR's
+    rows, unmatched = ns.html_rows(HTML_GAME, {"V": page}, box)
+    assert rows == [] and unmatched > 0
+    assert ns.sweater_map({}) == {}
+
+
+def test_empty_api_falls_back_to_the_html_reports(monkeypatch):
+    stored = []
+    monkeypatch.setattr(ns, "ensure_tables", lambda db=None: None)
+    monkeypatch.setattr(ns, "store_game", lambda gid, rows, goals, status, problem=None,
+                        db=None, source="api": stored.append((gid, status, len(rows),
+                                                              source, problem)))
+    monkeypatch.setattr(ns, "MIN_SHIFTS", 10)
+    monkeypatch.setattr(ns, "MIN_PLAYERS", 2)
+    page = TOI_FIXTURE.read_text(encoding="utf-8")
+    box = json.loads(BOX_FIXTURE.read_text(encoding="utf-8"))
+    client = StubClient([Reply("ok", {"data": [], "total": 0}), Reply("ok", box),
+                         Reply("ok", page), Reply("ok", "<html></html>")])
+    counts = ns.fetch_games([HTML_GAME], client=client)
+    assert counts["from_html"] == 1 and counts["ok"] == 1
+    assert stored[0][1:4] == ("ok", 47, "html") and "HTML" in stored[0][4]
+    assert client.urls[1].endswith("/2024021235/boxscore")
+    assert client.urls[2] == "https://www.nhl.com/scores/htmlreports/20242025/TH021235.HTM"
+    assert client.urls[3] == "https://www.nhl.com/scores/htmlreports/20242025/TV021235.HTM"
+
+    # A failed report keeps the game 'empty' (retried later) and says why
+    stored.clear()
+    client = StubClient([Reply("ok", {"data": [], "total": 0}), Reply("ok", box),
+                         Reply("error", problem="HTTP 503")])
+    counts = ns.fetch_games([HTML_GAME], client=client)
+    assert counts["empty"] == 1 and stored[0][3] == "api"
+    assert "TH report: HTTP 503" in stored[0][4]
+
+    # Fallback off: one request only
+    stored.clear()
+    client = StubClient([Reply("ok", {"data": [], "total": 0})])
+    ns.fetch_games([HTML_GAME], client=client, html_fallback=False)
+    assert stored[0][1] == "empty" and len(client.urls) == 1
 
 
 def test_season_argument_and_help(capsys):
@@ -174,10 +249,10 @@ def test_store_replaces_and_failures_keep_rows(games):
     with engine.connect() as conn:
         n = conn.execute(text("SELECT COUNT(*) FROM raw.shifts WHERE game_id = :g"),
                          {"g": G1}).scalar()
-        f = conn.execute(text("SELECT status, n_shifts, attempts FROM raw.shift_fetches "
-                              "WHERE game_id = :g"), {"g": G1}).one()
+        f = conn.execute(text("SELECT status, n_shifts, attempts, source FROM "
+                              "raw.shift_fetches WHERE game_id = :g"), {"g": G1}).one()
     assert n == len(rows)
-    assert tuple(f) == ("error", len(rows), 3)
+    assert tuple(f) == ("error", len(rows), 3, "api")   # a failure keeps the source
 
 
 @requires_db

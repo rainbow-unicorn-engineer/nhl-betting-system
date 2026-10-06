@@ -485,7 +485,8 @@ CREATE TABLE IF NOT EXISTS raw.shift_fetches (
     n_goal_events   SMALLINT NOT NULL DEFAULT 0,
     attempts        SMALLINT NOT NULL DEFAULT 1,
     problem         TEXT,
-    fetched_at      TIMESTAMP NOT NULL
+    fetched_at      TIMESTAMP NOT NULL,
+    source          VARCHAR(8)                     -- api (shift-chart API) or html (time-on-ice reports)
 );
 
 -- Scratches, officials and head coaches from the NHL right-rail page

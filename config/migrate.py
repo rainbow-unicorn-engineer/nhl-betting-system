@@ -85,6 +85,9 @@ COLUMNS = (
     # the player's shift count in the game
     ("raw", "shifts", "nhl_shift_id", "BIGINT"),
     ("raw", "shifts", "shift_number", "SMALLINT"),
+    # where each game's shifts came from: the shift-chart API or the HTML
+    # time-on-ice reports (the fallback when the API has none)
+    ("raw", "shift_fetches", "source", "VARCHAR(8)"),
 )
 
 # (schema, table, statements): tables added after db/schema.sql first
@@ -402,7 +405,8 @@ TABLES = (
             n_goal_events   SMALLINT NOT NULL DEFAULT 0,
             attempts        SMALLINT NOT NULL DEFAULT 1,
             problem         TEXT,
-            fetched_at      TIMESTAMP NOT NULL
+            fetched_at      TIMESTAMP NOT NULL,
+            source          VARCHAR(8)                     -- api, html
         )""",
     )),
     # Scratches, officials and head coaches from the NHL right-rail page

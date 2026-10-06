@@ -128,3 +128,11 @@ def test_retry_after_zero_still_waits_the_backoff():
                       min_interval_s=0.0, backoff_s=3.0)
     assert c.get_json("u").status == "ok"
     assert clock.sleeps[0] == 3.0
+
+
+def test_get_text_returns_the_page_text():
+    resp = FakeResp(200, bad_json=True)
+    resp.text = "<html>shifts</html>"
+    c, _ = client([resp], min_interval_s=0.0)
+    r = c.get_text("u")
+    assert r.status == "ok" and r.body == "<html>shifts</html>"

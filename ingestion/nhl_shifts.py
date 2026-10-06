@@ -25,6 +25,17 @@ Each row is either
 Only shifts are stored; goal markers are counted in the fetch log
 (n_goal_events), since raw.shots already holds every goal.
 
+Fallback (added 2026-10-05, after the backfill found the endpoint empty
+for 57 games of 2024-25, 2025-04-08 to 2025-04-15): when the endpoint has
+no shifts for a game, the NHL's official HTML time-on-ice reports
+(https://www.nhl.com/scores/htmlreports/<season>/TH<nnnnnn>.HTM for the
+home team, TV... for the visitors) carry the same shifts: per player, the
+shift number, period, start and end ("elapsed / game" clock) and duration.
+Those rows name players by sweater number, so the game's boxscore
+(api-web.nhle.com/v1/gamecenter/<id>/boxscore) maps number to player id.
+Three requests per game; rows stored this way have no NHL row id, and the
+fetch log says source = 'html' (otherwise 'api').
+
 Writes, per game, in one transaction: the game's old raw.shifts rows are
 replaced by the new ones (so a re-fetch never duplicates), and the game's
 raw.shift_fetches row records the outcome:
@@ -58,7 +69,9 @@ backfill passes only if all hold, and each miss is reported):
 season without fetching anything.
 """
 import argparse
+import html as html_lib
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -71,6 +84,8 @@ from ingestion.polite import PoliteClient, Reply
 logger = logging.getLogger("nhl.ingestion.nhl_shifts")
 
 URL = "https://api.nhle.com/stats/rest/en/shiftcharts"
+HTML_URL = "https://www.nhl.com/scores/htmlreports/{season}/T{side}{suffix}.HTM"
+BOXSCORE_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore"
 SHIFT_TYPE = 517
 GOAL_TYPE = 505
 MIN_INTERVAL_S = 0.34     # at most ~3 requests a second
@@ -92,8 +107,10 @@ DDL = [
             n_goal_events   SMALLINT NOT NULL DEFAULT 0,
             attempts        SMALLINT NOT NULL DEFAULT 1,
             problem         TEXT,
-            fetched_at      TIMESTAMP NOT NULL
+            fetched_at      TIMESTAMP NOT NULL,
+            source          VARCHAR(8)                     -- api, html
         )""",
+    "ALTER TABLE raw.shift_fetches ADD COLUMN IF NOT EXISTS source VARCHAR(8)",
 ]
 
 _ensured = False
@@ -112,8 +129,9 @@ def ensure_tables(db=None) -> None:
               (SELECT COUNT(*) FROM information_schema.columns
                WHERE table_schema = 'raw' AND table_name = 'shifts'
                  AND column_name IN ('nhl_shift_id', 'shift_number')),
-              (SELECT COUNT(*) FROM information_schema.tables
-               WHERE table_schema = 'raw' AND table_name = 'shift_fetches')
+              (SELECT COUNT(*) FROM information_schema.columns
+               WHERE table_schema = 'raw' AND table_name = 'shift_fetches'
+                 AND column_name = 'source')
         """)).one()
         if tuple(have) != (2, 1):
             logger.info("Schema upgrade: raw.shifts columns / raw.shift_fetches")
@@ -179,6 +197,87 @@ def parse_shifts(body: dict, game_id: int) -> Tuple[List[dict], int]:
     return out, goals
 
 
+_BLOCK_RE = re.compile(r'class="playerHeading[^"]*"[^>]*>\s*(\d+)\s+([^<]*)<', re.I)
+_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.I | re.S)
+_CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.I | re.S)
+_CLOCK_RE = re.compile(r"^(\d{1,2}:\d{2})\s*/\s*\d{1,2}:\d{2}$")
+
+
+def _cell_text(raw: str) -> str:
+    return " ".join(html_lib.unescape(re.sub(r"<[^>]+>", " ", raw)).split())
+
+
+def parse_toi_report(page: str) -> List[dict]:
+    """Shift rows from one NHL HTML time-on-ice report (one team):
+    [{sweater, shift_number, period, start_time, end_time, duration}].
+    Only rows whose start cell reads "elapsed / game" are shifts; the
+    per-period summary tables under each player are skipped. Period "OT"
+    is 4; a shootout row (no clock) never matches."""
+    out: List[dict] = []
+    page = page or ""
+    blocks = list(_BLOCK_RE.finditer(page))
+    for i, b in enumerate(blocks):
+        sweater = int(b.group(1))
+        chunk = page[b.end(): blocks[i + 1].start() if i + 1 < len(blocks) else len(page)]
+        for row in _ROW_RE.findall(chunk):
+            cells = [_cell_text(c) for c in _CELL_RE.findall(row)]
+            if len(cells) < 5:
+                continue
+            start_m, end_m = _CLOCK_RE.match(cells[2]), _CLOCK_RE.match(cells[3])
+            if not start_m:
+                continue
+            per = cells[1].upper()
+            period = 4 if per == "OT" else _int(per)
+            if period is None:
+                continue
+            start = mmss(start_m.group(1))
+            end = mmss(end_m.group(1)) if end_m else None
+            duration = mmss(cells[4])
+            if duration is None and end is not None and end >= start:
+                duration = end - start
+            out.append({"sweater": sweater, "shift_number": _int(cells[0]),
+                        "period": period, "start_time": start, "end_time": end,
+                        "duration": duration})
+    return out
+
+
+def sweater_map(boxscore: dict) -> Dict[Tuple[str, int], Tuple[int, Optional[str]]]:
+    """{(side 'H' or 'V', sweater number): (player_id, team)} from a boxscore."""
+    out: Dict[Tuple[str, int], Tuple[int, Optional[str]]] = {}
+    boxscore = boxscore or {}
+    stats = boxscore.get("playerByGameStats") or {}
+    for side, key in (("H", "homeTeam"), ("V", "awayTeam")):
+        team = (boxscore.get(key) or {}).get("abbrev") or None
+        for group in ("forwards", "defense", "goalies"):
+            for p in (stats.get(key) or {}).get(group) or []:
+                pid, num = _int(p.get("playerId")), _int(p.get("sweaterNumber"))
+                if pid is not None and num is not None:
+                    out[(side, num)] = (pid, team)
+    return out
+
+
+def html_rows(game_id: int, pages: Dict[str, str], boxscore: dict) -> Tuple[List[dict], int]:
+    """raw.shifts rows from the two reports ({'H': page, 'V': page}) and
+    the boxscore; returns (rows, shift rows whose sweater was not found)."""
+    numbers = sweater_map(boxscore)
+    rows: Dict[tuple, dict] = {}
+    unmatched = 0
+    for side, page in pages.items():
+        for r in parse_toi_report(page):
+            hit = numbers.get((side, r["sweater"]))
+            if hit is None:
+                unmatched += 1
+                continue
+            pid, team = hit
+            rows[(pid, r["period"], r["start_time"])] = {
+                "game_id": int(game_id), "player_id": pid, "period": r["period"],
+                "start_time": r["start_time"], "end_time": r["end_time"],
+                "duration": r["duration"], "team": team, "nhl_shift_id": None,
+                "shift_number": r["shift_number"]}
+    out = sorted(rows.values(), key=lambda x: (x["period"], x["start_time"], x["player_id"]))
+    return out, unmatched
+
+
 def classify(rows: Sequence[dict]) -> str:
     """ok / partial / empty for a parsed game."""
     if not rows:
@@ -204,9 +303,9 @@ INSERT_SHIFTS = text("""
 
 UPSERT_FETCH = text("""
     INSERT INTO raw.shift_fetches (game_id, status, n_shifts, n_players,
-                                   n_goal_events, attempts, problem, fetched_at)
+                                   n_goal_events, attempts, problem, fetched_at, source)
     VALUES (:game_id, :status, :n_shifts, :n_players, :n_goal_events, 1, :problem,
-            (now() AT TIME ZONE 'UTC'))
+            (now() AT TIME ZONE 'UTC'), :source)
     ON CONFLICT (game_id) DO UPDATE SET
         status = EXCLUDED.status,
         n_shifts = CASE WHEN EXCLUDED.status IN ('ok', 'partial')
@@ -218,12 +317,14 @@ UPSERT_FETCH = text("""
                              ELSE raw.shift_fetches.n_goal_events END,
         attempts = LEAST(raw.shift_fetches.attempts + 1, 32000),
         problem = EXCLUDED.problem,
-        fetched_at = EXCLUDED.fetched_at
+        fetched_at = EXCLUDED.fetched_at,
+        source = CASE WHEN EXCLUDED.status IN ('ok', 'partial')
+                      THEN EXCLUDED.source ELSE raw.shift_fetches.source END
 """)
 
 
 def store_game(game_id: int, rows: List[dict], goals: int, status: str,
-               problem: Optional[str] = None, db=None) -> None:
+               problem: Optional[str] = None, db=None, source: str = "api") -> None:
     """Replace the game's shifts (only when rows were parsed) and record
     the fetch, in one transaction."""
     with (db or engine).begin() as conn:
@@ -235,7 +336,7 @@ def store_game(game_id: int, rows: List[dict], goals: int, status: str,
         conn.execute(UPSERT_FETCH, {
             "game_id": game_id, "status": status, "n_shifts": len(rows),
             "n_players": len({r["player_id"] for r in rows}),
-            "n_goal_events": goals, "problem": problem})
+            "n_goal_events": goals, "problem": problem, "source": source})
 
 
 def games_to_fetch(season: Optional[int] = None, retry_empty: bool = False,
@@ -284,19 +385,50 @@ def fetch_game(client: PoliteClient, game_id: int) -> Tuple[str, List[dict], int
     return status, rows, goals, problem
 
 
+def fetch_game_html(client: PoliteClient, game_id: int) -> Tuple[str, List[dict], Optional[str]]:
+    """(status, rows, problem) from the HTML time-on-ice reports; status is
+    ok, partial or empty, or error when a page or the boxscore failed."""
+    gid = str(int(game_id))
+    season = f"{gid[:4]}{int(gid[:4]) + 1}"
+    box = client.get_json(BOXSCORE_URL.format(game_id=gid))
+    if box.status != "ok" or not isinstance(box.body, dict):
+        return "error", [], f"boxscore: {box.problem or box.status}"
+    pages = {}
+    for side in ("H", "V"):
+        page = client.get_text(HTML_URL.format(season=season, side=side, suffix=gid[4:]))
+        if page.status != "ok" or not isinstance(page.body, str):
+            return "error", [], f"T{side} report: {page.problem or page.status}"
+        pages[side] = page.body
+    rows, unmatched = html_rows(game_id, pages, box.body)
+    status = classify(rows)
+    problem = "from the HTML time-on-ice reports (the shift-chart API had none)"
+    if unmatched:
+        problem += f"; {unmatched} shift rows had a sweater number not in the boxscore"
+    return status, rows, problem
+
+
 def fetch_games(game_ids: Sequence[int], client: Optional[PoliteClient] = None,
-                db=None, max_consecutive_errors: int = 25) -> Dict[str, int]:
+                db=None, max_consecutive_errors: int = 25,
+                html_fallback: bool = True) -> Dict[str, int]:
     """Fetch and store each game; returns counts by status. Stops early
     after max_consecutive_errors failures in a row (the API is down)."""
     ensure_tables(db)
     client = client or PoliteClient("NHL shift charts", min_interval_s=MIN_INTERVAL_S)
     counts = {"games": len(game_ids), "ok": 0, "partial": 0, "empty": 0, "error": 0,
-              "shifts": 0, "stopped_early": 0}
+              "shifts": 0, "stopped_early": 0, "from_html": 0}
     streak = 0
     started = time.monotonic()
     for i, gid in enumerate(game_ids, 1):
         status, rows, goals, problem = fetch_game(client, gid)
-        store_game(gid, rows, goals, status, problem, db=db)
+        source = "api"
+        if status == "empty" and html_fallback:
+            h_status, h_rows, h_problem = fetch_game_html(client, gid)
+            if h_rows:
+                status, rows, problem, source = h_status, h_rows, h_problem, "html"
+                counts["from_html"] += 1
+            elif h_status == "error":
+                problem = f"shift-chart API empty; {h_problem}"
+        store_game(gid, rows, goals, status, problem, db=db, source=source)
         counts[status] += 1
         counts["shifts"] += len(rows)
         streak = streak + 1 if status == "error" else 0
@@ -322,7 +454,7 @@ def fetch_missing(season: Optional[int] = None, retry_empty: bool = False,
     if not ids:
         logger.info("Shift charts: every finished game is already fetched")
         return {"games": 0, "ok": 0, "partial": 0, "empty": 0, "error": 0,
-                "shifts": 0, "stopped_early": 0}
+                "shifts": 0, "stopped_early": 0, "from_html": 0}
     logger.info(f"Shift charts: {len(ids)} game(s) to fetch"
                 + (f" (season {season})" if season else ""))
     return fetch_games(ids)
@@ -371,6 +503,7 @@ def coverage(db=None) -> List[dict]:
             SELECT g.season,
                    COUNT(*) AS finished,
                    COUNT(*) FILTER (WHERE f.status = 'ok') AS ok,
+                   COUNT(*) FILTER (WHERE f.status = 'ok' AND f.source = 'html') AS ok_from_html,
                    COUNT(*) FILTER (WHERE f.status = 'partial') AS partial,
                    COUNT(*) FILTER (WHERE f.status = 'empty') AS empty,
                    COUNT(*) FILTER (WHERE f.status = 'error') AS error,
