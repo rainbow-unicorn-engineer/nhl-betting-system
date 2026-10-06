@@ -260,7 +260,9 @@ def free_data():
     for label, module, func in steps:
         try:
             counts = getattr(importlib.import_module(module), func)()
-            if counts.get("stopped_early") or counts.get("candles_stopped_early")                     or counts.get("listing_failed"):
+            counts = counts or {}
+            if (counts.get("stopped_early") or counts.get("candles_stopped_early")
+                    or counts.get("listing_failed")):
                 logger.error(f"{label}: stopped early (non-fatal; the next run "
                              f"resumes): {counts}")
         except Exception as e:
