@@ -147,6 +147,150 @@ Evaluation (walk-forward, expanding season folds, purge gap):
   carries DraftKings closing O/U prices for most of 2025-26, but
   ingestion/espn_odds.py doesn't keep them), so there is no payout
   backtest for totals: the strategy proof starts at paper trading.
+
+v3 experiment: market offset + Dixon-Coles (2026-10-04, PRE-REGISTERED
+before any variant ran; code run_totals_v3, opt-in)
+- Why: v2 has no edge over the environment and its over/under log loss at
+  the DraftKings line is worse than the no-vig market (0.6959 vs 0.6882,
+  n=1,010). The moneyline model only became useful when it was boosted
+  FROM the market (models/lgbm.py). Two-way over/under prices now exist for
+  every past season, so the same trick can be tried for totals.
+- T0 was reproduced first, unchanged: 2.1801 vs 2.1787 (the v2 numbers).
+- Market prices (→ one fair P(over) per game at the market's main line,
+  market_over_probs over the union of these quotes; no-vig → the book's
+  fee taken out; closing → the last price before puck drop):
+  (a) raw.odds_snapshots, each book's last pre-game quote (live, 2026-27);
+  (b) raw.odds_history (2024-25, 10 books incl. Pinnacle): each book's
+      LAST snapshot strictly before puck drop, over and under from that one
+      snapshot; consensus = median no-vig P(over) across the books at the
+      line most of them quote;
+  (c) ESPN's DraftKings closing over/under (2025-26);
+  (d) ESPN's Unibet closing over/under (2020-21 to 2023-24), kept only
+      when the line is 5.5, the overround (→ the two sides' implied
+      probabilities summed, minus 1: the book's fee) is 3.5%-6.5%, the
+      no-vig P(over) is 0.25-0.80, and both of the game's Unibet moneyline
+      prices are under 1000 in size. Those are in-play markers: 2023-24
+      has lines from 2.0 to 13.0, moneylines of +/-1000 to 10000, and a
+      175-game block with 6.5%-9.8% margins whose log loss is too good for
+      a pre-game price (0.6545 vs 0.6654 for a constant). Data check done
+      before this pre-registration (prices vs outcomes only, no model):
+      Unibet's 5.5 is a real line, not the old placeholder. Its no-vig
+      P(over 5.5) is calibrated in every bin from 0.40 to 0.70 (0.576
+      predicted vs 0.584 actual in the 0.55-0.60 bin) and beats a constant
+      by 0.003-0.008 log loss in 2020-21 to 2022-23. At 5.5 overtime cannot
+      change the result (a regulation tie has an even total). Kept: 926 /
+      1,378 / 1,359 / 1,069 games.
+- Variants:
+  T0  v2 as committed (environment offset, margin weights, drift
+      correction, goalie variant A features).
+  T1  market offset. For a priced game, the market rates are the
+      environment rates (the home/away split stays the environment's)
+      times one common factor, solved so that the model's own PMF
+      machinery (the fold's margin weights; T2/T3 also rho) gives
+      P(over line | no push) = the no-vig market P(over) (market_lambdas).
+      A second booster (variant A features, same params) is trained ONLY on
+      priced training games with init_score = log(market rate), the
+      models/lgbm.py pattern, early-stopped on the priced regular-season
+      tail. Its season drift relative to the market rates is removed with
+      v2's drift_shift rule. Unpriced games: T0 unchanged.
+  T2  T1 + a Dixon-Coles rho (→ one number that moves probability between
+      the 0-0 / 1-1 and the 1-0 / 0-1 regulation scores, i.e. low-score
+      dependence between the two teams). Joint = independent x margin
+      weight x tau(h, a; rate_h, rate_a, rho), renormalized. rho is fitted
+      by maximum likelihood on each fold's training games with the
+      environment PMFs and that fold's margin weights (fitted first),
+      bounded to [-0.2, 0.2]. It is used everywhere the PMF is: the market
+      inversion, both boosters' scoring, the baseline.
+  T3  T2 + goalie-role variant C features (features/goalie_role.py) in
+      both boosters.
+  M   reference only, never adoptable: the market rates through the PMF
+      with no booster (environment baseline where unpriced). It copies the
+      market at the posted line, so the market check cannot fail it; it
+      shows what the market alone is worth to the NLL.
+- Metrics, all pooled out-of-fold over the 5 walk-forward folds:
+  - NLL vs the MATCHED environment baseline: the environment rates
+    through the variant's own joint machinery (T0, T1: margin weights,
+    i.e. 2.1787; T2, T3: margin weights + rho). A structural fix goes to
+    both sides, as in the hardened gate. Paired SE and folds won.
+  - NLL vs T0 (paired difference and SE).
+  - Calibration: predicted vs actual regulation tie rate; the total-goals
+    distribution, mean predicted P(total = t) vs the observed share for
+    t = 0..10 and 11+, with the largest gap and a chi-square (→ the sum
+    over those buckets of (observed - expected)^2 / expected; smaller is
+    better calibrated); push rates P(total = 5, 6, 7) (→ a push is a tie
+    with a whole-number line: the stake is refunded).
+  - Market check (market_check): over/under log loss at the main line vs
+    the no-vig P(over), pushes dropped, pooled over all priced scored
+    games, also reported per source.
+- Pass rule, fixed now. A T1-T3 variant passes when ALL hold:
+  (1) pooled NLL below its matched baseline by >= 2 paired SEs;
+  (2) below that baseline in >= 4 of the 5 folds;
+  (3) the market check is NOT WORSE at 95%: diff - 1.96 SE <= 0 (diff =
+      model minus market log loss) over >= 200 priced games.
+  Several pass: the lowest pooled NLL, unless a simpler passing variant
+  (lower number) is within 1 paired SE of it; then the simpler one.
+- Consequences, fixed now. The passing variant becomes the default:
+  MODEL_VERSION "v3", with the production scorer switched to it. GATE_PASSED
+  flips to True only if that variant ALSO BEATS the market: diff + 1.96 SE
+  < 0 over the pooled priced games. Reason: GATE_PASSED lets the bet
+  checker give totals legs a BET verdict, and a model that is merely "not
+  worse" than the market has no proven edge, so it would bet noise. If no
+  variant passes, v2 stays the default and GATE_PASSED stays False.
+- STATUS (2026-10-04, v3 experiment): NO VARIANT PASSES. v2 stays the
+  default, MODEL_VERSION stays "v2", GATE_PASSED stays False. Run once,
+  as pre-registered (python -m models.totals --v3, read-only, ~20 s).
+  Data: 7,979 games in the 5 validation seasons' dataset, 7,140 priced
+  (Unibet 4,732 after cleaning — exactly the 926 / 1,378 / 1,359 / 1,069
+  counted before the pre-registration; odds_history 1,398 games from
+  13,969 book quotes; DraftKings 1,010); 6,214 priced validation games,
+  6,143 without a push at the line. T0 reproduced v2 exactly.
+  Pooled NLL (6,993 scored games), vs the matched baseline, folds won:
+    T0  2.1801  vs B    2.1787  +0.0014 ± 0.0011  2/5
+    T1  2.1770  vs B    2.1787  -0.0017 ± 0.0016  3/5
+    T2  2.1771  vs B_dc 2.1787  -0.0016 ± 0.0016  3/5
+    T3  2.1764  vs B_dc 2.1787  -0.0023 ± 0.0016  3/5
+    M   2.1740  vs B    2.1787  -0.0047 ± 0.0012  5/5 (reference only)
+  vs T0: T1 -0.0031 ± 0.0012, T2 -0.0030 ± 0.0012, T3 -0.0037 ± 0.0012,
+  M -0.0061 ± 0.0015. vs M: T1 +0.0030 ± 0.0010, T2 +0.0031 ± 0.0010,
+  T3 +0.0025 ± 0.0009 (the boosters make the market worse).
+  Per fold (2021-22..2025-26), T1 / T3 / M / B: 2.1913 / 2.1902 /
+  2.1877 / 2.1986; 2.1592 / 2.1584 / 2.1544 / 2.1605; 2.1772 / 2.1767 /
+  2.1762 / 2.1763; 2.2040 / 2.2051 / 2.2011 / 2.2016; 2.1532 / 2.1516 /
+  2.1504 / 2.1563. Fitted rho per fold: -0.0005, +0.0083, -0.0018,
+  +0.0055, -0.0060 — no low-score dependence left once the margin
+  weights are in, so T2 is T1 to 4 decimals.
+  Market check (over/under log loss at the main line vs no-vig, n=6,143):
+    T0 0.6871  T1 0.6844  T2 0.6844  T3 0.6840  B 0.6852  vs market
+    0.6815; diffs +0.0056 ± 0.0013, +0.0028 ± 0.0008, +0.0029 ± 0.0009,
+    +0.0024 ± 0.0008, +0.0037 ± 0.0012. Every variant is WORSE than the
+    market at 95%. By source, T3 minus market: Unibet +0.0024 ± 0.0010
+    (n=3,806), 2024-25 consensus +0.0036 ± 0.0022 (n=1,327), DraftKings
+    2025-26 +0.0010 ± 0.0015 (n=1,010). The plain environment baseline
+    B is level with the 2024-25 ten-book consensus (+0.0002 ± 0.0024)
+    but 0.0069 ± 0.0028 behind DraftKings 2025-26 and 0.0041 ± 0.0016
+    behind Unibet.
+  Calibration (pooled): regulation tie rate predicted 0.218 (T0-T3) /
+  0.222 (M, B) vs actual 0.2225. Total-goals distribution chi-square
+  (12 buckets) T0 33.8, T1 38.9, T2 38.9, T3 39.2, M 37.4, B 31.6 —
+  all clearly off, the same way: too much mass on 11+ goals (predicted
+  0.054-0.057 vs 0.0465) and 2 goals, too little on 6, 7 and 8.
+  Push rates at totals 5 / 6 / 7: T3 0.217 / 0.104 / 0.197 vs actual
+  0.219 / 0.112 / 0.205 (6 and 7 are under-predicted by every variant).
+  Rule outcome: T1-T3 fail (1) (about 1-1.4 SE, not 2), (2) (3 of 5
+  folds) and (3) (worse than the market). M passes (1) and (2) but is
+  not adoptable: it IS the market.
+  What it means: starting from the market total helps the NLL (M beats
+  the environment in every season), but no booster on top of it — team
+  stats, goalie roles or rho — adds anything the closing price lacks;
+  each one makes the market's over/under probability worse. What would
+  flip GATE_PASSED: a new pre-registered variant that beats its baseline
+  by >= 2 SE in >= 4/5 folds AND beats the no-vig market's over/under
+  log loss with 95% confidence (diff + 1.96 SE < 0) on >= 200 priced
+  games. None of T1-T3 is close (their best upper bound is +0.0040).
+  Not pre-registered here and left untested: the home/away split from
+  the moneyline instead of the environment's (an older draft of this
+  experiment did that); it changes the regulation-tie and push shape,
+  not the expected total, so it is unlikely to close the market gap.
 """
 import logging
 
@@ -534,18 +678,80 @@ def _check_weights(w) -> np.ndarray:
     return w
 
 
+def dc_tau(pmf_h: np.ndarray, pmf_a: np.ndarray, rho: float) -> np.ndarray:
+    """(n, K+1, K+1) Dixon-Coles factors (v3 experiment, variant T2/T3):
+    1 everywhere except the four low scores, with lh, la the two sides'
+    rates (each PMF's mean):
+        tau(0,0) = 1 - lh*la*rho   tau(0,1) = 1 + lh*rho
+        tau(1,0) = 1 + la*rho      tau(1,1) = 1 - rho
+    (home goals first). rho > 0 moves probability from 0-0 and 1-1 to
+    1-0 and 0-1; rho < 0 the other way. Factors are floored at 0."""
+    n, k1 = pmf_h.shape
+    tau = np.ones((n, k1, k1))
+    if rho == 0.0:
+        return tau
+    k = np.arange(k1)
+    lh, la = pmf_h @ k, pmf_a @ k
+    tau[:, 0, 0] = 1.0 - lh * la * rho
+    tau[:, 0, 1] = 1.0 + lh * rho
+    tau[:, 1, 0] = 1.0 + la * rho
+    tau[:, 1, 1] = 1.0 - rho
+    return np.clip(tau, 0.0, None)
+
+
 def joint_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
-              margin_weights=MARGIN_WEIGHTS) -> np.ndarray:
+              margin_weights=MARGIN_WEIGHTS, rho: float = 0.0) -> np.ndarray:
     """(n, K+1, K+1) joint regulation-score distribution from per-side
     PMFs: their product, each cell times its margin bucket's weight,
     renormalized per game to sum to 1. margin_weights=None keeps the
-    plain independent product."""
+    plain independent product. rho != 0 also multiplies in the
+    Dixon-Coles factors (dc_tau) before renormalizing."""
     joint = pmf_h[:, :, None] * pmf_a[:, None, :]
-    if margin_weights is None:
+    if margin_weights is None and rho == 0.0:
         return joint
-    w = _check_weights(margin_weights)
-    joint = joint * w[margin_buckets(pmf_h.shape[1])][None]
+    if margin_weights is not None:
+        w = _check_weights(margin_weights)
+        joint = joint * w[margin_buckets(pmf_h.shape[1])][None]
+    if rho != 0.0:
+        joint = joint * dc_tau(pmf_h, pmf_a, float(rho))
     return joint / joint.sum(axis=(1, 2), keepdims=True)
+
+
+DC_RHO_BOUNDS = (-0.2, 0.2)
+
+
+def fit_dc_rho(pmf_h: np.ndarray, pmf_a: np.ndarray, y_home, y_away,
+               margin_weights=MARGIN_WEIGHTS) -> float:
+    """Maximum-likelihood Dixon-Coles rho from training games only, given
+    the per-side PMFs and the (already fitted) margin weights. Only the
+    four low-score cells change, so a game's log-likelihood moves by
+    log tau(observed cell) - log(sum of joint x tau)."""
+    from scipy.optimize import minimize_scalar
+
+    k1 = pmf_h.shape[1]
+    joint = joint_pmf(pmf_h, pmf_a, margin_weights)
+    k = np.arange(k1)
+    lh, la = pmf_h @ k, pmf_a @ k
+    h = np.clip(np.asarray(y_home).astype(int), 0, k1 - 1)
+    a = np.clip(np.asarray(y_away).astype(int), 0, k1 - 1)
+    cells = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    mass = np.stack([joint[:, i, j] for i, j in cells], axis=1)     # (n, 4)
+    obs = np.stack([(h == i) & (a == j) for i, j in cells], axis=1)
+
+    def taus(rho):
+        t = np.stack([1.0 - lh * la * rho, 1.0 + lh * rho,
+                      1.0 + la * rho, np.full_like(lh, 1.0 - rho)], axis=1)
+        return np.clip(t, 1e-12, None)
+
+    def nll(rho):
+        t = taus(rho)
+        z = 1.0 + (mass * (t - 1.0)).sum(axis=1)
+        log_obs = np.where(obs, np.log(t), 0.0).sum(axis=1)
+        return -np.mean(log_obs - np.log(z))
+
+    res = minimize_scalar(nll, bounds=DC_RHO_BOUNDS, method="bounded",
+                          options={"xatol": 1e-6})
+    return float(res.x)
 
 
 def fit_margin_weights(pmf_h: np.ndarray, pmf_a: np.ndarray,
@@ -583,20 +789,26 @@ def fit_margin_weights(pmf_h: np.ndarray, pmf_a: np.ndarray,
     return np.exp(np.append(res.x, 0.0))
 
 
-def total_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
-              margin_weights=MARGIN_WEIGHTS) -> np.ndarray:
-    """Settlement-total distribution from two per-side regulation PMFs
-    (n, K+1) -> (n, 2K+2): the joint (margin-reweighted by default; see
-    joint_pmf) summed along each total, with every regulation tie shifted
-    up one goal (the OT/SO winner's credited goal)."""
-    n, k1 = pmf_h.shape
-    joint = joint_pmf(pmf_h, pmf_a, margin_weights)        # (n, K+1, K+1)
-    out = np.zeros((n, 2 * k1))
+def total_from_joint(joint: np.ndarray) -> np.ndarray:
+    """(n, K+1, K+1) regulation joint -> (n, 2K+2) settlement-total PMF:
+    each cell's mass goes to h + a, and a regulation tie (h == a) to
+    h + a + 1 (the OT/SO winner's credited goal)."""
+    n, k1, _ = joint.shape
     h_idx, a_idx = np.meshgrid(np.arange(k1), np.arange(k1), indexing="ij")
     t_idx = np.where(h_idx == a_idx, h_idx + a_idx + 1, h_idx + a_idx)
-    np.add.at(out, (np.arange(n)[:, None, None],
-                    np.broadcast_to(t_idx, joint.shape)), joint)
-    return out
+    to_total = np.zeros((k1 * k1, 2 * k1))
+    to_total[np.arange(k1 * k1), t_idx.ravel()] = 1.0
+    return joint.reshape(n, k1 * k1) @ to_total
+
+
+def total_pmf(pmf_h: np.ndarray, pmf_a: np.ndarray,
+              margin_weights=MARGIN_WEIGHTS, rho: float = 0.0) -> np.ndarray:
+    """Settlement-total distribution from two per-side regulation PMFs
+    (n, K+1) -> (n, 2K+2): the joint (margin-reweighted by default, and
+    Dixon-Coles adjusted when rho != 0; see joint_pmf) summed along each
+    total, with every regulation tie shifted up one goal (the OT/SO
+    winner's credited goal)."""
+    return total_from_joint(joint_pmf(pmf_h, pmf_a, margin_weights, rho))
 
 
 def prob_over(tpmf: np.ndarray, line) -> tuple:
@@ -1149,6 +1361,409 @@ def _register(pooled: dict, meta, names: list) -> None:
     logger.info(f"Registered {MODEL_NAME} {MODEL_VERSION} in models.model_registry")
 
 
+# ── v3 experiment: market offset + Dixon-Coles (pre-registered) ────
+#
+# Module docstring, "v3 experiment", has the variants, metrics and the
+# pass rule. Everything here is evaluation only and writes nothing.
+
+V3_VARIANTS = ("T0", "T1", "T2", "T3")
+V3_REFERENCES = ("M", "B", "B_dc")      # market alone, the two baselines
+MARKET_SCALE_RANGE = (0.25, 4.0)        # bisection bracket for the factor
+MARKET_BISECT_STEPS = 40
+MIN_PRICED_TRAIN = 200                  # fewer: priced games use M's rates
+GATE_SE = 2.0                           # pass rule (1)
+GATE_FOLDS = 4                          # pass rule (2)
+CAL_MAX_TOTAL = 11                      # calibration buckets 0..10, 11+
+
+# Unibet cleaning (docstring, source d)
+UNIBET_LINE = 5.5
+UNIBET_OVERROUND = (0.035, 0.065)
+UNIBET_FAIR = (0.25, 0.80)
+UNIBET_ML_MAX = 1000
+
+
+def market_lambdas(fair_over, line, base_h, base_a,
+                   margin_weights=MARGIN_WEIGHTS, rho: float = 0.0,
+                   steps: int = MARKET_BISECT_STEPS) -> tuple:
+    """Per game, the rates (base_h * c, base_a * c) whose total PMF
+    (margin weights, rho) gives P(over line | no push) = fair_over: the
+    market's expected scoring put through this model's own machinery, with
+    the home/away split of the base rates. c is found by bisection on
+    log c inside MARKET_SCALE_RANGE (P(over) rises with c); a price outside
+    what the range can reach gets the nearest end. Pure."""
+    fair = np.asarray(fair_over, dtype=float)
+    line = np.asarray(line, dtype=float)
+    base_h = np.asarray(base_h, dtype=float)
+    base_a = np.asarray(base_a, dtype=float)
+    lo = np.full(len(fair), np.log(MARKET_SCALE_RANGE[0]))
+    hi = np.full(len(fair), np.log(MARKET_SCALE_RANGE[1]))
+    for _ in range(steps):
+        mid = 0.5 * (lo + hi)
+        k = np.exp(mid)
+        tp = total_pmf(poisson_pmf(base_h * k), poisson_pmf(base_a * k),
+                       margin_weights, rho)
+        po, pp = prob_over(tp, line)
+        p = po / np.clip(1.0 - pp, 1e-12, None)
+        up = p < fair
+        lo, hi = np.where(up, mid, lo), np.where(up, hi, mid)
+    k = np.exp(0.5 * (lo + hi))
+    return (np.clip(base_h * k, *LAMBDA_CLIP),
+            np.clip(base_a * k, *LAMBDA_CLIP))
+
+
+def clean_unibet(rows: pd.DataFrame) -> pd.DataFrame:
+    """Unibet closing over/under rows that pass the pre-registered checks
+    (line 5.5, overround 3.5-6.5%, no-vig P(over) 0.25-0.80, both
+    moneyline prices under 1000 in size), as quotes. rows: game_id,
+    over_under, over_price, under_price, home_ml, away_ml. Pure."""
+    from features.util import american_implied_prob
+    cols = ["game_id", "book_name", "line", "over_price", "under_price"]
+    r = rows.dropna(subset=["over_under", "over_price", "under_price"])
+    if r.empty:
+        return pd.DataFrame(columns=cols)
+    po = r["over_price"].astype(float).map(american_implied_prob)
+    pu = r["under_price"].astype(float).map(american_implied_prob)
+    over_round = po + pu - 1.0
+    fair = po / (po + pu)
+    ml_ok = ((r["home_ml"].astype(float).abs() < UNIBET_ML_MAX)
+             & (r["away_ml"].astype(float).abs() < UNIBET_ML_MAX))
+    ok = ((r["over_under"].astype(float) == UNIBET_LINE)
+          & over_round.between(*UNIBET_OVERROUND)
+          & fair.between(*UNIBET_FAIR) & ml_ok)
+    out = r[ok].rename(columns={"over_under": "line"})
+    return out.assign(book_name="espn_Unibet")[cols].reset_index(drop=True)
+
+
+def history_closing_quotes(rows: pd.DataFrame) -> pd.DataFrame:
+    """Each book's closing over/under quote from raw.odds_history rows
+    (game_id, book, side, price, point, snapshot_ts, start_utc): the last
+    snapshot strictly before puck drop that has both sides at the same
+    point. Pure."""
+    cols = ["game_id", "book_name", "line", "over_price", "under_price"]
+    r = rows[rows["snapshot_ts"] < rows["start_utc"]]
+    r = r.dropna(subset=["price", "point"])
+    if r.empty:
+        return pd.DataFrame(columns=cols)
+    key = ["game_id", "book", "snapshot_ts"]
+    over = r[r["side"] == "over"].drop_duplicates(key, keep="last")
+    under = r[r["side"] == "under"].drop_duplicates(key, keep="last")
+    both = over.merge(under, on=key, suffixes=("_o", "_u"))
+    both = both[both["point_o"].astype(float) == both["point_u"].astype(float)]
+    last = (both.sort_values("snapshot_ts")
+            .drop_duplicates(["game_id", "book"], keep="last"))
+    return pd.DataFrame({
+        "game_id": last["game_id"].to_numpy(),
+        "book_name": last["book"].to_numpy(),
+        "line": last["point_o"].astype(float).to_numpy(),
+        "over_price": last["price_o"].astype(int).to_numpy(),
+        "under_price": last["price_u"].astype(int).to_numpy()})
+
+
+_HISTORY_TOTALS_SQL = """
+    SELECT o.game_id, o.book, o.side, o.price, o.point, o.snapshot_ts,
+           (g.start_time_utc AT TIME ZONE 'UTC') AS start_utc
+    FROM raw.odds_history o
+    JOIN raw.games g USING (game_id)
+    WHERE o.market = 'totals' AND g.game_state IN ('FINAL', 'OFF')
+      AND g.start_time_utc IS NOT NULL
+"""
+
+_UNIBET_SQL = """
+    SELECT h.game_id, h.over_under, h.over_price, h.under_price,
+           h.home_ml, h.away_ml
+    FROM raw.historical_odds h
+    JOIN raw.games g USING (game_id)
+    WHERE h.provider = 'Unibet' AND g.game_state IN ('FINAL', 'OFF')
+"""
+
+
+def load_v3_quotes(conn=None) -> pd.DataFrame:
+    """Every pre-registered over/under source as quote rows (game_id,
+    book_name, line, over_price, under_price, source): live snapshots,
+    ESPN DraftKings closing, raw.odds_history closing, cleaned Unibet.
+    Read-only."""
+    if conn is None:
+        with engine.connect() as c:
+            return load_v3_quotes(c)
+    parts = []
+    snap = load_market_quotes(conn)
+    if not snap.empty:
+        parts.append(snap.assign(source=np.where(
+            snap["book_name"].astype(str).str.startswith("espn_"),
+            "draftkings_espn", "snapshot")))
+    hist = pd.read_sql(text(_HISTORY_TOTALS_SQL), conn)
+    if not hist.empty:
+        hist["snapshot_ts"] = pd.to_datetime(hist["snapshot_ts"])
+        hist["start_utc"] = pd.to_datetime(hist["start_utc"])
+        parts.append(history_closing_quotes(hist).assign(source="odds_history"))
+    uni = pd.read_sql(text(_UNIBET_SQL), conn)
+    parts.append(clean_unibet(uni).assign(source="unibet_espn"))
+    parts = [p for p in parts if not p.empty]
+    cols = ["game_id", "book_name", "line", "over_price", "under_price",
+            "source"]
+    return (pd.concat(parts, ignore_index=True)[cols] if parts
+            else pd.DataFrame(columns=cols))
+
+
+def quote_sources(quotes: pd.DataFrame) -> pd.Series:
+    """game_id -> its quote source ('mixed' when several)."""
+    if quotes.empty or "source" not in quotes:
+        return pd.Series(dtype=object)
+    return quotes.groupby("game_id")["source"].agg(
+        lambda s: s.iloc[0] if s.nunique() == 1 else "mixed")
+
+
+def total_calibration(tpmf: np.ndarray, totals: np.ndarray,
+                      max_total: int = CAL_MAX_TOTAL) -> dict:
+    """Mean predicted P(total = t) vs the observed share, t = 0..max-1 and
+    max+ (one bucket), with the largest gap and the chi-square
+    sum((obs - exp)^2 / exp) over counts. Pure."""
+    t = np.clip(np.asarray(totals).astype(int), 0, max_total)
+    pred = np.hstack([tpmf[:, :max_total],
+                      tpmf[:, max_total:].sum(axis=1, keepdims=True)])
+    expected = pred.sum(axis=0)
+    observed = np.bincount(t, minlength=max_total + 1).astype(float)
+    n = len(t)
+    chi2 = float(np.sum((observed - expected) ** 2 / np.clip(expected, 1e-9,
+                                                             None)))
+    return {"pred": (expected / n).round(4).tolist(),
+            "obs": (observed / n).round(4).tolist(),
+            "max_gap": float(np.max(np.abs(observed - expected)) / n),
+            "chi2": chi2}
+
+
+def not_worse_than_market(mc: dict) -> bool:
+    """Pass rule (3): enough priced games and the model's log loss is not
+    worse than the market's at 95% (diff - 1.96 SE <= 0)."""
+    return (mc.get("n", 0) >= MARKET_CHECK_MIN_GAMES
+            and np.isfinite(mc.get("diff_se", np.nan))
+            and mc["diff"] - 1.96 * mc["diff_se"] <= 0)
+
+
+def v3_passes(s: dict) -> bool:
+    """The pre-registered pass rule (1)-(3) on one variant's summary."""
+    return (s["diff"] <= -GATE_SE * s["diff_se"]
+            and s["folds_won"] >= GATE_FOLDS
+            and not_worse_than_market(s["market_check"]))
+
+
+def choose_v3(summaries: dict):
+    """The variant the pre-registered rule adopts (None when none of
+    T1-T3 passes): the lowest pooled NLL, unless a simpler passing
+    variant is within 1 paired SE of it."""
+    passing = [v for v in V3_VARIANTS[1:] if v in summaries
+               and v3_passes(summaries[v])]
+    if not passing:
+        return None
+    best = min(passing, key=lambda v: summaries[v]["nll"])
+    for v in passing:                          # in order: simplest first
+        if v == best:
+            return v
+        d = summaries[v]["nll"] - summaries[best]["nll"]
+        if d <= summaries[v]["vs"].get(best, {}).get("se", np.inf):
+            return v
+    return best
+
+
+def _paired(a: np.ndarray, b: np.ndarray) -> dict:
+    d = a - b
+    return {"diff": float(d.mean()),
+            "se": float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1
+            else float("nan")}
+
+
+def run_totals_v3(market_quotes=None, variants=V3_VARIANTS) -> dict:
+    """The pre-registered v3 walk-forward (module docstring). Registers and
+    writes nothing. market_quotes: rows like load_v3_quotes (None loads
+    them). Returns {"summaries", "folds", "chosen", "rho", "oof"}."""
+    for v in variants:
+        if v not in V3_VARIANTS:
+            raise ValueError(f"unknown v3 variant {v!r}")
+    Xh_c, Xa_c, y_h, y_a, meta, names_c = load_totals_dataset(
+        variant="C", with_roles=True)
+    n_a = len(ATTACK_FEATURES)
+    if list(names_c[:n_a]) != list(ATTACK_FEATURES):
+        raise RuntimeError("variant C columns must start with variant A's")
+    feats = {"A": (Xh_c[:, :n_a], Xa_c[:, :n_a]), "C": (Xh_c, Xa_c)}
+
+    env_h = env_rates(meta["date"], y_h, ENV_PRIOR_RATE["home"])
+    env_a = env_rates(meta["date"], y_a, ENV_PRIOR_RATE["away"])
+    folds = walk_forward_folds(meta)
+    totals = meta["total"].to_numpy()
+    seasons, dates = meta["season"].to_numpy(), meta["date"].to_numpy()
+    is_po = meta["is_playoff"].to_numpy(dtype=bool)
+    n = len(meta)
+
+    if market_quotes is None:
+        market_quotes = load_v3_quotes()
+    mkt = market_over_probs(market_quotes).set_index("game_id")
+    line = meta["game_id"].map(mkt["line"]).to_numpy(dtype=float)
+    fair = meta["game_id"].map(mkt["fair_over"]).to_numpy(dtype=float)
+    priced = np.isfinite(line) & np.isfinite(fair)
+    source = meta["game_id"].map(quote_sources(market_quotes)).to_numpy(
+        dtype=object)
+    logger.info(f"v3 dataset: {n} games, {priced.sum()} priced, "
+                f"{len(folds)} folds")
+
+    names = list(variants) + list(V3_REFERENCES)
+    nll = {v: np.full(n, np.nan) for v in names}
+    tie = {v: np.full(n, np.nan) for v in names}
+    p_over = {v: np.full(n, np.nan) for v in names}
+    p_push = {v: np.full(n, np.nan) for v in names}
+    tpmfs = {v: np.full((n, 2 * (MAX_GOALS + 1)), np.nan) for v in names}
+    fold_rows = []
+    rhos = {}
+    need_rho = any(v in ("T2", "T3") for v in variants)
+
+    for fold in folds:
+        tr, val = fold.train_idx, fold.val_idx
+        pe_tr = (poisson_pmf(env_h[tr]), poisson_pmf(env_a[tr]))
+        w = fit_margin_weights(*pe_tr, y_h[tr], y_a[tr])
+        rho = fit_dc_rho(*pe_tr, y_h[tr], y_a[tr], w) if need_rho else 0.0
+        rhos[int(fold.val_season)] = rho
+
+        def env_model(fs):
+            Xh, Xa = feats[fs]
+            fm = fit_totals_fold(Xh, Xa, y_h, y_a, env_h, env_a, tr,
+                                 meta["date"], is_playoff=is_po)
+            lh, la = predict_lambdas(fm, Xh[val], Xa[val],
+                                     env_h[val], env_a[val])
+            adj = booster_adjustment(lh, la, env_h[val], env_a[val])
+            return apply_drift(lh, la, drift_shift(seasons[val], dates[val],
+                                                   adj))
+
+        tr_p, val_p = tr[priced[tr]], val[priced[val]]
+        mrates = {}
+
+        def market_rates(r):
+            if r not in mrates:
+                idx = np.concatenate([tr_p, val_p])
+                mh, ma = np.full(n, np.nan), np.full(n, np.nan)
+                if len(idx):
+                    mh[idx], ma[idx] = market_lambdas(
+                        fair[idx], line[idx], env_h[idx], env_a[idx], w, r)
+                mrates[r] = (mh, ma)
+            return mrates[r]
+
+        def market_model(fs, r):
+            mh, ma = market_rates(r)
+            if len(val_p) == 0:
+                return np.array([]), np.array([])
+            if len(tr_p) < MIN_PRICED_TRAIN:
+                return mh[val_p], ma[val_p]
+            Xh, Xa = feats[fs]
+            fm = fit_totals_fold(Xh, Xa, y_h, y_a, mh, ma, tr_p,
+                                 meta["date"], is_playoff=is_po)
+            lh, la = predict_lambdas(fm, Xh[val_p], Xa[val_p],
+                                     mh[val_p], ma[val_p])
+            adj = booster_adjustment(lh, la, mh[val_p], ma[val_p])
+            return apply_drift(lh, la, drift_shift(seasons[val_p],
+                                                   dates[val_p], adj))
+
+        pos = {g: i for i, g in enumerate(val)}
+        loc_p = np.array([pos[g] for g in val_p], dtype=int)
+
+        def combine(fallback, market):
+            lh, la = fallback[0].copy(), fallback[1].copy()
+            if len(loc_p):
+                lh[loc_p], la[loc_p] = market
+            return lh, la
+
+        env_val = (env_h[val], env_a[val])
+        rates = {"B": (env_val, 0.0), "B_dc": (env_val, rho)}
+        lam_t0 = env_model("A")
+        rates["M"] = (combine(env_val, tuple(x[val_p] for x in
+                                             market_rates(0.0))), 0.0)
+        if "T0" in variants:
+            rates["T0"] = (lam_t0, 0.0)
+        if "T1" in variants:
+            rates["T1"] = (combine(lam_t0, market_model("A", 0.0)), 0.0)
+        if "T2" in variants:
+            rates["T2"] = (combine(lam_t0, market_model("A", rho)), rho)
+        if "T3" in variants:
+            rates["T3"] = (combine(env_model("C"), market_model("C", rho)),
+                           rho)
+
+        row = {"val_season": int(fold.val_season), "n_val": len(val),
+               "n_priced": int(len(val_p)), "n_priced_train": int(len(tr_p)),
+               "margin_weights": [round(float(x), 3) for x in w],
+               "rho": round(rho, 4)}
+        for v, ((lh, la), r) in rates.items():
+            joint = joint_pmf(poisson_pmf(lh), poisson_pmf(la), w, r)
+            tp = total_from_joint(joint)
+            tpmfs[v][val] = tp
+            nll[v][val] = nll_of_totals(tp, totals[val])
+            tie[v][val] = np.trace(joint, axis1=1, axis2=2)
+            if len(val_p):
+                po, pp = prob_over(tp[loc_p], line[val_p])
+                p_over[v][val_p], p_push[v][val_p] = po, pp
+            row[v] = float(np.mean(nll[v][val]))
+        fold_rows.append(row)
+        logger.info(f"  fold {row['val_season']}: rho={rho:+.4f} priced "
+                    f"{row['n_priced']}/{row['n_val']} | " + " ".join(
+                        f"{v}={row[v]:.4f}" for v in names if v in row))
+
+    scored = ~np.isnan(nll["B"])
+    reg_tie = (y_h == y_a)
+    summaries = {}
+    for v in names:
+        base = "B_dc" if v in ("T2", "T3") else "B"
+        s = {"nll": float(np.mean(nll[v][scored])),
+             "baseline": base,
+             "baseline_nll": float(np.mean(nll[base][scored])),
+             "n_scored": int(scored.sum())}
+        pb = _paired(nll[v][scored], nll[base][scored])
+        s["diff"], s["diff_se"] = pb["diff"], pb["se"]
+        s["folds_won"] = int(sum(
+            np.mean(nll[v][f.val_idx]) < np.mean(nll[base][f.val_idx])
+            for f in folds))
+        s["vs"] = {u: _paired(nll[v][scored], nll[u][scored])
+                   for u in names if u != v}
+        s["tie_pred"] = float(np.mean(tie[v][scored]))
+        s["tie_actual"] = float(np.mean(reg_tie[scored]))
+        s["calibration"] = total_calibration(tpmfs[v][scored], totals[scored])
+        s["push_pred"] = {k: float(np.mean(tpmfs[v][scored][:, k]))
+                          for k in (5, 6, 7)}
+        s["push_actual"] = {k: float(np.mean(totals[scored] == k))
+                            for k in (5, 6, 7)}
+        pr = scored & priced
+        s["market_check"] = market_check(p_over[v][pr], p_push[v][pr],
+                                         fair[pr], totals[pr], line[pr])
+        s["market_by_source"] = {
+            str(src): market_check(p_over[v][m], p_push[v][m], fair[m],
+                                   totals[m], line[m])
+            for src in sorted(set(source[pr]))
+            for m in [pr & (source == src)]}
+        s["passes"] = v in V3_VARIANTS and v3_passes(s)
+        s["beats_market"] = bool(s["market_check"].get("beats_market"))
+        summaries[v] = s
+
+    chosen = choose_v3({v: summaries[v] for v in variants})
+    for v in names:
+        s = summaries[v]
+        mc = s["market_check"]
+        logger.info(
+            f"{v:5s} nll={s['nll']:.4f} vs {s['baseline']} "
+            f"{s['baseline_nll']:.4f} ({s['diff']:+.4f} ± {s['diff_se']:.4f},"
+            f" {s['folds_won']}/{len(folds)} folds) vs T0 "
+            f"{s['vs'].get('T0', {'diff': 0.0})['diff']:+.4f} | tie "
+            f"{s['tie_pred']:.3f}/{s['tie_actual']:.3f} chi2 "
+            f"{s['calibration']['chi2']:.1f} | market "
+            + (f"{mc['model_log_loss']:.4f} vs {mc['market_log_loss']:.4f} "
+               f"({mc['diff']:+.4f} ± {mc['diff_se']:.4f}, n={mc['n']})"
+               if mc.get("n") else "none")
+            + (" PASSES" if s["passes"] else ""))
+    logger.info(f"v3 adopted by the pre-registered rule: {chosen}")
+
+    oof = meta.loc[scored, ["game_id", "season", "date", "total"]].copy()
+    for v in names:
+        oof[f"nll_{v}"] = nll[v][scored]
+    oof["priced"] = priced[scored]
+    oof["source"] = source[scored]
+    return {"summaries": summaries, "folds": fold_rows, "chosen": chosen,
+            "rho": rhos, "oof": oof}
+
+
 def main(argv=None) -> dict:
     """Command line: run the walk-forward evaluation and register the
     model (inactive), or with --no-register only report. --help runs
@@ -1160,7 +1775,12 @@ def main(argv=None) -> dict:
                     "models.model_registry")
     parser.add_argument("--no-register", action="store_true",
                         help="evaluate and report only; write nothing")
+    parser.add_argument("--v3", action="store_true",
+                        help="run the pre-registered v3 experiment (market "
+                             "offset + Dixon-Coles); writes nothing")
     args = parser.parse_args(argv)
+    if args.v3:
+        return run_totals_v3()
     return run_totals(register=not args.no_register)
 
 
