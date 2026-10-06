@@ -151,7 +151,10 @@ def test_tables_hold_only_new_tables_with_their_ddl():
                      ("raw", "lineup_fetches"), ("raw", "news_events"),
                      ("raw", "news_state"), ("raw", "news_runs"),
                      ("raw", "pipeline_runs"), ("betting", "slips"),
-                     ("betting", "slip_legs"), ("betting", "bankroll_txns")]
+                     ("betting", "slip_legs"), ("betting", "bankroll_txns"),
+                     ("raw", "shift_fetches"), ("raw", "game_info"),
+                     ("raw", "game_scratches"), ("raw", "game_officials"),
+                     ("raw", "kalshi_markets"), ("raw", "kalshi_candles")]
     for schema, table, statements in migrate.TABLES:
         create = _create_table(statements)
         assert f"CREATE TABLE IF NOT EXISTS {schema}.{table} (" in create
