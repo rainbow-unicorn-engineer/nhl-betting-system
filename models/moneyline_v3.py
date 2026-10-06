@@ -151,7 +151,79 @@ restricted to the same games.
   which is often unconfirmed at 10:00, so the morning arm is slightly
   flattered.
 
-STATUS: pre-registered, not yet run.
+=====================================================================
+STATUS (run 2026-10-04, seed 42, robustness seeds 1 and 2; results in
+models/artifacts/moneyline_v3_results.json; re-run with
+`python -m models.moneyline_v3`, read-only)
+=====================================================================
+
+Decision: V0 stays. No variant is eligible, so models/lgbm.py is
+unchanged. 6,993 walk-forward games scored, 2,412 priced.
+
+Pooled log loss (lower is better), difference vs V0 with paired SE, and
+vs the consensus no-vig close on the 2,412 priced games:
+  V0   0.66163                          vs market +0.0037 (SE 0.0025)
+  V1   0.66223  +0.00060 (SE 0.00100)   vs market +0.0055 (SE 0.0020)
+  V1p  0.66225  +0.00062 (SE 0.00099)   vs market +0.0055 (SE 0.0020)
+  V2   0.66228  +0.00066 (SE 0.00110)   vs market +0.0070 (SE 0.0019)
+  V3   0.66207  +0.00044 (SE 0.00114)   vs market +0.0074 (SE 0.0019)
+  Market (consensus no-vig close) on the priced games: 0.6666
+  (2024-25 0.6573, 2025-26 DraftKings 0.6794); Pinnacle no-vig 0.6576.
+  None beats V0 (condition (a) fails for all), and V1, V2 and V3 are
+  each worse than the market at 95% (condition (b) fails too). Seeds 1
+  and 2 agree: no variant reaches 2 SE, the rule picks V0 every time.
+  By season: V1 matches the market in 2024-25 (-0.0010, SE 0.0017; vs
+  Pinnacle -0.0010, SE 0.0017) but is clearly worse than DraftKings in
+  2025-26 (+0.0144, SE 0.0042), while V0 matches DraftKings there
+  (+0.00004, SE 0.0020). Why V1 drifts away in 2025-26 is not known; a
+  guess, untested: the booster learns a correction from mostly Unibet
+  three-way seasons that does not transfer to two-way prices.
+  ECE (calibration miss): V0 0.017, V1 0.019, V2 0.018, V3 0.016.
+
+Post-hoc diagnostics (added after the run, never adoptable; the older,
+superseded pre-registration in another branch had listed a Unibet
+mapping as a candidate, which is why they were tried):
+  V1m  V1 + a per-fold logistic mapping of Unibet-era market
+       probabilities onto the two-way scale, fitted on training rows
+       only: 0.66224, +0.00001 (SE 0.00042) vs V1. No help.
+  V1mc V1m with the 106 Unibet rows that look captured in play treated
+       as having no market: 0.66440, +0.0022 (SE 0.0008) vs V1. Worse
+       (2023-24 loses its market on those games).
+
+Priced backtests (descriptive). Flat ROI with 95% game-clustered CI:
+  V0 2024-25 best of 10 books: 1,049 bets, +0.6% [-6.0%, +6.9%]
+     (quarter-Kelly +1.0%, bankroll 100 -> 116, max drawdown 29%).
+     Single US books -0.5% to -2.0%; Pinnacle alone -0.4%.
+  V0 2025-26 DraftKings: 401 bets, -1.3% [-10.7%, +8.5%].
+  V1 2024-25 best of 10: 585 bets, +4.4% [-3.6%, +12.1%];
+  V1 2025-26 DraftKings: 727 bets, -10.0% [-16.6%, -3.4%].
+  V2 and V3 are no better (V3 2024-25 best of 10: -6.7%).
+  Edge buckets: V0 2024-25 6-9 points +16.0% [+2.6%, +29.2%] on 256
+  bets, but 2.5-4 -12.5% and 9+ +0.3%, and 2025-26 6-9 is +5.0%
+  [-20.5%, +30.8%]. With 4 buckets x 2 seasons x 4 variants looked at,
+  one interval that excludes 0 is what chance alone would give; it is
+  not evidence for a threshold.
+  CLV: mean closing EV of the prices taken is negative everywhere
+  (best of 10 about -1.7%, single US books about -4%, DraftKings 2025-26
+  -4.2%): betting at the close at these prices pays the margin, so any
+  profit would have to come from the model, and the log loss says the
+  model does not out-predict the close.
+  Exchanges: no Kalshi or Polymarket prices exist in the data (the
+  history covers 10 sportsbooks), so there is no real exchange backtest.
+  The labelled hypothetical (buy at consensus no-vig + 1 cent) shows the
+  taker fee alone turning V0's 2024-25 +0.1% into -3.1% (Kalshi) and
+  -3.1% (Polymarket).
+
+Bet-timing study (V0, 889 games with a morning snapshot):
+  H1 not supported: slope of the line's move on the model's morning
+     edge 0.039, t 1.90 (needed t >= 2). A hint, not evidence.
+  H2 not supported: morning bets' mean closing EV -1.65% (SE 0.18%);
+     the no-vig line did move toward our side by +0.17 points on
+     average (SE 0.09), too little to cover the margin.
+  H3 neither slot is better: morning minus close flat ROI -1.1%
+     [-3.4%, +1.1%], closing EV +0.16% [-0.21%, +0.52%]. Morning arm
+     361 bets +5.2% flat [-4.4%, +15.0%]; close arm 359 bets +6.4%
+     [-3.5%, +16.3%].
 """
 import json
 import logging
