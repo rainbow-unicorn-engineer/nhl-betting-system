@@ -30,8 +30,10 @@ Semantics locked here:
   dec_offered / prod(dec_i) — exact for standard pricing, proportional
   approximation for boosts (flagged in the report).
 - Legs sharing a game are CORRELATED and independence is wrong there;
-  the report says so and withholds a verdict (the joint same-game model
-  is Phase 5 scope).
+  the report says so and withholds a verdict. A joint same-game pricer
+  exists (betting/sgp.py) but failed its pre-registered test against
+  multiplying the legs' chances (sgp.GATE_PASSED is False, see its
+  STATUS), so it is not used here.
 - While the totals model has not passed its validation gate
   (models.totals.GATE_PASSED, see its STATUS): totals-leg EVs are reported
   with a warning and never earn a "BET" verdict on their own.
