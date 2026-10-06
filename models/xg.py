@@ -46,6 +46,14 @@ game: each game's shots scored by a model trained on the other 80% of
 2020-21 games). Those values feed only training rows of the downstream
 models (the 2020-21 rolling features and the 2021-22 goalie prior, all
 earlier than any scored game).
+[Wording corrected 2026-10-06, method unchanged: the 2020-21 cross-fitted
+values feed only features computed from games dated before the rows they
+feed: the 2020-21 training rows, the 2021-22 league GSAx/60 prior (which
+sets the 2021-22 goalie features, scored in the 2021-22 moneyline fold),
+and player xG windows and trailing league rates that reach back across
+the season boundary into early 2021-22 rows. That is not leakage (→ the
+model seeing information it couldn't have had at bet time): every value
+comes from games before the row it feeds. "Only training rows" was wrong.]
 
 Comparison (pooled over the held-out shots of 2021-22 .. 2025-26, the
 SAME shots for both; per season reported too). MoneyPuck = raw.shots.
@@ -180,6 +188,20 @@ scoring NLL because props_sog.nb_nll takes one dispersion at a time and
 each row carries its own fold's; nb_nll_rows scores each row with its own
 fold's value, as run_props itself does. The props arms were not refitted
 differently.
+
+Fixed 2026-10-06, results unchanged: from 2026-10-04 raw.shots also holds
+the first shots of 2026-27 (3,234 on the re-run). That season is too
+small to be a walk-forward fold (→ a season held out and scored by a
+model trained only on earlier seasons), so its shots got no xG and
+--downstream stopped with "shots have no out-of-sample xG". Now
+walk_forward_xg(fill_unfolded=True), used by the downstream test only,
+gives any season without a fold xG from one model trained on all earlier
+seasons (7-day purge kept), the way a live model would score it. The gate
+never scores those shots, and they feed only 2026-27 rows, which no
+moneyline or props fold scores or trains on (each skips a season that
+small). Re-run read-only on 2026-10-06 with the 2026-27 shots present:
+every number above came out identical (shot level on 605,110 shots,
+moneyline 6,993 games, props 248,589 player-games, same decision).
 
 The other attempt at this track (branch model/xg-layer-a, file
 experiments/2026-10-04-xg-layer-a.md) pre-registered a different bar
