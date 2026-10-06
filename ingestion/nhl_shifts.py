@@ -65,6 +65,14 @@ backfill passes only if all hold, and each miss is reported):
   S3  in 'ok' games, the median absolute gap between a skater's summed
       shift durations and raw.skater_games.toi_seconds is at most 5 seconds.
 
+STATUS (backfill finished 2026-10-05, live database): 9,384 of 9,384
+finished games 2020-21 to 2026-10-05 fetched 'ok', 6,098,180 shifts.
+S1 pass (100% in every season; 57 games of April 2025 came from the HTML
+fallback, without which 2024-25 was 95.9%). S2 pass (1 of 304,309
+player-games who played has no shift: 1 second of ice time). S3 pass
+(median gap 0 seconds in every season). Per-season table:
+docs/data_sources.md, section 2.13.
+
 `python -m ingestion.nhl_shifts --help`; `--report` prints coverage by
 season without fetching anything.
 """

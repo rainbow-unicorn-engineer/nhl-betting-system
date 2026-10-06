@@ -45,6 +45,12 @@ is reported):
   G3  no scratched player also appears in that game's box score
       (scratched_but_played = 0; any found are listed as data errors).
 
+STATUS (backfill finished 2026-10-05, live database): 9,384 of 9,384
+finished games 2020-21 to 2026-10-05 'ok'; 54,441 scratches and 31,937
+officials. G1 pass (100% in every season). G2 pass (13 games, 0.14%,
+list 1 or 3 referees). G3 pass (0 scratched players in the box score).
+Per-season table: docs/data_sources.md, section 2.13.
+
 `python -m ingestion.nhl_game_info --help`.
 """
 import argparse

@@ -78,6 +78,18 @@ is reported):
   K4  at least 90% of matched settled games have a usable two-sided
       pre-game close (bid > 0 and ask < 1 on both markets).
 
+STATUS (backfill finished 2026-10-05, live database): 1,686 events,
+3,372 markets (83 events of the 2025 playoffs, 1,392 of 2025-26, 89 of
+2026-27 so far, 122 unmatched: preseason and one game settled 'scalar'),
+703,033 candles. K1 pass (every event has two markets). K2 pass (2025-26:
+1,392 of 1,394 games; the two missing are game 7s that Kalshi did not
+list in this series; 2026-27: 39 of 39). K3 pass (3,028 of 3,028 settled
+markets agree with raw.games). K4 pass (100% of matched settled games
+have a two-sided close). On the 1,012 games of 2025-26 with a DraftKings
+close, Kalshi's close and DraftKings' no-vig close differ by a median of
+0.55 percentage points (95th percentile 1.6, never above 8), so the close
+is pre-game, not in-play. Details: docs/data_sources.md, section 2.13.
+
 `python -m ingestion.kalshi --help`.
 """
 import argparse
