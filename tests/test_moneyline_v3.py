@@ -229,3 +229,74 @@ def test_walk_forward_matches_lgbm_fold_api():
                       pd.Series(p, index=meta["game_id"]))
     assert np.allclose(again, oof[rows3])
     assert math.isfinite(V.per_game_log_loss(y[rows3], oof[rows3]).mean())
+
+
+# ── Post-hoc diagnostics (V1m, V1mc) ────────────────────────────────
+
+def test_unibet_inplay_mask_flags_each_contamination_sign():
+    df = pd.DataFrame({
+        "season": [20222023, 20222023, 20222023, 20222023, 20222023,
+                   20232024, 20232024],
+        "date": ["2023-01-05"] * 5 + ["2024-03-01", "2024-04-10"],
+        "home_ml": [-150, -1200, 400, -150, -150, -150, -150],
+        "away_ml": [130, 700, 350, 130, 130, 130, 130],
+        "over_under": [6.0, 6.0, 6.0, 8.5, None, 6.0, 6.0],
+    })
+    got = V.unibet_inplay_mask(df).tolist()
+    # clean, |ML| >= 1000, both sides long (implied sum < 0.75),
+    # total outside 5-7, NULL total kept, clean 2023-24, late-2023-24 window
+    assert got == [False, True, True, True, False, False, True]
+
+
+def test_drop_market_only_touches_listed_games():
+    names = ["f", "market_home_prob", "market_available"]
+    X = np.array([[1.0, 0.6, 1.0], [2.0, 0.4, 1.0], [3.0, 0.7, 1.0]])
+    out = V.drop_market(X, names, [10, 11, 12], [11])
+    assert out[1].tolist() == [2.0, 0.5, 0.0]
+    assert out[[0, 2]].tolist() == X[[0, 2]].tolist()
+    assert X[1, 1] == 0.4                     # the input is not changed
+
+
+def test_unibet_mapper_fits_on_training_rows_only():
+    """The mapping must not move when validation outcomes change (no
+    leakage) and must leave non-Unibet rows alone."""
+    rng = np.random.default_rng(5)
+    n = 1200
+    names = ["f", "market_home_prob", "market_available"]
+    p = rng.uniform(0.3, 0.7, n)
+    X = np.column_stack([rng.normal(size=n), p, np.ones(n)])
+    y = (rng.uniform(size=n) < np.clip(p * 1.2 - 0.05, 0, 1)).astype(int)
+    uni = np.arange(n) < 1000                 # last 200 rows: two-way source
+    train = np.arange(800)
+    t1 = V.unibet_mapper(y, names, uni)(X, train)
+    y2 = y.copy()
+    y2[800:] = 1 - y2[800:]                   # flip every non-training label
+    t2 = V.unibet_mapper(y2, names, uni)(X, train)
+    assert np.allclose(t1, t2)
+    assert np.allclose(t1[1000:], X[1000:])   # two-way rows untouched
+    assert not np.allclose(t1[:1000, 1], X[:1000, 1])
+    small = V.unibet_mapper(y, names, uni, min_rows=5000)(X, train)
+    assert small is X                         # too few rows: no mapping
+
+
+def test_walk_forward_applies_the_fold_transform():
+    rng = np.random.default_rng(4)
+    rows = []
+    for i, s in enumerate([20202021, 20212022, 20222023]):
+        for d in pd.date_range(f"{2020 + i}-10-10", periods=300, freq="12h"):
+            rows.append((len(rows), s, d))
+    meta = pd.DataFrame(rows, columns=["game_id", "season", "date"])
+    n = len(meta)
+    p = rng.uniform(0.3, 0.7, n)
+    y = (rng.uniform(size=n) < p).astype(int)
+    names = ["f1", "market_home_prob", "market_available"]
+    X = np.column_stack([rng.normal(size=n), p, np.ones(n)])
+    seen = []
+
+    def tf(Xf, train_idx):
+        seen.append(int(train_idx.max()))
+        return Xf
+    oof, _ = V.walk_forward(X, y, meta, names, fold_transform=tf)
+    assert len(seen) == 2
+    plain, _ = V.walk_forward(X, y, meta, names)
+    assert np.allclose(oof[~np.isnan(oof)], plain[~np.isnan(plain)])

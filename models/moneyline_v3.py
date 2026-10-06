@@ -524,13 +524,21 @@ def load_inputs() -> dict:
         """), conn, params={"ids": [int(i) for i in meta["game_id"]]})
         pp_base = load_pp_base(conn)
         app = load_appearances(conn)
+        unibet = pd.read_sql(text("""
+            SELECT h.game_id, g.season, g.date, h.home_ml, h.away_ml,
+                   h.over_under
+            FROM raw.historical_odds h JOIN raw.games g USING (game_id)
+            WHERE h.provider = 'Unibet'
+              AND h.home_ml IS NOT NULL AND h.away_ml IS NOT NULL
+        """), conn)
     games = meta[["game_id"]].merge(games, on="game_id", how="left")
     games["date"] = pd.to_datetime(games["date"])
     pp = pp_diffs(games, compute_pp_rolling(pp_base)).reset_index(drop=True)
     home_def, away_def = defending_role_frame(games, app)
     roles = role_diffs(home_def, away_def)
+    inplay = unibet.loc[unibet_inplay_mask(unibet), "game_id"].tolist()
     return {"X": X, "y": y, "meta": meta, "names": names, "market": market,
-            "pp": pp, "roles": roles}
+            "pp": pp, "roles": roles, "unibet_inplay_ids": inplay}
 
 
 def variant_matrices(X, names, meta, market, pp, roles) -> dict:
@@ -560,25 +568,106 @@ def lgbm_seed(seed: int):
 
 
 def walk_forward(X, y, meta, names, seed: int = SEED,
-                 keep_season: Optional[int] = None) -> tuple:
+                 keep_season: Optional[int] = None,
+                 fold_transform=None) -> tuple:
     """Out-of-fold P(home win) for every validation game with
     models.lgbm.fit_fold / predict_fold, and the fitted fold model of
-    keep_season (for re-scoring it with another market input)."""
+    keep_season (for re-scoring it with another market input).
+    fold_transform(X, train_idx) -> X: an optional per-fold change of the
+    inputs fitted on that fold's training rows only (the post-hoc
+    diagnostics use it)."""
     from models.baseline import walk_forward_folds
     from models.lgbm import fit_fold, market_offset, predict_fold
 
-    base = market_offset(X, names)
-    avail = X[:, names.index("market_available")] == 1.0
     oof = np.full(len(y), np.nan)
     kept = None
     with lgbm_seed(seed):
         for f in walk_forward_folds(meta):
-            fm = fit_fold(X, y, base, f.train_idx, meta["date"], names)
-            oof[f.val_idx] = predict_fold(fm, X[f.val_idx], base[f.val_idx],
+            Xf = X if fold_transform is None else fold_transform(X, f.train_idx)
+            base = market_offset(Xf, names)
+            avail = Xf[:, names.index("market_available")] == 1.0
+            fm = fit_fold(Xf, y, base, f.train_idx, meta["date"], names)
+            oof[f.val_idx] = predict_fold(fm, Xf[f.val_idx], base[f.val_idx],
                                           avail[f.val_idx])
             if f.val_season == keep_season:
                 kept = fm
     return oof, kept
+
+
+# ── Post-hoc diagnostics (added AFTER the pre-registered run; never
+#    adoptable, see STATUS) ──────────────────────────────────────────
+
+UNIBET_LAST_SEASON = 20232024
+UNIBET_MAX_ABS_ML = 1000          # |moneyline| at or above: captured in play
+UNIBET_MIN_IMPLIED_SUM = 0.75     # both sides long: a tied game in play
+UNIBET_TOTAL_RANGE = (5.0, 7.0)   # pre-game NHL totals; NULL is kept
+UNIBET_INPLAY_FROM = {20232024: pd.Timestamp("2024-04-08")}
+
+
+def unibet_inplay_mask(df: pd.DataFrame) -> pd.Series:
+    """True for an ESPN Unibet row captured during the game, or inside the
+    late-2023-24 stretch where about half the rows were. df: season, date,
+    home_ml, away_ml, over_under."""
+    from features.util import american_implied_prob
+    h, a = df["home_ml"].astype(float), df["away_ml"].astype(float)
+    big = (h.abs() >= UNIBET_MAX_ABS_ML) | (a.abs() >= UNIBET_MAX_ABS_ML)
+    s = h.map(american_implied_prob) + a.map(american_implied_prob)
+    ou = df["over_under"].astype(float)
+    lo, hi = UNIBET_TOTAL_RANGE
+    bad_total = ou.notna() & ((ou < lo) | (ou > hi))
+    window = pd.Series(False, index=df.index)
+    d = pd.to_datetime(df["date"])
+    for season, start in UNIBET_INPLAY_FROM.items():
+        window |= (df["season"] == season) & (d >= start)
+    return big | (s < UNIBET_MIN_IMPLIED_SUM) | bad_total | window
+
+
+def drop_market(X: np.ndarray, names: list, game_ids, drop_ids) -> np.ndarray:
+    """Copy of X with the listed games set to 'no market' (0.5, 0)."""
+    X = X.copy()
+    rows = pd.Series(np.asarray(game_ids)).isin(set(drop_ids)).to_numpy()
+    X[rows, names.index("market_home_prob")] = 0.5
+    X[rows, names.index("market_available")] = 0.0
+    return X
+
+
+def unibet_mapper(y: np.ndarray, names: list, unibet_rows: np.ndarray,
+                  min_rows: int = 200):
+    """fold_transform for walk_forward: a logistic fit
+    y ~ a * logit(p_unibet) + b on the fold's TRAINING Unibet-era games
+    maps every Unibet-era market probability onto the two-way scale
+    (train and validation rows alike); two-way sources are untouched."""
+    from scipy.special import expit, logit
+    from sklearn.linear_model import LogisticRegression
+
+    from models.lgbm import PROB_CLIP
+    i = names.index("market_home_prob")
+
+    def transform(X, train_idx):
+        tr = train_idx[unibet_rows[train_idx]]
+        if len(tr) < min_rows:
+            return X
+        z = logit(np.clip(X[tr, i], *PROB_CLIP))
+        lr = LogisticRegression(C=1e6, max_iter=1000).fit(z.reshape(-1, 1), y[tr])
+        a, b = float(lr.coef_[0][0]), float(lr.intercept_[0])
+        X = X.copy()
+        X[unibet_rows, i] = expit(a * logit(np.clip(X[unibet_rows, i], *PROB_CLIP)) + b)
+        return X
+    return transform
+
+
+def diagnostic_runs(X1, names, y, meta, unibet_inplay_ids) -> dict:
+    """V1m (V1 + the per-fold Unibet two-way mapping) and V1mc (V1m with
+    the in-play Unibet rows treated as having no market): (X, names,
+    fold_transform) per diagnostic."""
+    season = meta["season"].to_numpy()
+    ids = meta["game_id"].to_numpy()
+    avail = X1[:, names.index("market_available")] == 1.0
+    uni = avail & (season <= UNIBET_LAST_SEASON)
+    X1c = drop_market(X1, names, ids, unibet_inplay_ids)
+    uni_c = (X1c[:, names.index("market_available")] == 1.0) & (season <= UNIBET_LAST_SEASON)
+    return {"V1m": (X1, names, unibet_mapper(y, names, uni)),
+            "V1mc": (X1c, names, unibet_mapper(y, names, uni_c))}
 
 
 def rescore(fm: dict, X, names, rows: np.ndarray, game_ids,
@@ -725,20 +814,38 @@ def run_all(seeds: Iterable[int] = ROBUST_SEEDS, save: bool = True) -> dict:
     v0_avail = X[:, names.index("market_available")] == 1.0
     res = {"seed": SEED, "scores": score_variants(y, meta, oofs, market, v0_avail)}
 
+    # Post-hoc diagnostics: scored next to the variants, never adoptable
+    # (score_variants' decision only looks at ADOPTABLE).
+    diag = diagnostic_runs(mats["V1"][0], mats["V1"][1], y, meta,
+                           inp["unibet_inplay_ids"])
+    res["n_unibet_inplay_games"] = len(inp["unibet_inplay_ids"])
+    doofs = {}
+    for k, (Xk, nk, tf) in diag.items():
+        logger.info(f"{k} (post-hoc diagnostic), seed {SEED}")
+        doofs[k], _ = walk_forward(Xk, y, meta, nk, SEED, fold_transform=tf)
+    dsc = score_variants(y, meta, {**oofs, **doofs}, market, v0_avail)
+    res["diagnostics"] = {k: dsc["variants"][k] for k in doofs}
+    res["diagnostics_pairwise_vs_V1"] = {
+        k: paired((per_game_log_loss(y, np.nan_to_num(doofs[k], nan=0.5))
+                   - per_game_log_loss(y, np.nan_to_num(oofs["V1"], nan=0.5)))
+                  [~np.isnan(oofs["V0"])]) for k in doofs}
+
     res["robustness"] = {}
     for s in seeds:
         so = {}
         for k, (Xk, nk) in mats.items():
             logger.info(f"{k}: seed {s}")
             so[k], _ = walk_forward(Xk, y, meta, nk, s)
+        for k, (Xk, nk, tf) in diag.items():
+            so[k], _ = walk_forward(Xk, y, meta, nk, s, fold_transform=tf)
         sc = score_variants(y, meta, so, market, v0_avail)
         res["robustness"][str(s)] = {
             k: {"log_loss": v["log_loss"], "vs_v0": v["vs_v0"],
                 "vs_market": v["vs_market"]} for k, v in sc["variants"].items()}
         res["robustness"][str(s)]["decision"] = sc["decision"]
 
-    res["backtests"] = {k: run_backtests(priced_frame(meta, market, oofs[k]))
-                        for k in mats}
+    res["backtests"] = {k: run_backtests(priced_frame(meta, market, o))
+                        for k, o in {**oofs, **doofs}.items()}
     chosen = res["scores"]["decision"]["chosen"]
     Xc, nc = mats[chosen]
     res["timing"] = {"model": chosen, **timing_study(
@@ -774,6 +881,13 @@ def report(res: dict) -> str:
             f"(SE {b['se']:.5f}, n {b['n']}) | priced LL {v['log_loss_priced']:.5f}")
     lines.append(f"Decision: {sc['decision']['chosen']} — "
                  + "; ".join(sc["decision"]["steps"]))
+    for k, v in res.get("diagnostics", {}).items():
+        a, b = v["vs_v0"], v["vs_market"]
+        lines.append(
+            f"{k:4s} (post-hoc) LL {v['log_loss']:.5f} ECE {v['ece']:.4f} | vs V0 "
+            f"{a['mean']:+.5f} (SE {a['se']:.5f}) | vs market {b['mean']:+.5f} "
+            f"(SE {b['se']:.5f}) | by season {v['by_season']} | mkt by season "
+            + str({s: round(d['mean'], 4) for s, d in v['vs_market_by_season'].items()}))
     for s, r in res.get("robustness", {}).items():
         lines.append(f"seed {s}: " + ", ".join(
             f"{k} {v['vs_v0']['mean']:+.5f}/{v['vs_v0']['se']:.5f}"
