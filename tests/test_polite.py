@@ -107,3 +107,24 @@ def test_unparseable_retry_after_falls_back_to_backoff():
                       min_interval_s=0.0, backoff_s=3.0)
     assert c.get_json("u").status == "ok"
     assert clock.sleeps == [3.0]
+
+
+def test_429_widens_the_gap_and_answers_narrow_it_back():
+    c, clock = client([FakeResp(429), FakeResp(200, {}), FakeResp(200, {}), FakeResp(200, {})],
+                      min_interval_s=1.0, backoff_s=2.0, speedup_after=2)
+    assert c.get_json("u").status == "ok"
+    assert c.min_interval_s == 1.5            # slowed by half after the 429
+    assert c.get_json("u").status == "ok"     # second answer in a row: speed back up
+    assert c.min_interval_s == 1.2
+    assert c.get_json("u").status == "ok"
+    assert c.min_interval_s == 1.2            # one answer since the last speed-up
+    c2, _ = client([FakeResp(429)] * 4, min_interval_s=1.0, max_interval_s=2.0, retries=4)
+    c2.get_json("u")
+    assert c2.min_interval_s == 2.0           # never slower than max_interval_s
+
+
+def test_retry_after_zero_still_waits_the_backoff():
+    c, clock = client([FakeResp(429, headers={"Retry-After": "0"}), FakeResp(200, {})],
+                      min_interval_s=0.0, backoff_s=3.0)
+    assert c.get_json("u").status == "ok"
+    assert clock.sleeps[0] == 3.0
