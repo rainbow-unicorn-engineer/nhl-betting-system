@@ -329,9 +329,11 @@ def fetch_missing(season: Optional[int] = None, retry_empty: bool = False,
 
 
 def coverage(db=None) -> List[dict]:
-    """Per season: finished games, fetch outcomes, stored shifts, and
+    """Per season: finished games, fetch outcomes, stored shifts,
     box-score players who played (raw.skater_games + raw.goalie_games,
-    toi_seconds > 0) in 'ok' games but have no shift (check S2)."""
+    toi_seconds > 0) in 'ok' games but have no shift (check S2), and the
+    median absolute gap in seconds between a skater's summed shifts and his
+    box-score ice time in 'ok' games (check S3)."""
     ensure_tables(db)
     with (db or engine).connect() as conn:
         rows = conn.execute(text("""
@@ -351,6 +353,20 @@ def coverage(db=None) -> List[dict]:
                 LEFT JOIN shifted s ON s.game_id = b.game_id AND s.player_id = b.player_id
                 WHERE s.game_id IS NULL
                 GROUP BY b.game_id
+            ),
+            toi_gap AS (
+                SELECT g3.season, ABS(st.secs - sg.toi_seconds) AS gap
+                FROM (SELECT s.game_id, s.player_id, SUM(s.duration) AS secs
+                      FROM raw.shifts s
+                      JOIN raw.shift_fetches f3 ON f3.game_id = s.game_id AND f3.status = 'ok'
+                      GROUP BY s.game_id, s.player_id) st
+                JOIN raw.skater_games sg ON sg.game_id = st.game_id AND sg.player_id = st.player_id
+                JOIN raw.games g3 ON g3.game_id = st.game_id
+                WHERE sg.toi_seconds > 0
+            ),
+            toi_med AS (
+                SELECT season, percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS med
+                FROM toi_gap GROUP BY season
             )
             SELECT g.season,
                    COUNT(*) AS finished,
@@ -360,7 +376,9 @@ def coverage(db=None) -> List[dict]:
                    COUNT(*) FILTER (WHERE f.status = 'error') AS error,
                    COUNT(*) FILTER (WHERE f.game_id IS NULL) AS not_fetched,
                    COALESCE(SUM(f.n_shifts), 0) AS shifts,
-                   COALESCE(SUM(m.n), 0) AS box_players_without_shifts
+                   COALESCE(SUM(m.n), 0) AS box_players_without_shifts,
+                   (SELECT med FROM toi_med t WHERE t.season = g.season)
+                       AS median_skater_toi_gap_s
             FROM g
             LEFT JOIN raw.shift_fetches f ON f.game_id = g.game_id
             LEFT JOIN missing m ON m.game_id = g.game_id

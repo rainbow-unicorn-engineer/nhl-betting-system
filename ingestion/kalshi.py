@@ -643,6 +643,9 @@ def coverage(db=None) -> List[dict]:
     ensure_tables(db)
     with (db or engine).connect() as conn:
         rows = conn.execute(text("""
+            WITH cc AS (
+                SELECT ticker, COUNT(*) AS n FROM raw.kalshi_candles GROUP BY ticker
+            )
             SELECT COALESCE(g.season::text, 'unmatched') AS season,
                    COUNT(DISTINCT m.event_ticker) AS events,
                    COUNT(*) AS markets,
@@ -651,12 +654,9 @@ def coverage(db=None) -> List[dict]:
                    COUNT(*) FILTER (WHERE m.candles_status = 'ok') AS candles_ok,
                    COUNT(*) FILTER (WHERE m.candles_status = 'empty') AS candles_empty,
                    COUNT(*) FILTER (WHERE m.candles_status = 'error') AS candles_error,
-                   (SELECT COUNT(*) FROM raw.kalshi_candles c
-                    JOIN raw.kalshi_markets m2 ON m2.ticker = c.ticker
-                    LEFT JOIN raw.games g2 ON g2.game_id = m2.game_id
-                    WHERE COALESCE(g2.season::text, 'unmatched')
-                          = COALESCE(g.season::text, 'unmatched')) AS candles
+                   COALESCE(SUM(cc.n), 0) AS candles
             FROM raw.kalshi_markets m LEFT JOIN raw.games g ON g.game_id = m.game_id
+            LEFT JOIN cc ON cc.ticker = m.ticker
             GROUP BY 1 ORDER BY 1
         """)).mappings().all()
     return [dict(r) for r in rows]
