@@ -4,10 +4,110 @@ Skater shots-on-goal (SOG) props model: a full count distribution of a
 skater's shots on goal in a game, given that he plays (toi_seconds > 0),
 from which P(SOG > line) is read for the usual prop lines 0.5 .. 4.5.
 
-STATUS: see the STATUS section at the end of this docstring. Registration
-is disabled (run_props(register=True) raises), and nothing reads it. The
-price check (STATUS, "Market check") found that it does NOT beat the prop
-market.
+STATUS: see the STATUS sections near the end of this docstring (v3
+first). Registration is disabled (run_props(register=True) raises), and
+nothing reads it. The price checks (STATUS v3; STATUS v2, "Market
+check") found that neither v2 nor v3 beats the prop market.
+
+v3 PRE-REGISTRATION (2026-10-04). Written and committed before any v3
+variant was run. The market parts are in models/props_market_check.py.
+Disclosed: before writing this, ONE diagnostic of the existing baseline
+B1 was run (no booster, no new feature). It split B1's mean error per
+validation season into a rate part (B1's SOG/60 x the ACTUAL TOI, minus
+actual SOG) and an expected-TOI part. The TOI part is ~0 in every season
+(|.| <= 0.003 SOG a game). The rate part is all of it: -0.004, +0.049,
++0.050, +0.048, -0.000 for 2021-22 .. 2025-26. In 2024-25 B1 predicts
+5.86 SOG/60 at the actual TOI against an actual 5.69. The trailing-365-
+day league rate it rests on averaged 5.88 that season (the season before
+ran at 6.09), and the career-to-date player rates sat 3.6% above it. So
+the root cause is the LEVEL, in two parts. First, a trailing-365-day
+league rate lags a falling league. Second, career-to-date rates were
+earned in higher-shooting seasons, and the ratio to the training-window
+mean that re-levels them assumes each player's career has the training
+window's mix. P3's formula below follows from this reading. No P-variant
+result had been seen when it was written.
+
+Variants. Each one adds to the one before. All share the same rows,
+folds, eligibility (>= 5 prior appearances), LightGBM params, early
+stopping, NB dispersion fit, and the v2 in-season drift correction (M =
+M2 in every variant, relative to that variant's own offset):
+- P0 = v2 exactly (FEATURES, offset B1). It must reproduce v2's numbers
+  (pooled NLL M 1.57818, B1 1.58173). The 2026-27 games loaded since are
+  not a fold and come after every fold's rows, and every feature looks
+  backward only, so the reproduction should be exact.
+- P1 = P0 + power-play features (features/player_shots.py FEATURES_PP).
+  Each one uses only his appearances strictly before the game:
+    pp_toi_l5/l10/l20: mean power-play (PP → his team has more skaters
+      on the ice after an opponent's penalty) minutes per appearance
+      over his last 5/10/20 appearances;
+    pp_share_l5/l10/l20: his PP seconds / his team's PP seconds over
+      those same games. A game's team PP seconds = the sum of the team's
+      skaters' PP seconds / 5 (five skaters are on the ice in a 5-on-4);
+    pk_toi_l10/l20: mean penalty-kill (PK → his team is the one a
+      skater short) minutes per appearance;
+    pp_sog60_l20_rel, pp_sog60_season_rel: his shots on goal at power-
+      play strength per 60 PP minutes, over his last 20 appearances and
+      season to date, counting only games with shot data, divided by his
+      position's trailing league SOG/60. A PP shot is a raw.shots event
+      SHOT or GOAL whose strength (written from the shooter's side) gives
+      his team more skaters than the opponent, with the opponent at 4 or
+      fewer: 5v4, 5v3, 4v3, 6v4, 6v3;
+    nonpp_sog60_l20_rel: the rest of his SOG per 60 of his non-PP
+      minutes, same rules;
+    team_pp_l10: his team's PP minutes per game over its last 10 games;
+    opp_pk_l10: the opponent's PK minutes per game over its last 10
+      games (team PK seconds = the skaters' PK seconds / 4). This measures
+      how often the opponent takes penalties.
+  Unknown stats (stats_filled_at NULL) are missing, never zero.
+- P2 = P1 + usage proxies (FEATURES_USAGE):
+    es_toi_l10: mean even-strength minutes (TOI - PP - PK), last 10;
+    es_toi_rank_pct, toi_rank_pct: his rank on es_toi_l10 / toi_mean_l10
+      among his team's skaters of his position group (F or D) dressed
+      for this game, (rank - 1) / (n - 1): 0 = the most, 1 = the least;
+    pp_rank: his rank on pp_toi_l10 among all his team's skaters dressed
+      for this game (1 = the most; ranks 1-5 are roughly the first
+      power-play unit);
+    fo_l20: faceoffs taken per appearance over his last 20 (centres take
+      most of them); fo_win_l20: faceoffs won / taken over his last 20.
+  The ranks use who is dressed for this game. That is known at warm-ups
+  before puck drop, and it is the same information the model already
+  conditions on (it predicts given that he plays). They also use only
+  the pre-game values of every teammate.
+- P3 = P2 with the offset replaced by B3 (the baseline fix). Features
+  are P2's. B3 = index x L_env x expected TOI / 3600, with expected TOI
+  unchanged, where:
+    L_env(d, pos): this season's league SOG/60 for his position (F or
+    D), from the season's games dated strictly before d, shrunk toward
+    last year's level:
+        L_env = (S_sd + K_env x L_prev / 3600) / (T_sd + K_env) x 3600
+      S_sd, T_sd = SOG and TOI of every played player-game of that
+      position in the same season dated before d. L_prev = the
+      position's trailing-365-day rate on the season's first date
+      (league_pos_sog60 there). K_env = 100,000 minutes, about a fifth of
+      a season's forward minutes.
+    index (relative and time-decayed): over his earlier appearances j
+    (any season),
+        w_j   = 0.5 ^ ((d - d_j) / 365 days)
+        index = (sum_j w_j sog_j + K_p)
+                / (sum_j w_j toi_j x L_env(d_j, pos) / 3600 + K_p)
+      K_p = 300 minutes x L_env(d, pos) / 60, which is v2's shrinkage
+      (k = 300 TOI minutes) in expected-shot units. An index of 1 means
+      his position's league rate. Each past game is judged against the
+      league level of its own date, so a change in the league's level
+      cannot leak into the player's rate. No training-window ratio is
+      needed, so B3 is the same in every fold.
+GATE (as v1/v2, unchanged; each variant's M against B1, the v2 offset):
+pooled NLL(M) - NLL(B1) <= -2 paired SE; M beats B1 in >= 4 of 5 folds;
+pooled ECE of P(SOG > 2.5) <= 0.02.
+ADOPTION (decided before any run): start with A = P0. For k = 1, 2, 3 in
+that order, Pk replaces A if (a) Pk passes the gate, (b) pooled NLL(Pk) -
+NLL(A) <= -2 paired SE over the same player-games, and (c) Pk's NLL is
+lower than A's in >= 3 of 5 folds. The final A becomes the default
+(DEFAULT_VARIANT). If P0 stays, v3 = v2. Reported for information, not
+part of the rule: per-fold mean bias, per-fold ECE, and B3 against B1.
+MARKET: models/props_market_check.py is re-run for the adopted variant
+on every shots-on-goal price row now loaded. Registration stays disabled
+(run_props(register=True) raises) unless that check passes.
 
 Model M (the candidate), pre-registered before any results were seen:
 - One LightGBM regressor, objective poisson, predicting expected SOG.
@@ -94,6 +194,104 @@ is reported for information. A pass means "a better forecaster than
 simple baselines"; it does NOT mean profitable. That needs a check
 against prop PRICES, which this module does not have yet, and DraftKings
 props carry about a 6.2% bookmaker margin.
+
+STATUS v3 (2026-10-05; read-only on the live database; `python -m
+models.props_sog --v3` runs every variant and the adoption rule,
+`python -m models.props_market_check` the price check). VERDICT: P3 is
+ADOPTED as the forecaster (DEFAULT_VARIANT = "P3"). It is the best
+shots forecaster so far, and it still does NOT beat the prop market, so
+registration stays disabled. Two separate runs (2026-10-04 and
+2026-10-05) gave bit-identical numbers.
+- Rows: 287,333 played skater games built (the 2026-27 games loaded
+  since v2 included); 248,589 scored over the same 5 folds as v2.
+- P0 reproduced v2 exactly: pooled NLL M 1.57818, B1 1.58173, M2 - M1
+  -0.00009; every fold number is the same as v2's.
+- Every variant, pooled NLL M (M - B1, paired SE; folds won vs B1;
+  pooled ECE(> 2.5); pooled mean predicted - actual SOG):
+    P0 1.57818 (-0.00355, 0.00018; 5/5; 0.0087; +0.050)  gate PASS
+    P1 1.57800 (-0.00373, 0.00019; 5/5; 0.0108; +0.055)  gate PASS
+    P2 1.57800 (-0.00373, 0.00019; 5/5; 0.0107; +0.055)  gate PASS
+    P3 1.57636 (-0.00537, 0.00023; 5/5; 0.0110; +0.062)  gate PASS
+- Adoption rule, step by step (A starts at P0):
+    P1 vs P0: -0.00018 (SE 0.000074, -2.4 SE), lower NLL in 3 of 5
+      folds (-0.00045, -0.00045, +0.00001, +0.00015, -0.00016). All
+      three conditions hold, narrowly: A = P1.
+    P2 vs P1: -0.0000004 (SE 0.000038), 4 of 5 folds. Not by 2 SE: the
+      usage proxies add nothing the PP features had not already given.
+      A stays P1.
+    P3 vs P1: -0.00164 (SE 0.00012, ~14 SE), 5 of 5 folds (-0.00055,
+      -0.00064, -0.00167, -0.00207, -0.00327). A = P3.
+  For reference, P3 vs P0 (v2): -0.00182 (SE 0.00014), 5 of 5 folds.
+- P3 per fold, NLL M / B1 / B3 (M - B1, SE), mean predicted - actual SOG
+  M / M1 / B1 / B3, ECE(> 2.5) M / B1:
+    2021-22 1.62050 / 1.62470 / 1.62450 (-0.0042, 0.0004)  +0.025 / +0.021 / -0.003 / -0.000  0.0043 / 0.0140
+    2022-23 1.60265 / 1.60771 / 1.60739 (-0.0051, 0.0004)  +0.071 / +0.034 / +0.048 / +0.051  0.0137 / 0.0150
+    2023-24 1.57823 / 1.58384 / 1.58235 (-0.0056, 0.0006)  +0.088 / +0.041 / +0.053 / +0.062  0.0153 / 0.0099
+    2024-25 1.54576 / 1.55053 / 1.54877 (-0.0048, 0.0005)  +0.079 / +0.017 / +0.048 / +0.051  0.0158 / 0.0086
+    2025-26 1.53480 / 1.54199 / 1.53857 (-0.0072, 0.0006)  +0.045 / +0.001 / +0.000 / +0.022  0.0082 / 0.0055
+  2025-26 by position: forwards NLL 1.5952 (v2 1.5982), ECE(> 2.5)
+  0.0086; defensemen 1.4153 (v2 1.4196), ECE(> 2.5) 0.0097. Pooled
+  Brier(> 2.5) 0.15641 (v2 0.15681, B1 0.15753). Fitted alpha per fold
+  0.037-0.049.
+- B3 against B1 (information only): pooled NLL 1.58029 vs 1.58173
+  (-0.00144, SE 0.00012), better in 5 of 5 folds. As a stand-alone
+  baseline B3 is better than B1, but it did NOT remove the level drift
+  it was built to remove: its mean bias per fold is -0.000, +0.051,
+  +0.062, +0.051, +0.022 (B1: -0.003, +0.048, +0.053, +0.048, +0.000).
+  At the ACTUAL time on ice B3 is still about +0.05 SOG too high in
+  2022-23 .. 2024-25, so the pre-registration's reading (a lagging
+  league rate, and career rates earned in higher-shooting seasons) was
+  not the whole cause. A guess, untested, for a later pre-registration:
+  the remaining level error is in which players get the minutes (the
+  time-on-ice-weighted mix of players), not in the league rate.
+- Found after the run, NOT part of any rule: with the B3 offset the
+  in-season drift correction now hurts. P3's uncorrected booster M1 has
+  pooled NLL 1.57542 (M2 - M1 = +0.00094, SE 0.00007; M1 better in 5
+  of 5 folds), bias +0.023 (M2 +0.062) and ECE(> 2.5) 0.0041. The
+  correction divides out the booster's mean adjustment, and with B3
+  that adjustment is mostly a repair of B3's own level, so removing it
+  puts the bias back. M stays M2 (DRIFT_CORRECT) because that is what
+  was pre-registered; switching to M1 needs its own pre-registered test
+  (and a market re-check).
+- Market check, re-run for P3 on every 2025-26 shots-on-goal price row
+  now loaded. raw.prop_odds_hist holds 65,184 prop rows over all
+  markets; 9,739 are shots on goal: DraftKings 1,980 two-sided rows /
+  102 games, including the late playoffs through 2026-06-14 (v2 had
+  1,354 / 75); ESPN BET 5,769 / 410 games; DraftKings "N+" milestones
+  1,990. Matched: 1,947 DraftKings, 5,733 ESPN BET. PRIMARY, log loss
+  model - no-vig market (game-clustered SE; v3 pass rule: pooled mean +
+  1.96 SE < 0 AND every book with n >= 300 negative):
+    DraftKings 1,947: +0.00141 (SE 0.00280)  NO   (P0 on the same rows +0.00544)
+    ESPN BET   5,733: +0.00230 (SE 0.00127)  NO   (P0 +0.00526)
+    pooled     7,680: +0.00207 (SE 0.00118)  NO   (P0 +0.00531)
+  NOT PASSED. P3 closes about 60% of v2's gap to the market, and the
+  market is still the better forecaster (pooled by ~1.8 SE now; ~3.3 SE
+  for v2). Flat 1-unit bets (information only; game-clustered bootstrap
+  95%, 2,000 resamples, seed 7): pooled T=0.04 1,220 bets ROI +0.012
+  [-0.038, +0.065]; T=0.06 544 bets +0.036 [-0.044, +0.118];
+  DraftKings T=0.04 384 bets +0.049 [-0.047, +0.138], T=0.06 202 bets
+  +0.051 [-0.076, +0.187]; ESPN BET T=0.04 836 bets -0.004 [-0.069,
+  +0.062], T=0.06 342 bets +0.028 [-0.067, +0.130]. Every interval
+  includes 0. DraftKings "N+" milestones (over only): T=0.04 88 bets ROI
+  -0.148 [-0.387, +0.083].
+- Market-mean diagnostic (props_market_check, pre-registered there;
+  information only). Is the miss in the LEVEL (the expected count) or
+  in the SHAPE (how spread out the count is)? Pooled: mean SOG 2.209,
+  model mean 2.256 (bias +0.047, SE 0.020), market implied mean 2.228
+  (+0.019, SE 0.020). A level-only fix closes 14% of the gap and a
+  shape-only fix 6%, so by the pre-registered rule it is neither: the
+  gap is in the per-player means (which player-games the model rates
+  above or below the market). The information slope beta (how much of
+  the model's disagreement with the market turns out right) is 0.30 (SE
+  0.09) for P3, against 0.17 (SE 0.07) for v2: the disagreements carry
+  some information, but only about a third of each one is right, so
+  betting on them still loses to the price. DraftKings 0.22 (SE 0.17),
+  ESPN BET 0.23 (SE 0.11). By line group the reading is the same
+  (per-player means) for 0.5, 1.5, 2.5 and 3.5+.
+- Decisions: DEFAULT_VARIANT = "P3", MODEL_VERSION = "v3", GATE_PASSED
+  stays True (a forecasting verdict only). Registration stays disabled
+  (run_props(register=True) raises) because the market check did not
+  pass.
 
 STATUS (2026-10-03, v2 = M2, the drift-corrected booster; read-only on
 the live database): GATE PASSED as a FORECASTER, and M2 replaced v1 under
@@ -245,9 +443,9 @@ from models.baseline import PURGE_DAYS, expected_calibration_error, walk_forward
 logger = logging.getLogger("nhl.models.props_sog")
 
 MODEL_NAME = "props_sog"
-MODEL_VERSION = "v2"           # v2: v1 + in-season drift correction (M2)
+MODEL_VERSION = "v3"           # v3: P3 (v2 + PP/usage features, offset B3)
 # The forecasting gate verdict (STATUS), set by hand. It is NOT a betting
-# approval: no price-based check exists yet, and nothing reads it.
+# approval: the price check (props_market_check) fails, and nothing reads it.
 GATE_PASSED = True
 LINES = (0.5, 1.5, 2.5, 3.5, 4.5)
 MIN_PRIOR_GAMES = 5            # eligibility: >= 5 prior appearances
@@ -263,6 +461,26 @@ DRIFT_PRIOR_ROWS = 2000
 # Whether the reported model M is the drift-corrected M2 (v2) rather than
 # v1 (M1); set by the pre-registered decision rule recorded in STATUS.
 DRIFT_CORRECT = True
+
+# v3 variants (pre-registration above): features and the offset the
+# booster starts from. B1 = the v2 exposure baseline, B3 = the fixed one.
+from features.player_shots import FEATURES, FEATURES_PP, FEATURES_USAGE  # noqa: E402
+
+VARIANTS = {
+    "P0": {"features": list(FEATURES), "offset": "B1"},
+    "P1": {"features": list(FEATURES) + FEATURES_PP, "offset": "B1"},
+    "P2": {"features": list(FEATURES) + FEATURES_PP + FEATURES_USAGE,
+           "offset": "B1"},
+    "P3": {"features": list(FEATURES) + FEATURES_PP + FEATURES_USAGE,
+           "offset": "B3"},
+}
+ADOPT_ORDER = ("P1", "P2", "P3")
+ADOPT_SE = 2.0                 # Pk must beat the adopted one by >= 2 SE
+ADOPT_MIN_FOLDS = 3            # ... and in >= 3 of 5 folds
+# The variant run_props reports as M by default, set by the v3 adoption
+# rule (STATUS v3: P1 replaced P0, P2 did not replace P1, P3 replaced
+# P1).
+DEFAULT_VARIANT = "P3"
 
 LGBM_PARAMS = {
     "objective": "poisson",
@@ -475,13 +693,15 @@ def score_block(y, mus: dict, alphas: dict) -> dict:
 
 def _paired_diffs(out: dict, nll: dict) -> None:
     """Paired NLL differences (and SEs) of each model key vs B1 and B0,
-    and M2 - M1 when both variants are present."""
+    M2 - M1 when both variants are present, and B3 - B1."""
     for m in ("M", "M1", "M2"):
         for b in ("B1", "B0"):
             if m in nll and b in nll:
                 out[f"diff_{m}_{b}"], out[f"se_{m}_{b}"] = _paired(nll[m], nll[b])
     if "M1" in nll and "M2" in nll:
         out["diff_M2_M1"], out["se_M2_M1"] = _paired(nll["M2"], nll["M1"])
+    if "B3" in nll and "B1" in nll:
+        out["diff_B3_B1"], out["se_B3_B1"] = _paired(nll["B3"], nll["B1"])
 
 
 def gate(pooled: dict, folds: list, key: str = "M") -> dict:
@@ -517,38 +737,47 @@ def drift_decision(pooled: dict, folds: list) -> dict:
 
 
 def run_props(register: bool = False, frame: pd.DataFrame = None,
-              params=None, drift_correct_m: bool | None = None) -> dict:
-    """Walk-forward evaluation of M, B1 and B0 (module docstring).
+              params=None, drift_correct_m: bool | None = None,
+              variant: str | None = None) -> dict:
+    """Walk-forward evaluation of M, B1, B0 and B3 (module docstring).
+    variant (default DEFAULT_VARIANT): one of VARIANTS, i.e. the booster's
+    features and its offset (B1 or B3); the gate is always against B1.
     Both booster variants are scored from the same fitted booster: M1 (v1,
-    no correction) and M2 (in-season drift correction); "M" — the model the
-    gate and the output speak for — is M2 when drift_correct_m (default
-    DRIFT_CORRECT), else M1.
+    no correction) and M2 (in-season drift correction, relative to the
+    variant's offset); "M" — the model the gate and the output speak for —
+    is M2 when drift_correct_m (default DRIFT_CORRECT), else M1.
     register=True raises: there is no registry entry for this model."""
     if register:
         raise RuntimeError(
-            "props_sog registration is disabled: the model has no price-"
-            "based evaluation yet (it has not been checked against prop "
-            "prices). Run "
-            "with register=False.")
-    from features.player_shots import FEATURES
+            "props_sog registration is disabled: the model has not passed "
+            "its check against prop prices (models/props_market_check.py; "
+            "STATUS v3). Run with register=False.")
+    if variant is None:
+        variant = DEFAULT_VARIANT
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown variant {variant!r} (have {sorted(VARIANTS)})")
+    spec = VARIANTS[variant]
+    feats = spec["features"]
 
     df = load_props_dataset(frame)
-    X = df[FEATURES].to_numpy(dtype=float)
+    X = df[feats].to_numpy(dtype=float)
     y = df["sog"].to_numpy(dtype=float)
     meta = df[["season", "date"]]
     folds = walk_forward_folds(meta)
-    logger.info(f"Props SOG dataset: {len(df)} eligible player-games x "
-                f"{len(FEATURES)} features, {len(folds)} folds "
-                f"(purge {PURGE_DAYS}d)")
+    logger.info(f"Props SOG dataset ({variant}, offset {spec['offset']}): "
+                f"{len(df)} eligible player-games x {len(feats)} features, "
+                f"{len(folds)} folds (purge {PURGE_DAYS}d)")
 
     if drift_correct_m is None:
         drift_correct_m = DRIFT_CORRECT
     active = "M2" if drift_correct_m else "M1"
-    oof = {k: np.full(len(df), np.nan) for k in ("M", "M1", "M2", "B1", "B0")}
+    oof = {k: np.full(len(df), np.nan)
+           for k in ("M", "M1", "M2", "B1", "B0", "B3")}
     oof_alpha = {k: np.full(len(df), np.nan) for k in oof}
     oof_shift = np.full(len(df), np.nan)
     fold_metrics = []
     b0_all = np.clip(df["b0_mean"].to_numpy(float), *MU_CLIP)
+    b3_all = np.clip(df["b3_mean"].to_numpy(float), *MU_CLIP)
     seasons = df["season"].to_numpy()
     dates = df["date"].to_numpy()
 
@@ -558,18 +787,24 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         ratio = drift_ratio(df["league_sog60"].to_numpy(), train_mean)
         base = np.clip(exposure_baseline(df["shrunk_sog60"], df["exp_toi"],
                                          ratio), *MU_CLIP)
-        fm = fit_fold(X, y, base, tr, df["date"], params)
-        m1_val = predict(fm, X[val], base[val])
-        m1_tr = predict(fm, X[tr], base[tr])
+        off = base if spec["offset"] == "B1" else b3_all
+        if not np.isfinite(off[np.concatenate([tr, val])]).all():
+            raise ValueError(f"non-finite {spec['offset']} offset in fold "
+                             f"{fold.val_season}")
+        fm = fit_fold(X, y, off, tr, df["date"], params)
+        m1_val = predict(fm, X[val], off[val])
+        m1_tr = predict(fm, X[tr], off[tr])
         # M2: the booster's running same-season adjustment (earlier dates
         # only) divided out — on the validation season, and within each
         # training season from the in-sample predictions (for the alpha)
-        m2_val, shift_val = drift_correct(m1_val, base[val], seasons[val],
+        m2_val, shift_val = drift_correct(m1_val, off[val], seasons[val],
                                           dates[val])
-        m2_tr, _ = drift_correct(m1_tr, base[tr], seasons[tr], dates[tr])
+        m2_tr, _ = drift_correct(m1_tr, off[tr], seasons[tr], dates[tr])
         oof_shift[val] = shift_val
-        mu = {"M1": m1_val, "M2": m2_val, "B1": base[val], "B0": b0_all[val]}
-        mu_tr = {"M1": m1_tr, "M2": m2_tr, "B1": base[tr], "B0": b0_all[tr]}
+        mu = {"M1": m1_val, "M2": m2_val, "B1": base[val], "B0": b0_all[val],
+              "B3": b3_all[val]}
+        mu_tr = {"M1": m1_tr, "M2": m2_tr, "B1": base[tr], "B0": b0_all[tr],
+                 "B3": b3_all[tr]}
         alphas = {k: fit_nb_alpha(y[tr], mu_tr[k]) for k in mu}
         mu["M"], alphas["M"] = mu[active], alphas[active]
         for k, v in mu.items():
@@ -623,6 +858,7 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
             pooled[f"ece{tag}_{k}"] = expected_calibration_error(hit, p)
     _paired_diffs(pooled, nll)
     pooled["model"] = active
+    pooled["variant"] = variant
     pooled["gate"] = gate(pooled, fold_metrics)
     pooled["gate_passed"] = pooled["gate"]["passed"]
     pooled["gate_M1"] = gate(pooled, fold_metrics, "M1")
@@ -645,7 +881,84 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
         out[f"mu_{k}"] = oof[k][scored]
         out[f"alpha_{k}"] = oof_alpha[k][scored]
     out["log_c"] = oof_shift[scored]
-    return {"folds": fold_metrics, "pooled": pooled, "oof": out}
+    return {"folds": fold_metrics, "pooled": pooled, "oof": out,
+            "variant": variant}
+
+
+# ── v3: comparing variants and the adoption rule ───────────────────
+
+def row_nll(res: dict, key: str = "M") -> pd.Series:
+    """Per scored player-game, the NLL of the actual SOG under `key`'s
+    mean and its own fold alpha, indexed by (player_id, game_id)."""
+    o = res["oof"]
+    nll = nb_nll_rows(o["sog"], o[f"mu_{key}"], o[f"alpha_{key}"])
+    return pd.Series(nll, index=pd.MultiIndex.from_frame(
+        o[["player_id", "game_id"]]), name=key).sort_index()
+
+
+def nb_nll_rows(y, mu, alpha) -> np.ndarray:
+    """NB NLL with a per-row alpha (each fold has its own)."""
+    y, mu, alpha = (np.asarray(y, float), np.asarray(mu, float),
+                    np.asarray(alpha, float))
+    out = np.empty(len(y))
+    for a in np.unique(alpha):
+        sel = alpha == a
+        out[sel] = nb_nll(y[sel], mu[sel], a)
+    return out
+
+
+def compare_variants(res_new: dict, res_old: dict) -> dict:
+    """Paired comparison of two runs' M on the same player-games: pooled
+    NLL(new) - NLL(old) with its paired SE, and the folds in which new's
+    NLL is lower."""
+    a, b = row_nll(res_new), row_nll(res_old)
+    if not a.index.equals(b.index):
+        raise ValueError("the two runs scored different player-games")
+    diff, se = _paired(a.to_numpy(), b.to_numpy())
+    fo = {int(f["val_season"]): f["nll_M"] for f in res_old["folds"]}
+    fn = {int(f["val_season"]): f["nll_M"] for f in res_new["folds"]}
+    if set(fo) != set(fn):
+        raise ValueError("the two runs have different folds")
+    wins = sum(fn[s] < fo[s] for s in fn)
+    return {"diff": diff, "se": se, "folds_won": int(wins),
+            "n_folds": len(fn),
+            "fold_diffs": {s: fn[s] - fo[s] for s in sorted(fn)}}
+
+
+def adoption(results: dict, start: str = "P0",
+             order=ADOPT_ORDER) -> dict:
+    """The pre-registered v3 adoption rule. results: variant -> run_props
+    result. A starts at `start`; each Pk in `order` replaces A if (a) Pk
+    passes the gate vs B1, (b) NLL(Pk) - NLL(A) <= -ADOPT_SE paired SE
+    and (c) Pk's NLL is lower than A's in >= ADOPT_MIN_FOLDS folds."""
+    adopted = start
+    steps = []
+    for k in order:
+        if k not in results:
+            continue
+        cmp_ = compare_variants(results[k], results[adopted])
+        a = bool(results[k]["pooled"]["gate"]["passed"])
+        b = bool(cmp_["diff"] <= -ADOPT_SE * cmp_["se"])
+        c = bool(cmp_["folds_won"] >= ADOPT_MIN_FOLDS)
+        steps.append({"variant": k, "against": adopted, "gate_passed": a,
+                      "nll_by_2se": b, "folds_ok": c,
+                      **{f"cmp_{x}": v for x, v in cmp_.items()},
+                      "adopted": a and b and c})
+        if a and b and c:
+            adopted = k
+    return {"adopted": adopted, "steps": steps}
+
+
+def run_v3(frame: pd.DataFrame = None, params=None,
+           variants=("P0",) + ADOPT_ORDER) -> dict:
+    """Every v3 variant on one feature frame, then the adoption rule.
+    Read only (run_props with register=False)."""
+    if frame is None:
+        from features.player_shots import load_player_features
+        frame = load_player_features()
+    results = {v: run_props(register=False, frame=frame, params=params,
+                            variant=v) for v in variants}
+    return {"results": results, "decision": adoption(results)}
 
 
 def _print_report(res: dict) -> None:
@@ -671,11 +984,24 @@ def main(argv=None):
                     "registers)")
     parser.add_argument("--evaluate", action="store_true",
                         help="run the evaluation and print the metrics")
+    parser.add_argument("--variant", choices=sorted(VARIANTS), default=None,
+                        help=f"v3 variant to evaluate (default "
+                             f"{DEFAULT_VARIANT})")
+    parser.add_argument("--v3", action="store_true",
+                        help="run every v3 variant and the adoption rule")
     args = parser.parse_args(argv)
+    if args.v3:
+        out = run_v3()
+        for v, res in out["results"].items():
+            print(f"== {v}")
+            _print_report(res)
+        import json
+        print(json.dumps(out["decision"], indent=1, default=float))
+        return out
     if not args.evaluate:
         parser.print_help()
         return None
-    res = run_props(register=False)
+    res = run_props(register=False, variant=args.variant)
     _print_report(res)
     return res
 
