@@ -20,6 +20,7 @@ Terms used below:
 | 2026-10-02 | Shots-on-goal props model v1 | `models/props_sog.py`, `features/player_shots.py` | Passed as a forecaster: beat both baselines in 5/5 seasons, about 19 SE. |
 | 2026-10-03 | Props model v2: in-season drift correction | `models/props_sog.py` (`DRIFT_CORRECT`) | Adopted by its rule, but marginally: −1.8 SE vs v1, with worse pooled calibration. The drift's real cause is in the baseline. |
 | 2026-10-03 | Props market check vs ESPN BET and DraftKings | `models/props_market_check.py` | Does not beat the market: the book's no-vig price had lower log loss, about 3 SE pooled. Flat-bet ROI intervals all include 0. |
+| 2026-10-05 | Free data loaders: shift charts, scratches and officials, Kalshi prices (acceptance checks S1-S3, G1-G3, K1-K4) | `ingestion/nhl_shifts.py`, `ingestion/nhl_game_info.py`, `ingestion/kalshi.py` | Data, not a model. Every check passes on the full backfill (9,384 games; 1,686 Kalshi events). Kalshi's pre-game close sits within 0.55 points of DraftKings' no-vig close at the median. Details in `docs/data_sources.md` 2.13. |
 
 ## Re-running
 

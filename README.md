@@ -146,9 +146,9 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 
 ### Shift charts, scratches and Kalshi prices
 
-Three free loaders, no key, each resumable (a stopped run picks up where it left off) and polite (at most about 3 requests a second to the NHL, 5 to Kalshi, with retries on "too many requests" and server errors):
+Three free loaders, no key, each resumable (a stopped run picks up where it left off) and polite (at most about 3 requests a second to the NHL, 5 to Kalshi, slowing down whenever a server answers "too many requests", and retrying server errors):
 
-- **Shift charts** → `python -m ingestion.nhl_shifts` loads every shift (→ one stretch a player spends on the ice, about 45 seconds) of every finished game into `raw.shifts`, with a fetch log in `raw.shift_fetches`. They show who actually played together: the real lines and power-play units (→ the group sent out when the other team has a player in the penalty box) of every past game.
+- **Shift charts** → `python -m ingestion.nhl_shifts` loads every shift (→ one stretch a player spends on the ice, about 45 seconds) of every finished game into `raw.shifts`, with a fetch log in `raw.shift_fetches`. When the NHL's shift API has nothing for a game (57 games of April 2025), it reads the NHL's HTML time-on-ice reports instead. They show who actually played together: the real lines and power-play units (→ the group sent out when the other team has a player in the penalty box) of every past game.
 - **Scratches and officials** → `python -m ingestion.nhl_game_info` stores, per game, the scratched players (→ on the roster but not dressed) in `raw.game_scratches`, the referees and linesmen in `raw.game_officials`, and the head coaches in `raw.game_info` (also the fetch log). The daily box-score load already downloads this page for team stats, so new games cost no extra request. Scratches are known about 30-60 minutes before puck drop, so a model may use them for the close but not in the morning.
 - **Kalshi** → `python -m ingestion.kalshi --backfill` loads Kalshi's NHL game-winner markets (→ "Will this team win?" contracts that pay $1, so the price is the market's probability) into `raw.kalshi_markets`, matched to `raw.games`, and their price candles (→ open, high, low and close of the bid, ask and traded price over an hour, or a minute in the 3 hours before puck drop) into `raw.kalshi_candles`. `--report` prints the pre-game closing price summary. Prices are before Kalshi's taker fee (0.07 × p × (1 − p) per contract). Kalshi also trades during games: never use a candle that ends after `start_time_utc` as a pre-game price.
 
@@ -265,8 +265,8 @@ python -m config.migrate --seed-venues      # arena coordinates and time zones; 
 python pipeline.py backfill                 # 2020-21 through the current season: games, game logs, MoneyPuck shots; about 20 minutes a season; safe to re-run
 python -m ingestion.espn_odds               # free historical reference lines with their prices; resumable
 python -m ingestion.nhl_stats --season 20252026   # power-play stats; repeat for each season, about a minute each
-python -m ingestion.nhl_shifts              # shift charts, every finished game; about 45 minutes; resumable
-python -m ingestion.nhl_game_info           # scratches, officials, coaches; about 45 minutes; resumable
+python -m ingestion.nhl_shifts              # shift charts, every finished game; about 2 hours (the NHL rate-limits it); resumable
+python -m ingestion.nhl_game_info           # scratches, officials, coaches; about 2 hours; resumable
 python -m ingestion.kalshi --backfill       # Kalshi NHL markets and candles; about 25 minutes; resumable
 python pipeline.py features                 # every season
 python -m models.lgbm                       # walk-forward evaluation; registers the moneyline model
@@ -570,7 +570,7 @@ pytest
 - **Its name ends in `_test`**, set as `POSTGRES_DB` in the environment or in `.env`.
 - **`NHL_ALLOW_DB_TESTS=1` together with `POSTGRES_HOST`, `POSTGRES_PORT` and `POSTGRES_DB`**, all three set in the environment for that run, pointing at the copy. The flag alone does nothing, and so do overrides that name the same database as `.env` (`localhost` and `127.0.0.1` count as the same server): the tests still skip, and the line at the top says why. So the flag on its own can never send the suite to the database `.env` names.
 
-The suite has 962 tests. Without a database, 859 pass and 103 skip, in about a minute and a quarter. Thirteen files need no database at all: `test_betting_engine`, `test_backtest`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, `test_db_guard`, `test_today`, `test_montecarlo`, and `test_windows_scripts` (its PowerShell checks run only on Windows); most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network, and so do `test_dailyfaceoff_lines` and `test_news` (two saved Daily Faceoff line-combination pages).
+The suite has 1,073 tests. Without a database, 960 pass and 113 skip, in about a minute and a half. Thirteen files need no database at all: `test_betting_engine`, `test_backtest`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, `test_db_guard`, `test_today`, `test_montecarlo`, and `test_windows_scripts` (its PowerShell checks run only on Windows); most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`, `test_nhl_shifts`, `test_nhl_game_info`, `test_kalshi`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network, and so do `test_dailyfaceoff_lines` and `test_news` (two saved Daily Faceoff line-combination pages).
 
 ### Running the database tests on a copy
 
