@@ -272,3 +272,15 @@ def test_tabpfn_v2_smoke():
         pytest.skip(f"TabPFN-2 weights unavailable: {e}")
     p = model.predict_proba(X[150:])[:, list(model.classes_).index(1)]
     assert np.all((p > 0) & (p < 1))
+
+
+# ─────────────────────────────────────────────
+# Row limit: refuse rather than subsample
+# ─────────────────────────────────────────────
+class TestLimits:
+    def test_more_rows_than_tabpfn_allows_is_refused(self):
+        with pytest.raises(ValueError, match="subsampling"):
+            tp.check_limits(np.zeros((tp.TABPFN_MAX_ROWS + 1, 3)))
+
+    def test_largest_real_window_fits(self):
+        tp.check_limits(np.zeros((6_551, 109)))

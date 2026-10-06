@@ -121,6 +121,8 @@ MARKET_COLS = ("market_home_prob", "market_available")
 RESULTS_PATH = Path(__file__).parent / "results.json"
 OOF_PATH = Path(__file__).resolve().parents[2] / "data" / "experiments" / "tabpfn_oof.csv"
 EPS = 1e-15
+TABPFN_MAX_ROWS = 10_000      # TabPFN-2's rated training-set size
+TABPFN_MAX_FEATURES = 500     # ... and feature count
 
 
 # ─────────────────────────────────────────────
@@ -180,7 +182,8 @@ def no_vig_two_way(home_price: np.ndarray, away_price: np.ndarray) -> np.ndarray
     """No-vig home probability from two American moneyline prices."""
     def implied(a):
         a = np.asarray(a, dtype=float)
-        return np.where(a < 0, -a / (-a + 100.0), 100.0 / (a + 100.0))
+        with np.errstate(divide="ignore"):   # np.where evaluates both branches
+            return np.where(a < 0, -a / (-a + 100.0), 100.0 / (a + 100.0))
     ph, pa = implied(home_price), implied(away_price)
     return ph / (ph + pa)
 
@@ -216,6 +219,18 @@ def make_tabpfn(kind: str, seed: int = SEED, device: Optional[str] = None):
 Factory = Callable[[str], object]   # kind -> unfitted estimator
 
 
+def check_limits(X_fit: np.ndarray) -> None:
+    """Refuse a training table bigger than TabPFN-2 is rated for, instead of
+    letting the package subsample it silently. Our largest window (about
+    6,550 games x 109 features) is well inside."""
+    n_rows, n_feats = X_fit.shape
+    if n_rows > TABPFN_MAX_ROWS:
+        raise ValueError(f"{n_rows} training rows exceed TabPFN-2's {TABPFN_MAX_ROWS}; "
+                         "the pre-registration allows no subsampling")
+    if n_feats > TABPFN_MAX_FEATURES:
+        raise ValueError(f"{n_feats} features exceed TabPFN-2's {TABPFN_MAX_FEATURES}")
+
+
 def _clf_logit(model, X: np.ndarray) -> np.ndarray:
     p = model.predict_proba(X)
     classes = list(model.classes_)
@@ -244,6 +259,7 @@ def fit_blind(factory: Factory, X, y, train_idx, dates, names):
     blind = np.array([i for i, n in enumerate(names) if n not in MARKET_COLS])
     f_core, f_cal = time_split(train_idx, dates)
     f = factory("clf")
+    check_limits(X[f_core][:, blind])
     f.fit(X[f_core][:, blind], y[f_core])
     temp_f = fit_temperature(_clf_logit(f, X[f_cal][:, blind]), y[f_cal])
     return f, temp_f, blind
@@ -254,6 +270,7 @@ def fit_market_model(variant: str, factory: Factory, X, y, train_idx, dates, nam
     avail_i = names.index("market_available")
     avail_idx = train_idx[X[train_idx, avail_i] == 1.0]
     m_core, m_cal = time_split(avail_idx, dates)
+    check_limits(X[m_core])
     if variant == "A":
         m = factory("clf")
         m.fit(X[m_core], y[m_core])
