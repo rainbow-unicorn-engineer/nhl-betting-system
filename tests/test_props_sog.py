@@ -461,7 +461,8 @@ class TestWalkForwardWiring:
                                    n_teams=8, roster=8)
         frame = build_player_features(s, g, a, t)
         params = dict(P.LGBM_PARAMS, n_estimators=30, min_child_samples=50)
-        res = P.run_props(register=False, frame=frame, params=params)
+        res = P.run_props(register=False, frame=frame, params=params,
+                          variant="P0")         # v2 wiring: offset B1
         assert [f["val_season"] for f in res["folds"]] == list(seasons[1:])
         pooled = res["pooled"]
         for k in ("M", "B1", "B0"):
@@ -517,7 +518,7 @@ class TestWalkForwardWiring:
         real_fit = P.fit_nb_alpha
         monkeypatch.setattr(P, "fit_nb_alpha", lambda y, mu: (
             calls.append(np.asarray(mu, float).copy()) or real_fit(y, mu)))
-        P.run_props(frame=frame, params=params)
+        P.run_props(frame=frame, params=params, variant="P0")
         data = P.load_props_dataset(frame)
         folds = P.walk_forward_folds(data[["season", "date"]])
         assert len(calls) == 5 * len(folds)
@@ -538,8 +539,10 @@ class TestWalkForwardWiring:
                                    days=40, n_teams=6, roster=6)
         frame = build_player_features(s, g, a, t)
         params = dict(P.LGBM_PARAMS, n_estimators=20, min_child_samples=50)
-        on = P.run_props(frame=frame, params=params, drift_correct_m=True)
-        off = P.run_props(frame=frame, params=params, drift_correct_m=False)
+        on = P.run_props(frame=frame, params=params, drift_correct_m=True,
+                         variant="P0")
+        off = P.run_props(frame=frame, params=params, drift_correct_m=False,
+                          variant="P0")
         assert on["pooled"]["model"] == "M2" and off["pooled"]["model"] == "M1"
         np.testing.assert_array_equal(on["oof"]["mu_M"], on["oof"]["mu_M2"])
         np.testing.assert_array_equal(off["oof"]["mu_M"], off["oof"]["mu_M1"])

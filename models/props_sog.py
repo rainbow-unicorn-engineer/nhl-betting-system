@@ -4,10 +4,10 @@ Skater shots-on-goal (SOG) props model: a full count distribution of a
 skater's shots on goal in a game, given that he plays (toi_seconds > 0),
 from which P(SOG > line) is read for the usual prop lines 0.5 .. 4.5.
 
-STATUS: see the STATUS section at the end of this docstring. Registration
-is disabled (run_props(register=True) raises), and nothing reads it. The
-price check (STATUS, "Market check") found that it does NOT beat the prop
-market.
+STATUS: see the STATUS sections near the end of this docstring (v3
+first). Registration is disabled (run_props(register=True) raises), and
+nothing reads it. The price checks (STATUS v3; STATUS v2, "Market
+check") found that neither v2 nor v3 beats the prop market.
 
 v3 PRE-REGISTRATION (2026-10-04). Written and committed before any v3
 variant was run. The market parts are in models/props_market_check.py.
@@ -195,6 +195,104 @@ simple baselines"; it does NOT mean profitable. That needs a check
 against prop PRICES, which this module does not have yet, and DraftKings
 props carry about a 6.2% bookmaker margin.
 
+STATUS v3 (2026-10-05; read-only on the live database; `python -m
+models.props_sog --v3` runs every variant and the adoption rule,
+`python -m models.props_market_check` the price check). VERDICT: P3 is
+ADOPTED as the forecaster (DEFAULT_VARIANT = "P3"). It is the best
+shots forecaster so far, and it still does NOT beat the prop market, so
+registration stays disabled. Two separate runs (2026-10-04 and
+2026-10-05) gave bit-identical numbers.
+- Rows: 287,333 played skater games built (the 2026-27 games loaded
+  since v2 included); 248,589 scored over the same 5 folds as v2.
+- P0 reproduced v2 exactly: pooled NLL M 1.57818, B1 1.58173, M2 - M1
+  -0.00009; every fold number is the same as v2's.
+- Every variant, pooled NLL M (M - B1, paired SE; folds won vs B1;
+  pooled ECE(> 2.5); pooled mean predicted - actual SOG):
+    P0 1.57818 (-0.00355, 0.00018; 5/5; 0.0087; +0.050)  gate PASS
+    P1 1.57800 (-0.00373, 0.00019; 5/5; 0.0108; +0.055)  gate PASS
+    P2 1.57800 (-0.00373, 0.00019; 5/5; 0.0107; +0.055)  gate PASS
+    P3 1.57636 (-0.00537, 0.00023; 5/5; 0.0110; +0.062)  gate PASS
+- Adoption rule, step by step (A starts at P0):
+    P1 vs P0: -0.00018 (SE 0.000074, -2.4 SE), lower NLL in 3 of 5
+      folds (-0.00045, -0.00045, +0.00001, +0.00015, -0.00016). All
+      three conditions hold, narrowly: A = P1.
+    P2 vs P1: -0.0000004 (SE 0.000038), 4 of 5 folds. Not by 2 SE: the
+      usage proxies add nothing the PP features had not already given.
+      A stays P1.
+    P3 vs P1: -0.00164 (SE 0.00012, ~14 SE), 5 of 5 folds (-0.00055,
+      -0.00064, -0.00167, -0.00207, -0.00327). A = P3.
+  For reference, P3 vs P0 (v2): -0.00182 (SE 0.00014), 5 of 5 folds.
+- P3 per fold, NLL M / B1 / B3 (M - B1, SE), mean predicted - actual SOG
+  M / M1 / B1 / B3, ECE(> 2.5) M / B1:
+    2021-22 1.62050 / 1.62470 / 1.62450 (-0.0042, 0.0004)  +0.025 / +0.021 / -0.003 / -0.000  0.0043 / 0.0140
+    2022-23 1.60265 / 1.60771 / 1.60739 (-0.0051, 0.0004)  +0.071 / +0.034 / +0.048 / +0.051  0.0137 / 0.0150
+    2023-24 1.57823 / 1.58384 / 1.58235 (-0.0056, 0.0006)  +0.088 / +0.041 / +0.053 / +0.062  0.0153 / 0.0099
+    2024-25 1.54576 / 1.55053 / 1.54877 (-0.0048, 0.0005)  +0.079 / +0.017 / +0.048 / +0.051  0.0158 / 0.0086
+    2025-26 1.53480 / 1.54199 / 1.53857 (-0.0072, 0.0006)  +0.045 / +0.001 / +0.000 / +0.022  0.0082 / 0.0055
+  2025-26 by position: forwards NLL 1.5952 (v2 1.5982), ECE(> 2.5)
+  0.0086; defensemen 1.4153 (v2 1.4196), ECE(> 2.5) 0.0097. Pooled
+  Brier(> 2.5) 0.15641 (v2 0.15681, B1 0.15753). Fitted alpha per fold
+  0.037-0.049.
+- B3 against B1 (information only): pooled NLL 1.58029 vs 1.58173
+  (-0.00144, SE 0.00012), better in 5 of 5 folds. As a stand-alone
+  baseline B3 is better than B1, but it did NOT remove the level drift
+  it was built to remove: its mean bias per fold is -0.000, +0.051,
+  +0.062, +0.051, +0.022 (B1: -0.003, +0.048, +0.053, +0.048, +0.000).
+  At the ACTUAL time on ice B3 is still about +0.05 SOG too high in
+  2022-23 .. 2024-25, so the pre-registration's reading (a lagging
+  league rate, and career rates earned in higher-shooting seasons) was
+  not the whole cause. A guess, untested, for a later pre-registration:
+  the remaining level error is in which players get the minutes (the
+  time-on-ice-weighted mix of players), not in the league rate.
+- Found after the run, NOT part of any rule: with the B3 offset the
+  in-season drift correction now hurts. P3's uncorrected booster M1 has
+  pooled NLL 1.57542 (M2 - M1 = +0.00094, SE 0.00007; M1 better in 5
+  of 5 folds), bias +0.023 (M2 +0.062) and ECE(> 2.5) 0.0041. The
+  correction divides out the booster's mean adjustment, and with B3
+  that adjustment is mostly a repair of B3's own level, so removing it
+  puts the bias back. M stays M2 (DRIFT_CORRECT) because that is what
+  was pre-registered; switching to M1 needs its own pre-registered test
+  (and a market re-check).
+- Market check, re-run for P3 on every 2025-26 shots-on-goal price row
+  now loaded. raw.prop_odds_hist holds 65,184 prop rows over all
+  markets; 9,739 are shots on goal: DraftKings 1,980 two-sided rows /
+  102 games, including the late playoffs through 2026-06-14 (v2 had
+  1,354 / 75); ESPN BET 5,769 / 410 games; DraftKings "N+" milestones
+  1,990. Matched: 1,947 DraftKings, 5,733 ESPN BET. PRIMARY, log loss
+  model - no-vig market (game-clustered SE; v3 pass rule: pooled mean +
+  1.96 SE < 0 AND every book with n >= 300 negative):
+    DraftKings 1,947: +0.00141 (SE 0.00280)  NO   (P0 on the same rows +0.00544)
+    ESPN BET   5,733: +0.00230 (SE 0.00127)  NO   (P0 +0.00526)
+    pooled     7,680: +0.00207 (SE 0.00118)  NO   (P0 +0.00531)
+  NOT PASSED. P3 closes about 60% of v2's gap to the market, and the
+  market is still the better forecaster (pooled by ~1.8 SE now; ~3.3 SE
+  for v2). Flat 1-unit bets (information only; game-clustered bootstrap
+  95%, 2,000 resamples, seed 7): pooled T=0.04 1,220 bets ROI +0.012
+  [-0.038, +0.065]; T=0.06 544 bets +0.036 [-0.044, +0.118];
+  DraftKings T=0.04 384 bets +0.049 [-0.047, +0.138], T=0.06 202 bets
+  +0.051 [-0.076, +0.187]; ESPN BET T=0.04 836 bets -0.004 [-0.069,
+  +0.062], T=0.06 342 bets +0.028 [-0.067, +0.130]. Every interval
+  includes 0. DraftKings "N+" milestones (over only): T=0.04 88 bets ROI
+  -0.148 [-0.387, +0.083].
+- Market-mean diagnostic (props_market_check, pre-registered there;
+  information only). Is the miss in the LEVEL (the expected count) or
+  in the SHAPE (how spread out the count is)? Pooled: mean SOG 2.209,
+  model mean 2.256 (bias +0.047, SE 0.020), market implied mean 2.228
+  (+0.019, SE 0.020). A level-only fix closes 14% of the gap and a
+  shape-only fix 6%, so by the pre-registered rule it is neither: the
+  gap is in the per-player means (which player-games the model rates
+  above or below the market). The information slope beta (how much of
+  the model's disagreement with the market turns out right) is 0.30 (SE
+  0.09) for P3, against 0.17 (SE 0.07) for v2: the disagreements carry
+  some information, but only about a third of each one is right, so
+  betting on them still loses to the price. DraftKings 0.22 (SE 0.17),
+  ESPN BET 0.23 (SE 0.11). By line group the reading is the same
+  (per-player means) for 0.5, 1.5, 2.5 and 3.5+.
+- Decisions: DEFAULT_VARIANT = "P3", MODEL_VERSION = "v3", GATE_PASSED
+  stays True (a forecasting verdict only). Registration stays disabled
+  (run_props(register=True) raises) because the market check did not
+  pass.
+
 STATUS (2026-10-03, v2 = M2, the drift-corrected booster; read-only on
 the live database): GATE PASSED as a FORECASTER, and M2 replaced v1 under
 the pre-registered decision rule below. Not a betting result: no price-
@@ -345,9 +443,9 @@ from models.baseline import PURGE_DAYS, expected_calibration_error, walk_forward
 logger = logging.getLogger("nhl.models.props_sog")
 
 MODEL_NAME = "props_sog"
-MODEL_VERSION = "v2"           # v2: v1 + in-season drift correction (M2)
+MODEL_VERSION = "v3"           # v3: P3 (v2 + PP/usage features, offset B3)
 # The forecasting gate verdict (STATUS), set by hand. It is NOT a betting
-# approval: no price-based check exists yet, and nothing reads it.
+# approval: the price check (props_market_check) fails, and nothing reads it.
 GATE_PASSED = True
 LINES = (0.5, 1.5, 2.5, 3.5, 4.5)
 MIN_PRIOR_GAMES = 5            # eligibility: >= 5 prior appearances
@@ -380,8 +478,9 @@ ADOPT_ORDER = ("P1", "P2", "P3")
 ADOPT_SE = 2.0                 # Pk must beat the adopted one by >= 2 SE
 ADOPT_MIN_FOLDS = 3            # ... and in >= 3 of 5 folds
 # The variant run_props reports as M by default, set by the v3 adoption
-# rule (STATUS).
-DEFAULT_VARIANT = "P0"
+# rule (STATUS v3: P1 replaced P0, P2 did not replace P1, P3 replaced
+# P1).
+DEFAULT_VARIANT = "P3"
 
 LGBM_PARAMS = {
     "objective": "poisson",
@@ -650,10 +749,9 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
     register=True raises: there is no registry entry for this model."""
     if register:
         raise RuntimeError(
-            "props_sog registration is disabled: the model has no price-"
-            "based evaluation yet (it has not been checked against prop "
-            "prices). Run "
-            "with register=False.")
+            "props_sog registration is disabled: the model has not passed "
+            "its check against prop prices (models/props_market_check.py; "
+            "STATUS v3). Run with register=False.")
     if variant is None:
         variant = DEFAULT_VARIANT
     if variant not in VARIANTS:

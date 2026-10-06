@@ -20,12 +20,14 @@ Terms used below:
 | 2026-10-02 | Shots-on-goal props model v1 | `models/props_sog.py`, `features/player_shots.py` | Passed as a forecaster: beat both baselines in 5/5 seasons, about 19 SE. |
 | 2026-10-03 | Props model v2: in-season drift correction | `models/props_sog.py` (`DRIFT_CORRECT`) | Adopted by its rule, but marginally: −1.8 SE vs v1, with worse pooled calibration. The drift's real cause is in the baseline. |
 | 2026-10-03 | Props market check vs ESPN BET and DraftKings | `models/props_market_check.py` | Does not beat the market: the book's no-vig price had lower log loss, about 3 SE pooled. Flat-bet ROI intervals all include 0. |
+| 2026-10-05 | Props model v3: power-play (PP → his team has an extra skater after an opponent's penalty) features (P1), usage proxies (P2), a fixed exposure baseline B3 (P3) | `models/props_sog.py` (`VARIANTS`, `--v3`), `features/player_shots.py`, `models/props_market_check.py` | P3 adopted by its rule: beats v2 by 0.0018 log loss a player-game (~13 SE, 5/5 seasons). P1 helped narrowly (−2.4 SE); P2 added nothing. B3 is a better baseline but did not remove the +0.05 shots-a-game over-prediction. Market check re-run on every shots price row (incl. late playoffs): still does NOT beat the market (pooled +0.0021 log loss, SE 0.0012; v2 was +0.0053). The gap is in per-player means, not level or spread. Registration stays off. |
 
 ## Re-running
 
 ```powershell
 .venv\Scripts\python -m models.totals                 # totals walk-forward and gate (registers the production model)
 .venv\Scripts\python -m models.props_sog --evaluate    # props walk-forward and gate (read-only)
+.venv\Scripts\python -m models.props_sog --v3          # every v3 variant and the adoption rule (read-only)
 .venv\Scripts\python -m models.props_market_check     # props vs the market (read-only)
 ```
 
