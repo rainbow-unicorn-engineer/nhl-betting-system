@@ -1,7 +1,8 @@
 """
 models/props_market_check.py
 The pre-registered market check of the skater shots-on-goal (SOG) props
-model (models/props_sog.py, v2) against stored prop PRICES. Read only: it
+model (models/props_sog.py; v2, and since v3 the adopted variant) against
+stored prop PRICES. Read only: it
 SELECTs from the database, writes nothing, registers nothing.
 
 Terms:
@@ -95,6 +96,10 @@ with the props_sog v3 pre-registration):
   Otherwise the gap is in the per-player means (which player-games the
   model rates above or below the market), and beta says whether those
   disagreements carry information (beta > 0 by 2 SE) or not.
+
+RESULTS: v2 in props_sog.py STATUS (v2, "Market check"); v3 (the
+adopted P3, every price row now loaded, the pass rule and the
+market-mean diagnostic) in props_sog.py STATUS v3. Neither passes.
 
 Usage: python -m models.props_market_check   (prints the report)
 """
@@ -425,6 +430,137 @@ def evaluate(df: pd.DataFrame) -> dict:
     return res
 
 
+# ── v3: market-mean diagnostic (information only; pure) ───────────
+
+MEAN_BOUNDS = (0.02, 15.0)
+LEVEL_SHAPE_CLOSE = 0.5          # "closes at least half of the gap"
+
+
+def implied_mean(p_over, alpha, line, bounds=MEAN_BOUNDS,
+                 iters: int = 60) -> np.ndarray:
+    """mu_mkt: per row, the mean m with P_NB(SOG > line; m, alpha) equal
+    to the no-vig over probability (push mass removed on an integer line,
+    as for the model), by bisection on `bounds`. P(over) rises with m, so
+    the bisection is exact to (hi - lo) / 2^iters; a probability outside
+    what `bounds` can give returns the nearer bound."""
+    p_over = np.asarray(p_over, float)
+    lo = np.full(p_over.shape, float(bounds[0]))
+    hi = np.full(p_over.shape, float(bounds[1]))
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        up = model_side_probs(mid, alpha, line)[0] < p_over
+        lo, hi = np.where(up, mid, lo), np.where(up, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def clustered_ols(y, x, clusters) -> dict:
+    """OLS of y on [1, x] with game-clustered (sandwich) SEs and the same
+    G/(G-1) small-sample factor as clustered_mean_se."""
+    y, x = np.asarray(y, float), np.asarray(x, float)
+    X = np.column_stack([np.ones(len(y)), x])
+    xtx_inv = np.linalg.pinv(X.T @ X)
+    b = xtx_inv @ X.T @ y
+    e = y - X @ b
+    sc = pd.DataFrame(X * e[:, None]).groupby(np.asarray(clusters)).sum().to_numpy()
+    g = len(sc)
+    meat = sc.T @ sc * (g / (g - 1) if g > 1 else float("nan"))
+    v = xtx_inv @ meat @ xtx_inv
+    se = np.sqrt(np.clip(np.diag(v), 0, None))
+    return {"intercept": float(b[0]), "slope": float(b[1]),
+            "se_intercept": float(se[0]), "se_slope": float(se[1])}
+
+
+def _gap(p_model, df) -> float:
+    """Mean log loss(p_model) - log loss(no-vig market) over df's props."""
+    y = df["over_hit"].to_numpy(float)
+    return float(np.mean(log_loss(p_model, y) - log_loss(df["p_mkt"], y)))
+
+
+def level_constants(df: pd.DataFrame) -> dict:
+    """Per book: mean actual SOG / mean model mean on its props (fitted
+    in-sample, so an upper bound on what a level fix could do)."""
+    return {b: float(g["shots"].mean() / g["mu_M"].mean())
+            for b, g in df.groupby("book", sort=True)}
+
+
+def mean_block(df: pd.DataFrame, level_c: dict) -> dict:
+    """The pre-registered market-mean diagnostic on one set of props
+    (df: scored props with mu_mkt). Level fix: each prop's model mean
+    times its BOOK's constant (level_c). Shape fix: alpha* = the ML
+    dispersion of the actual SOG around mu_mkt on these props."""
+    from models.props_sog import fit_nb_alpha, nb_nll_rows
+    y = df["shots"].to_numpy(float)
+    mu_m, mu_k = df["mu_M"].to_numpy(float), df["mu_mkt"].to_numpy(float)
+    a = df["alpha_M"].to_numpy(float)
+    line = df["line"].to_numpy(float)
+    games = df["game_id"].to_numpy()
+    out = {"n": int(len(df)), "games": int(df["game_id"].nunique()),
+           "mean_sog": float(y.mean()), "mean_mu_model": float(mu_m.mean()),
+           "mean_mu_mkt": float(mu_k.mean())}
+    out["bias_model"], out["se_bias_model"] = clustered_mean_se(mu_m - y, games)
+    out["bias_mkt"], out["se_bias_mkt"] = clustered_mean_se(mu_k - y, games)
+    d = nb_nll_rows(y, mu_m, a) - nb_nll_rows(y, mu_k, a)
+    out["count_ll_diff"], out["se_count_ll_diff"] = clustered_mean_se(d, games)
+    ols = clustered_ols(y - mu_k, mu_m - mu_k, games)
+    out["beta"], out["se_beta"] = ols["slope"], ols["se_slope"]
+    out["beta_intercept"] = ols["intercept"]
+    out["se_beta_intercept"] = ols["se_intercept"]
+    gap = _gap(df["p_model"].to_numpy(float), df)
+    c = df["book"].map(level_c).to_numpy(float)
+    gap_level = _gap(model_side_probs(mu_m * c, a, line)[0], df)
+    a_star = fit_nb_alpha(y, mu_k)
+    gap_shape = _gap(model_side_probs(mu_m, a_star, line)[0], df)
+    out.update({"gap": gap, "gap_level_fix": gap_level,
+                "gap_shape_fix": gap_shape, "alpha_star": a_star,
+                "mean_alpha_model": float(a.mean()),
+                "level_c": {b: level_c[b] for b in sorted(set(df["book"]))}})
+    if gap > 0:
+        out["closed_level"] = (gap - gap_level) / gap
+        out["closed_shape"] = (gap - gap_shape) / gap
+    else:
+        out["closed_level"] = out["closed_shape"] = float("nan")
+    out["reading"] = mean_reading(out)
+    return out
+
+
+def mean_reading(b: dict) -> str:
+    """The pre-registered reading rule."""
+    if not b["gap"] > 0:
+        return "no gap (the model is not behind the market here)"
+    parts = [w for w, k in (("level", "closed_level"), ("shape", "closed_shape"))
+             if b[k] >= LEVEL_SHAPE_CLOSE]
+    if parts:
+        return " and ".join(parts)
+    if b["beta"] - 2.0 * b["se_beta"] > 0:
+        return ("per-player means; the model's disagreements carry "
+                "information (beta > 0 by 2 SE)")
+    return ("per-player means; the model's disagreements carry no "
+            "information (beta not > 0 by 2 SE)")
+
+
+def mean_diagnostic(df: pd.DataFrame) -> dict:
+    """Per book, pooled and per line group (0.5, 1.5, 2.5, 3.5+)."""
+    df = df.copy()
+    df["mu_mkt"] = implied_mean(df["p_mkt"], df["alpha_M"], df["line"])
+    lc = level_constants(df)
+    out = {b: mean_block(g, lc) for b, g in book_frames(df).items()}
+    lg = line_group(df["line"])
+    out["by_line"] = {k: mean_block(df[lg == k], lc) for k in sorted(set(lg))}
+    return out
+
+
+def market_check_passed(results: dict) -> dict:
+    """The v3 pass rule: the POOLED primary test beats the market AND
+    every book with n >= GATE_MIN_N has a negative mean difference."""
+    pooled = results.get(POOLED, {}).get("primary", {})
+    books = {b: r["primary"] for b, r in results.items() if b != POOLED}
+    big = {b: bool(p["diff"] < 0) for b, p in books.items()
+           if p["n"] >= GATE_MIN_N}
+    beats = bool(pooled.get("beats_market", False))
+    return {"pooled_beats": beats, "books_negative": big,
+            "passed": bool(beats and all(big.values()))}
+
+
 # ── Alternate milestones (information only) ────────────────────────
 
 def alternate_block(alt: pd.DataFrame, oof: pd.DataFrame,
@@ -514,17 +650,20 @@ def _object_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_market_check(season: int = SEASON, frame: pd.DataFrame = None,
                      res: dict = None, rows: pd.DataFrame = None,
-                     outcomes: pd.DataFrame = None, params=None) -> dict:
+                     outcomes: pd.DataFrame = None, params=None,
+                     variant: str = None) -> dict:
     """The whole pre-registered check. Every input can be given (tests);
     None reads it from the database (SELECT only). res: a
     props_sog.run_props result; it is only ever produced with
-    register=False."""
+    register=False. variant: the props_sog v3 variant (default: its
+    DEFAULT_VARIANT, the adopted one); not used when res is given."""
     from models import props_sog as P
     if frame is None:
         from features.player_shots import load_player_features
         frame = load_player_features()
     if res is None:
-        res = P.run_props(register=False, frame=frame, params=params)
+        res = P.run_props(register=False, frame=frame, params=params,
+                          variant=variant)
     oof = validation_predictions(res, season)
     if rows is None:
         rows = load_prop_rows(season)
@@ -541,8 +680,10 @@ def run_market_check(season: int = SEASON, frame: pd.DataFrame = None,
         outcomes = load_outcomes(sorted(set(matched["game_id"])))
     scored, n_push = attach_outcomes(matched, outcomes)
     fold = next(f for f in res["folds"] if int(f["val_season"]) == int(season))
+    results = evaluate(scored) if len(scored) else {}
     return {
         "season": season, "model": res["pooled"].get("model"),
+        "variant": res.get("variant", res["pooled"].get("variant")),
         "model_version": P.MODEL_VERSION,
         "fold": {"n": fold["n"], "n_train": fold["n_train"],
                  "nll_M": fold["nll_M"], "alpha_M": fold["alpha_M"]},
@@ -551,7 +692,9 @@ def run_market_check(season: int = SEASON, frame: pd.DataFrame = None,
                  for b, g in main.groupby("book", sort=True)},
         "prices": price_counts_by_book, "prices_total": price_counts,
         "unmatched": unmatched, "pushes_dropped": n_push,
-        "results": evaluate(scored) if len(scored) else {},
+        "results": results,
+        "market_check": market_check_passed(results),
+        "mean_diagnostic": mean_diagnostic(scored) if len(scored) else {},
         "alternate": {b: alternate_block(g, oof, outcomes)
                       for b, g in alt.groupby("book", sort=True)},
         "scored": scored,
@@ -573,7 +716,7 @@ def _bet_line(b: dict, label: str = "") -> str:
 
 def format_report(out: dict) -> str:
     L = [f"PROPS MARKET CHECK - props_sog {out['model_version']} "
-         f"(M = {out['model']}), season {out['season']} out-of-fold "
+         f"(variant {out.get('variant')}, M = {out['model']}), season {out['season']} out-of-fold "
          f"validation fold (n={out['fold']['n']}, trained on "
          f"{out['fold']['n_train']} earlier rows, NLL {_f(out['fold']['nll_M'], 5)}, "
          f"alpha {_f(out['fold']['alpha_M'])})", "",
@@ -605,6 +748,12 @@ def format_report(out: dict) -> str:
         L.append(f"    Brier model {_f(p['brier_model'], 5)} market "
                  f"{_f(p['brier_mkt'], 5)}; ECE (10 bins) model "
                  f"{_f(p['ece_model'])} market {_f(p['ece_mkt'])}")
+    mc = out.get("market_check")
+    if mc:
+        L.append(f"  v3 PASS RULE (pooled beats AND every book with n >= "
+                 f"{GATE_MIN_N} negative): pooled beats {mc['pooled_beats']}, "
+                 f"books negative {mc['books_negative']} -> "
+                 f"{'PASSED' if mc['passed'] else 'NOT PASSED'}")
     L += ["", "SECONDARY (information only): flat 1-unit bets at the quoted "
           "prices, game-clustered bootstrap 95% (2,000, seed 7):"]
     for b, r in out["results"].items():
@@ -614,6 +763,26 @@ def format_report(out: dict) -> str:
             L.append(_bet_line(x, f"line {lg:>4} "))
         for pos, x in r["by_position"].items():
             L.append(_bet_line(x, f"pos {pos}      "))
+    md = out.get("mean_diagnostic") or {}
+    if md:
+        L += ["", "MARKET-MEAN DIAGNOSTIC (information only; level vs shape):"]
+        blocks = [(k, v) for k, v in md.items() if k != "by_line"]
+        blocks += [(f"line {k}", v) for k, v in md.get("by_line", {}).items()]
+        for k, b in blocks:
+            L.append(f"  {k}: n {b['n']}; mean SOG {_f(b['mean_sog'], 3)}, "
+                     f"mu model {_f(b['mean_mu_model'], 3)} (bias "
+                     f"{b['bias_model']:+.3f} SE {_f(b['se_bias_model'], 3)}), "
+                     f"mu mkt {_f(b['mean_mu_mkt'], 3)} (bias "
+                     f"{b['bias_mkt']:+.3f} SE {_f(b['se_bias_mkt'], 3)})")
+            L.append(f"    count log loss model - mkt {b['count_ll_diff']:+.5f} "
+                     f"(SE {_f(b['se_count_ll_diff'], 5)}); beta "
+                     f"{_f(b['beta'], 3)} (SE {_f(b['se_beta'], 3)}), "
+                     f"intercept {b['beta_intercept']:+.3f}")
+            L.append(f"    gap {b['gap']:+.5f}; level fix {b['gap_level_fix']:+.5f} "
+                     f"(closes {_f(b['closed_level'], 2)}); shape fix "
+                     f"{b['gap_shape_fix']:+.5f} (alpha* {_f(b['alpha_star'], 3)} "
+                     f"vs model {_f(b['mean_alpha_model'], 3)}; closes "
+                     f"{_f(b['closed_shape'], 2)}) -> {b['reading']}")
     L += ["", "ALTERNATE 'N+' milestones (over only, no no-vig possible; "
           "information only):"]
     for b, a in out["alternate"].items():
@@ -636,8 +805,10 @@ def main(argv=None):
                     "against stored prop prices (read only; never "
                     "registers).")
     parser.add_argument("--season", type=int, default=SEASON)
+    parser.add_argument("--variant", default=None,
+                        help="props_sog v3 variant (default: the adopted one)")
     args = parser.parse_args(argv)
-    out = run_market_check(season=args.season)
+    out = run_market_check(season=args.season, variant=args.variant)
     print(format_report(out))
     return out
 

@@ -361,3 +361,117 @@ class TestOutOfFoldGuard:
         with pytest.raises(RuntimeError, match="stop"):
             C.run_market_check(frame=pd.DataFrame())
         assert seen == {"register": False}
+
+    def test_variant_is_passed_through_and_defaults_to_the_adopted_one(
+            self, monkeypatch):
+        seen = []
+
+        def fake_run(register=False, frame=None, params=None, variant=None, **k):
+            seen.append((register, variant))
+            raise RuntimeError("stop")
+        monkeypatch.setattr(P, "run_props", fake_run)
+        for v in ("P1", None):
+            with pytest.raises(RuntimeError, match="stop"):
+                C.run_market_check(frame=pd.DataFrame(), variant=v)
+        # None lets run_props use DEFAULT_VARIANT (the adopted variant)
+        assert seen == [(False, "P1"), (False, None)]
+        assert P.DEFAULT_VARIANT in P.VARIANTS
+
+
+# ── v3: market-mean diagnostic and the pass rule ───────────────────
+
+def _scored(mu_truth, mu_model, alpha_truth, alpha_model, line, seed=0,
+            book="DraftKings"):
+    """Synthetic scored props: SOG drawn from NB(mu_truth, alpha_truth);
+    the market prices them with the TRUE distribution (no vig), the
+    model with (mu_model, alpha_model)."""
+    rng = np.random.default_rng(seed)
+    n = len(mu_truth)
+    r = 1 / alpha_truth
+    y = rng.negative_binomial(r, r / (r + mu_truth))
+    df = pd.DataFrame({"game_id": np.arange(n) // 4, "book": book,
+                       "line": line, "shots": y.astype(float),
+                       "mu_M": mu_model, "alpha_M": alpha_model})
+    df["p_mkt"] = C.model_side_probs(mu_truth, alpha_truth, line)[0]
+    df["p_model"] = C.model_side_probs(mu_model, alpha_model, line)[0]
+    df["over_hit"] = (df["shots"] > df["line"]).astype(float)
+    return df
+
+
+class TestMarketMean:
+    def test_implied_mean_inverts_the_over_probability(self):
+        mu = np.array([0.4, 1.3, 2.2, 3.7, 6.0])
+        line = np.array([0.5, 1.5, 2.5, 3.5, 4.5])
+        p = C.model_side_probs(mu, 0.05, line)[0]
+        np.testing.assert_allclose(C.implied_mean(p, 0.05, line), mu, rtol=1e-8)
+        # a probability the bounds cannot reach returns the nearer bound
+        assert C.implied_mean([1.0], 0.05, [0.5])[0] == pytest.approx(
+            C.MEAN_BOUNDS[1], rel=1e-9)
+
+    def test_clustered_ols_recovers_the_slope(self):
+        rng = np.random.default_rng(1)
+        x = rng.normal(size=4000)
+        y = 0.1 + 0.3 * x + rng.normal(size=4000)
+        o = C.clustered_ols(y, x, np.arange(4000) // 5)
+        assert abs(o["slope"] - 0.3) < 3 * o["se_slope"]
+        assert abs(o["intercept"] - 0.1) < 3 * o["se_intercept"]
+        np.testing.assert_allclose([o["intercept"], o["slope"]],
+                                   np.polyfit(x, y, 1)[::-1])
+        # duplicating each row inside its own cluster leaves the slope and
+        # (up to the G/(G-1) factor, unchanged) its clustered SE alone
+        o2 = C.clustered_ols(np.repeat(y, 2), np.repeat(x, 2),
+                             np.repeat(np.arange(4000) // 5, 2))
+        assert o2["slope"] == pytest.approx(o["slope"])
+        assert o2["se_slope"] == pytest.approx(o["se_slope"], rel=1e-9)
+
+    def test_a_level_miss_reads_as_level(self):
+        rng = np.random.default_rng(2)
+        mu = rng.uniform(1.2, 3.5, 6000)
+        df = _scored(mu, mu * 1.25, 0.05, 0.05, 2.5)
+        out = C.mean_diagnostic(df)
+        b = out["DraftKings"]
+        assert b["gap"] > 0 and b["closed_level"] > 0.5
+        assert b["reading"].startswith("level")
+        assert b["level_c"]["DraftKings"] == pytest.approx(
+            df["shots"].mean() / df["mu_M"].mean())
+        # the market prices the truth, so its implied mean is the truth
+        np.testing.assert_allclose(b["mean_mu_mkt"], mu.mean(), rtol=1e-6)
+        assert set(out) == {"DraftKings", C.POOLED, "by_line"}
+        assert set(out["by_line"]) == {"2.5"}
+
+    def test_a_spread_miss_reads_as_shape(self):
+        rng = np.random.default_rng(3)
+        mu = rng.uniform(1.2, 3.5, 6000)
+        df = _scored(mu, mu, 0.05, 1.0, 2.5)
+        b = C.mean_diagnostic(df)[C.POOLED]
+        assert b["gap"] > 0 and b["closed_shape"] > 0.5
+        assert "shape" in b["reading"]
+        # mu_mkt is inverted with the MODEL's alpha (as pre-registered), so
+        # alpha* is not the true 0.05, but it moves well toward it
+        assert b["alpha_star"] < 0.5
+
+    def test_no_gap_reading(self):
+        rng = np.random.default_rng(4)
+        mu = rng.uniform(1.2, 3.5, 3000)
+        df = _scored(mu, mu * 1.3, 0.05, 0.05, 1.5)
+        df["p_model"] = df["p_mkt"]                  # identical prices
+        b = C.mean_diagnostic(df)["DraftKings"]
+        assert b["gap"] == 0 and b["reading"].startswith("no gap")
+
+
+class TestPassRule:
+    @staticmethod
+    def _res(pooled_beats, diffs):
+        res = {b: {"primary": {"diff": d, "n": n}} for b, (d, n) in diffs.items()}
+        res[C.POOLED] = {"primary": {"beats_market": pooled_beats,
+                                     "diff": -1.0, "n": 1000}}
+        return res
+
+    def test_rule(self):
+        ok = C.market_check_passed(self._res(True, {"A": (-0.01, 900),
+                                                    "B": (0.02, 100)}))
+        assert ok["passed"] and ok["books_negative"] == {"A": True}
+        bad = C.market_check_passed(self._res(True, {"A": (-0.01, 900),
+                                                     "B": (0.001, 300)}))
+        assert not bad["passed"]
+        assert not C.market_check_passed(self._res(False, {"A": (-0.01, 900)}))["passed"]
