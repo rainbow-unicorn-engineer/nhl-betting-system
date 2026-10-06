@@ -20,6 +20,7 @@ Terms used below:
 | 2026-10-02 | Shots-on-goal props model v1 | `models/props_sog.py`, `features/player_shots.py` | Passed as a forecaster: beat both baselines in 5/5 seasons, about 19 SE. |
 | 2026-10-03 | Props model v2: in-season drift correction | `models/props_sog.py` (`DRIFT_CORRECT`) | Adopted by its rule, but marginally: −1.8 SE vs v1, with worse pooled calibration. The drift's real cause is in the baseline. |
 | 2026-10-03 | Props market check vs ESPN BET and DraftKings | `models/props_market_check.py` | Does not beat the market: the book's no-vig price had lower log loss, about 3 SE pooled. Flat-bet ROI intervals all include 0. |
+| 2026-10-04 | TabPFN (pretrained table model from Hugging Face) for the moneyline: A feature, B market residual, C average with lgbm v2 | `experiments/tabpfn/` (separate `tabpfn` dependency group) | No variant passes: 0/5 seasons beat lgbm v2 by 2 SE. Best was C, a tie (+0.0001 ± 0.0005). All lose to the no-vig market. lgbm v2 stays. |
 
 ## Re-running
 
@@ -27,6 +28,7 @@ Terms used below:
 .venv\Scripts\python -m models.totals                 # totals walk-forward and gate (registers the production model)
 .venv\Scripts\python -m models.props_sog --evaluate    # props walk-forward and gate (read-only)
 .venv\Scripts\python -m models.props_market_check     # props vs the market (read-only)
+.venv\Scripts\python -m experiments.tabpfn.run         # TabPFN trial (read-only; needs the tabpfn group and its weights, see experiments/tabpfn/README.md)
 ```
 
 The goalie variants run from Python: `models.totals.run_totals(register=False, variant="C", with_roles=True)`.

@@ -91,7 +91,51 @@ No-vig price → the sportsbook's implied probability with its built-in fee
 ===========================================================================
 STATUS
 ===========================================================================
-Not run yet.
+Run once, 2026-10-04, on the RTX 5080 (tabpfn 9.1.0, torch 2.14.1+cu130,
+CUDA 13.0, lightgbm 4.7.0; about 8 minutes for all TabPFN fits). Full numbers
+in experiments/tabpfn/results.json. RESULT: NO VARIANT PASSES. lgbm v2 stays
+the production model; nothing was registered and nothing else changes.
+
+6,993 scored games (5 folds), 5,061 of them priced. Log loss, lower is
+better. "vs lgbm" = mean per-game difference (variant - lgbm v2) +- paired
+SE; negative = the variant is better.
+
+  model            pooled LL  vs lgbm v2           vs no-vig market (priced)  ECE
+  lgbm v2          0.6616     -                    +0.0041 +- 0.0012          0.0168
+  market (priced)  0.6523     -                    -                          0.0172
+  A  feature       0.6635     +0.0019 +- 0.0010    +0.0087 +- 0.0017          0.0168
+  B  residual      0.6777     +0.0160 +- 0.0023    +0.0282 +- 0.0033          0.0255
+  C  ensemble      0.6617     +0.0001 +- 0.0005    +0.0057 +- 0.0014          0.0169
+  A seed 1 (r/o)   0.6642     +0.0026 +- 0.0010    +0.0095 +- 0.0017          0.0172
+  A seed 2 (r/o)   0.6639     +0.0023 +- 0.0010    +0.0092 +- 0.0017          0.0156
+
+Per fold, variant - lgbm v2 (+- paired SE); no fold reaches -2 SE:
+  season    A                 B                 C
+  2021-22   +0.0108 +- 0.0020 +0.0260 +- 0.0037 +0.0047 +- 0.0010
+  2022-23   -0.0010 +- 0.0020 +0.0167 +- 0.0071 -0.0012 +- 0.0010
+  2023-24   +0.0021 +- 0.0021 +0.0237 +- 0.0058 +0.0003 +- 0.0012
+  2024-25   -0.0027 +- 0.0030 -0.0027 +- 0.0030 -0.0029 +- 0.0015
+  2025-26   +0.0003 +- 0.0022 +0.0165 +- 0.0052 -0.0007 +- 0.0011
+  (2024-25 has no line in the stored features, so A and B are the same
+  market-blind model there.)
+
+Decision by the pre-registered rule: A 0/5 folds, B 0/5, C 0/5 beat lgbm v2
+by 2 paired SE; every variant is also worse than the no-vig market on priced
+games (A +5.0 SE, B +8.5 SE, C +4.0 SE). Rule part 1 and part 2 both fail
+for all three.
+
+Report-only: the seed alone moves A's pooled log loss by up to 0.0007, about
+a third of A's gap to lgbm v2, so A's deficit is real, not seed noise. The
+2024-25 outside bar (Pinnacle no-vig close from raw.odds_history, 1,398
+games): Pinnacle 0.6574; lgbm v2 +0.0063 +- 0.0040 worse, A +0.0036 +-
+0.0034, C +0.0034 +- 0.0034. No model beats the sharp close.
+
+What it means: TabPFN-2, used as pre-registered, is a decent general
+learner (A lands within 0.002 of lgbm v2 with no tuning) but adds nothing
+the market and lgbm v2 do not already have. Learning the market residual
+directly (B) is clearly worse: the residual is almost pure noise and the
+regressor overreacts to it. The ensemble C ties lgbm v2. Neither lgbm v2
+nor any TabPFN variant beats the no-vig market, which remains the real bar.
 """
 from __future__ import annotations
 
