@@ -418,21 +418,22 @@ class TestPlayerXgFeatures:
             f[frame.columns].reset_index(drop=True), frame.reset_index(drop=True))
 
 
+@pytest.fixture(scope="module")
+def db():
+    from sqlalchemy import text
+
+    from config.settings import engine
+    try:
+        with engine.connect() as conn:
+            if conn.execute(text("SELECT COUNT(*) FROM raw.shots")).scalar() < 1000:
+                pytest.skip("raw.shots not loaded")
+    except Exception as e:
+        pytest.skip(f"database unavailable: {e}")
+    return engine
+
+
 class TestDatabase:
     """Skips unless tests/conftest.py allows database tests."""
-
-    @pytest.fixture(scope="class")
-    def db(self):
-        from sqlalchemy import text
-
-        from config.settings import engine
-        try:
-            with engine.connect() as conn:
-                if conn.execute(text("SELECT COUNT(*) FROM raw.shots")).scalar() < 1000:
-                    pytest.skip("raw.shots not loaded")
-        except Exception as e:
-            pytest.skip(f"database unavailable: {e}")
-        return engine
 
     def test_moneypuck_arm_equals_the_sql_path(self, db):
         from features import goalie_features as GF
