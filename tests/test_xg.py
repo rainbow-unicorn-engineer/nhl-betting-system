@@ -174,6 +174,78 @@ class TestWalkForward:
         assert not np.isnan(cf["oof"]).any()
         np.testing.assert_allclose(cf["oof"][~first], plain["oof"][~first])
 
+    @staticmethod
+    def with_season_in_progress(n_new=40):
+        """Three full seasons plus a few shots of a fourth: too few to be a
+        fold (walk_forward_folds' tenth-of-the-median rule)."""
+        shots = synthetic_league(n_per_season=1500)
+        new = synthetic_league(n_per_season=n_new, seasons=(20232024,), seed=9)
+        new["date"] = pd.Timestamp("2023-10-10") + pd.to_timedelta(
+            np.arange(n_new) // 60, unit="D")
+        new["shot_id"] += 10_000
+        new["game_id"] += 10_000
+        return pd.concat([shots, new], ignore_index=True)
+
+    def test_season_without_a_fold_filled_from_earlier_seasons(self):
+        shots = self.with_season_in_progress()
+        feats = FX.shot_features(shots)
+        new = (shots["season"] == 20232024).to_numpy()
+        plain = MX.walk_forward_xg(shots, feats, MX.CORE_FEATURES, SMALL,
+                                   crossfit_first=True)
+        assert 20232024 not in [f["val_season"] for f in plain["folds"]]
+        assert np.isnan(plain["oof"][new]).all() and plain["filled"] == []
+        full = MX.walk_forward_xg(shots, feats, MX.CORE_FEATURES, SMALL,
+                                  crossfit_first=True, fill_unfolded=True)
+        assert not np.isnan(full["oof"]).any()
+        assert full["filled"] == [{"season": 20232024, "n_train": 4500,
+                                   "n_shots": int(new.sum()),
+                                   "iters": full["filled"][0]["iters"]}]
+        # the seasons with a fold are untouched
+        np.testing.assert_array_equal(full["oof"][~new], plain["oof"][~new])
+        # the new season's xG never sees its own outcomes ...
+        flipped = shots.copy()
+        flipped.loc[new, "is_goal"] = ~flipped.loc[new, "is_goal"]
+        again = MX.walk_forward_xg(flipped, FX.shot_features(flipped),
+                                   MX.CORE_FEATURES, SMALL, crossfit_first=True,
+                                   fill_unfolded=True)
+        np.testing.assert_allclose(again["oof"][new], full["oof"][new])
+        # ... and equals one model fitted on every earlier shot
+        fm = MX.fit_xg(feats[MX.CORE_FEATURES], shots["is_goal"].astype(int).to_numpy(),
+                       np.flatnonzero(~new), pd.to_datetime(shots["date"]), SMALL)
+        np.testing.assert_allclose(
+            full["oof"][new], MX.predict_xg(fm, feats.loc[new, MX.CORE_FEATURES]))
+
+    def test_gate_ignores_the_filled_season(self):
+        shots = self.with_season_in_progress()
+        a = MX.evaluate(shots, params=SMALL, variants=["X2"])
+        b = MX.evaluate(shots, params=SMALL, variants=["X2"],
+                        crossfit_first=True, fill_unfolded=True)
+        assert a["variants"]["X2"]["pooled"]["ours"]["n"] == 3000
+        assert a["gate"] == b["gate"]
+        assert a["variants"]["X2"]["pooled"]["ll"] == b["variants"]["X2"]["pooled"]["ll"]
+
+    def test_downstream_runs_with_a_season_in_progress(self, monkeypatch):
+        shots = self.with_season_in_progress()
+        seen = {}
+
+        def fake_ml(s, ours_col=MX.XG_COL):
+            seen["ml"] = s[ours_col].to_numpy()
+            return {"diff": 0.0, "se": 1.0}
+
+        def fake_props(s, ours_col=MX.XG_COL):
+            seen["props"] = s[ours_col].to_numpy()
+            return {"diff": 0.0, "se": 1.0}
+
+        real_eval = MX.evaluate
+        monkeypatch.setattr(MX, "evaluate",
+                            lambda *a, **k: real_eval(*a, params=SMALL, **k))
+        monkeypatch.setattr(MX, "ml_comparison", fake_ml)
+        monkeypatch.setattr(MX, "props_comparison", fake_props)
+        res = MX.run_downstream(shots)
+        assert not np.isnan(seen["ml"]).any()
+        np.testing.assert_array_equal(seen["ml"], seen["props"])
+        assert res["evaluate"]["variants"]["X2"]["filled"][0]["season"] == 20232024
+
     def test_evaluate_reports_both_variants_and_the_gate(self):
         shots = synthetic_league(n_per_season=1500)
         res = MX.evaluate(shots, params=SMALL)

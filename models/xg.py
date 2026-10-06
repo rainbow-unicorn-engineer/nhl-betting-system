@@ -201,7 +201,7 @@ import numpy as np
 import pandas as pd
 
 from features.xg import ALL_FEATURES, CATEGORICAL, CORE_FEATURES, shot_features
-from models.baseline import expected_calibration_error, walk_forward_folds
+from models.baseline import PURGE_DAYS, expected_calibration_error, walk_forward_folds
 
 logger = logging.getLogger("nhl.models.xg")
 
@@ -350,11 +350,16 @@ def predict_xg(fm: dict, X: pd.DataFrame) -> np.ndarray:
 
 def walk_forward_xg(shots: pd.DataFrame, feats: pd.DataFrame,
                     features: list, params=None, crossfit_first: bool = False,
-                    crossfit_folds: int = CROSSFIT_FOLDS) -> dict:
+                    crossfit_folds: int = CROSSFIT_FOLDS,
+                    fill_unfolded: bool = False) -> dict:
     """Out-of-sample xG for every shot of every held-out season (model
     trained on earlier seasons only). crossfit_first also fills the first
-    season by game-grouped cross-fitting (downstream training rows only).
-    Returns {"oof": array (NaN where not scored), "folds": [...]}."""
+    season by game-grouped cross-fitting (downstream test only).
+    fill_unfolded also fills every later season too small to be a fold
+    (the season in progress) from one model trained on all earlier
+    seasons, purge gap kept; those shots are never scored by the gate.
+    Returns {"oof": array (NaN where not scored), "folds": [...],
+    "filled": [...]}."""
     meta = shots[["season", "date"]].reset_index(drop=True)
     meta["date"] = pd.to_datetime(meta["date"])
     y = shots["is_goal"].astype(int).to_numpy()
@@ -384,15 +389,37 @@ def walk_forward_xg(shots: pd.DataFrame, feats: pd.DataFrame,
             oof[va] = predict_xg(fm, X.iloc[va])
         logger.info(f"  xG cross-fit {first}: {len(idx)} shots, "
                     f"{crossfit_folds} game folds")
-    return {"oof": oof, "folds": folds_out}
+    filled = []
+    if fill_unfolded:
+        folded = {f["val_season"] for f in folds_out}
+        season = meta["season"]
+        for s in sorted(season.unique())[1:]:
+            if int(s) in folded:
+                continue
+            val = season == s
+            cutoff = meta.loc[val, "date"].min() - pd.Timedelta(days=PURGE_DAYS)
+            tr = np.flatnonzero(((season < s) & (meta["date"] < cutoff)).to_numpy())
+            if len(tr) == 0:
+                continue
+            va = np.flatnonzero(val.to_numpy())
+            fm = fit_xg(X, y, tr, dates, params)
+            oof[va] = predict_xg(fm, X.iloc[va])
+            filled.append({"season": int(s), "n_train": int(len(tr)),
+                           "n_shots": int(len(va)), "iters": fm["iters"]})
+            logger.info(f"  xG no-fold season {s}: {len(va)} shots from a "
+                        f"model trained on {len(tr)} earlier shots")
+    return {"oof": oof, "folds": folds_out, "filled": filled}
 
 
 # ── Shot-level evaluation ──────────────────────────────────────────
 
 def evaluate(shots: pd.DataFrame = None, feats: pd.DataFrame = None,
-             variants=None, params=None, crossfit_first: bool = False) -> dict:
+             variants=None, params=None, crossfit_first: bool = False,
+             fill_unfolded: bool = False) -> dict:
     """Walk-forward xG for each variant and the pre-registered comparison
-    with MoneyPuck. Read-only."""
+    with MoneyPuck. Read-only. crossfit_first and fill_unfolded (PRIMARY
+    only) fill the shots no fold scores, for the downstream test; the gate
+    scores fold seasons only either way."""
     if shots is None:
         from features.xg import load_shots
         shots = load_shots()
@@ -406,12 +433,13 @@ def evaluate(shots: pd.DataFrame = None, feats: pd.DataFrame = None,
     for v in variants:
         logger.info(f"xG variant {v} ({len(VARIANTS[v])} features)")
         wf = walk_forward_xg(shots, feats, VARIANTS[v], params,
-                             crossfit_first=crossfit_first and v == PRIMARY)
+                             crossfit_first=crossfit_first and v == PRIMARY,
+                             fill_unfolded=fill_unfolded and v == PRIMARY)
         p = wf["oof"]
         held = np.isin(shots["season"].to_numpy(),
                        [f["val_season"] for f in wf["folds"]])
         sel = held & ~np.isnan(p) & ~np.isnan(mp)
-        out = {"folds": wf["folds"], "oof": p,
+        out = {"folds": wf["folds"], "filled": wf["filled"], "oof": p,
                "excluded_no_mp": int((held & np.isnan(mp)).sum())}
         out["pooled"] = compare(y[sel], p[sel], mp[sel],
                                 shots["game_id"].to_numpy()[sel])
@@ -596,7 +624,7 @@ def run_downstream(shots: pd.DataFrame = None, cache: Path = None) -> dict:
     if shots is None:
         shots = load_shots()
     shots = shots.reset_index(drop=True)
-    ev = evaluate(shots, crossfit_first=True)
+    ev = evaluate(shots, crossfit_first=True, fill_unfolded=True)
     shots = shots.copy()
     shots[XG_COL] = ev["variants"][PRIMARY]["oof"]
     missing = int(np.isnan(shots[XG_COL]).sum())
