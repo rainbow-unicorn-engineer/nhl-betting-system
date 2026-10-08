@@ -198,8 +198,8 @@ training or in its scoring.
   market input and that season is scored by the market-blind fallback
   model, which the masking does not touch. 2025-26 vs DraftKings:
   +0.0024 (SE 0.0023), slightly worse than the experiment's +0.00004:
-  that fold trains on 2023-24, so it no longer learns from the leaked
-  prices and its probabilities move (by up to 0.08).
+  that fold's training includes 2023-24, so it no longer learns from
+  the leaked prices and its probabilities move (by up to 0.08).
   Backtests: 2024-25 identical to the experiment's V0 (every view). 2025-26
   DraftKings: 487 bets, -3.5% flat [-12.0%, +5.1%], quarter-Kelly -6.0%,
   max drawdown 35%, closing EV -4.2%. Edge buckets 2025-26: 2.5-4 225

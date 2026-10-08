@@ -35,7 +35,13 @@ pooled log loss over the same 6,993 games (re-run read-only 2026-10-07):
 0.6616 with the leak, 0.6648 without (2023-24 0.6453 -> 0.6593; the
 other seasons move by at most 0.002). The gate still passes. The 0.6616
 was too good: on the 106 in-play games the old model scored 0.453
-because it was reading the result off the price.
+because it was reading the result off the price. Against the consensus
+no-vig close (→ the books' closing price with their margin taken out)
+on the 2,412 priced games (2024-25 and 2025-26) this masked model's log
+loss is 0.0047 worse (SE 0.0025), and 0.0024 worse than DraftKings in
+2025-26 (SE 0.0023); 2025-26 DraftKings backtest 487 bets, -3.5% flat
+[-12.0%, +5.1%] (models.moneyline_v3.production_check, 2026-10-08;
+the experiment's leaky-trained V0 had +0.0037 and 401 bets, -1.3%).
 
 Benchmarks reported per fold: naive (train home-win rate) and the market
 itself (scored on market_available games). The Phase 2 baseline is the
