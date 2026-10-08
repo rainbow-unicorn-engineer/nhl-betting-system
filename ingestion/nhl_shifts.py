@@ -85,13 +85,39 @@ backfill passes only if all hold, and each miss is reported):
   S3  in 'ok' games, the median absolute gap between a skater's summed
       shift durations and raw.skater_games.toi_seconds is at most 5 seconds.
 
-STATUS (backfill finished 2026-10-05, live database): 9,384 of 9,384
+STATUS (backfill finished 2026-10-05, live database): 7,984 of 7,984
 finished games 2020-21 to 2026-10-05 fetched 'ok', 6,098,180 shifts.
 S1 pass (100% in every season; 57 games of April 2025 came from the HTML
 fallback, without which 2024-25 was 95.9%). S2 pass (1 of 304,309
 player-games who played has no shift: 1 second of ice time). S3 pass
 (median gap 0 seconds in every season). Per-season table:
 docs/data_sources.md, section 2.13.
+
+But S3's median hid a bad tail, found by an independent check on
+2026-10-06 (the backfill stored the source faithfully; the source was
+wrong): 19,203 repeated shift rows in 1,537 games, 1,371 rows of other
+teams in 2 games (2021020513: a third copy of its own shifts under the
+codes STL and MIN; 2025020565: game 2024020565's shifts, the same game
+number a season earlier), and 923 games with a skater more than 60 s
+from his box-score ice time (2.1% of skater-games more than 5 s off).
+clean_rows, the QA check and 'suspect' came from that.
+
+REPAIR (2026-10-07; rehearsed on a full copy of the live tables, and the
+numbers are the copy's; NOT YET RUN on the live database, which needs
+`--recheck` and then `--retry-empty`; backup taken first,
+data/backups/shifts_before_repair_20261007.dump):
+  --recheck      deletes 18,499 repeated and 1,371 wrong-team rows (both
+                 cross-game games keep 704 and 746 shifts of their own
+                 teams and pass the QA check; a re-fetch gives the same
+                 rows); 7,908 ok, 76 suspect.
+  --retry-empty  the 76 suspect games: 72 pass from the HTML reports, 1
+                 from the API, 3 stay suspect (2020020124, 2020020252,
+                 2021020326: the HTML reports disagree with the box score
+                 too).
+  After: 7,981 ok, 3 suspect, 6,078,021 shifts, 0 repeated or wrong-team
+  rows; in ok games 0 skater-games more than 60 s off and 889 of 287,225
+  (0.31%) more than 5 s off. S1 still passes (lowest 2020-21, 950 of 952);
+  S2 0 of 304,309; S3 median 0 s. `--report` prints these per season.
 
 `python -m ingestion.nhl_shifts --help`; `--report` prints coverage by
 season without fetching anything.

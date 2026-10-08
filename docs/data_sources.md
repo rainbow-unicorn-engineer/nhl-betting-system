@@ -247,12 +247,26 @@ Three loaders, no key, no credits. Each keeps a fetch log, so a stopped run pick
 | 2024-25 | 1,398 | 1,398 | 57 | 1,062,042 | 0 of 53,273 | 0 s |
 | 2025-26 | 1,394 | 1,394 | 0 | 1,052,966 | 1 of 53,124 | 0 s |
 | 2026-27 (to 2026-10-05) | 39 | 39 | 0 | 29,936 | 0 of 1,483 | 0 s |
-| **Total** | **9,384** | **9,384** | **57** | **6,098,180** | **1** | |
+| **Total** | **7,984** | **7,984** | **57** | **6,098,180** | **1** | |
 
-"Finished games" are regular-season and playoff games marked final in `raw.games` (preseason is not loaded).
+"Finished games" are regular-season and playoff games marked final in `raw.games` (`game_state` FINAL or OFF, as everywhere else in the repo; preseason is not loaded). This table is the backfill as first loaded; the repair below changes it.
 
 - **Checks:** S1 at least 99% of each season's games end "ok": **pass** (100% in every season, after the fallback below). S2 players who played but have no shift at most 0.5%: **pass** (1 of 304,309; a skater credited with 1 second of ice time in NSH-COL on 2025-12-09). S3 median gap between summed shift durations and box-score ice time at most 5 seconds: **pass** (0 seconds in every season).
 - **Odd:** the shift-chart API returns `{"data": [], "total": 0}` for 57 games at the end of the 2024-25 regular season (2025-04-08 to 2025-04-15; checked again by hand on 2024021235). The NHL's HTML time-on-ice reports for those games are complete, so the loader now falls back to them (three requests a game: the two reports and the boxscore for sweater numbers). On a test game the HTML shifts summed to every skater's box-score ice time exactly. Those 57 games are marked `source = 'html'` in `raw.shift_fetches` and their rows have no `nhl_shift_id`. Without the fallback 2024-25 would have been at 95.9% and failed S1.
+- **Bad rows in the source (found 2026-10-06, after the table above):** S3 tests the median gap, and the median could not see a bad tail. The shift API sometimes sends the same shift twice (same player, period and start time under two NHL row ids) and, for two games, rows of other teams, all looking normal. The backfill stored them as sent:
+  - 19,203 repeated rows in 1,537 games;
+  - 1,371 rows of other teams in 2 games. In 2021020513 (NYI-WSH) the STL and MIN rows were a third copy of the game's own shifts under the wrong team codes. In 2025020565 (NJD-BUF) the VGK and SJS rows were game 2024020565's shifts: the same game number a season earlier;
+  - 923 games with at least one skater more than 60 seconds from his box-score ice time, and 2.1% of skater-games more than 5 seconds off. The worst was 4,485 seconds of shifts against 1,495 seconds of ice time.
+- **The fix:** the loader now drops rows of any team not in the game and keeps one row per player, period and start time (the lowest NHL row id). Then a per-game QA check (→ quality check) compares each skater's summed shifts with his box-score ice time. A full game where any skater is more than 60 seconds off, or that has no box score yet, is stored as **`suspect`**, not `ok`, and tries the HTML reports, which replace the API's shifts only when they pass the same check. **A feature should read `ok` games only.** `--recheck` cleans and re-checks the rows already stored without fetching anything; `--game ID` fetches one game again.
+- **The repair (2026-10-07):** rehearsed on a full copy of the live tables; the numbers below are from that copy. The live tables are backed up (`data/backups/shifts_before_repair_20261007.dump`) but **not repaired yet**: running the same two commands on the live database does it (about 2 minutes, then about 2 minutes of requests; `--retry-empty` also loads any game finished since).
+
+| Step | Rows deleted | ok | suspect | Shifts after |
+|---|---|---|---|---|
+| Before | | 7,984 | 0 | 6,098,180 |
+| `--recheck` | 18,499 repeated, 1,371 other teams' | 7,908 | 76 | 6,078,310 |
+| `--retry-empty` (the 76 suspect games fetched again) | | 7,981 | 3 | 6,078,021 |
+
+  Of the 76, 72 passed from the HTML reports and 1 from the API. The 3 left (2020020124, 2020020252, 2021020326) fail from both sources. The two cross-game games keep 704 and 746 shifts of their own teams and pass the check; fetching them again gives the same rows. After the repair: no repeated or wrong-team rows, no skater-game in an `ok` game more than 60 seconds off, 889 of 287,225 (0.31%) more than 5 seconds off; S1 still passes (lowest: 2020-21, 950 of 952), S2 0 of 304,309, S3 median 0 seconds. `--report` now prints the tail too: skater-games more than 5 and 60 seconds off, repeated rows and wrong-team rows, per season.
 
 #### Scratches and officials → `raw.game_scratches`, `raw.game_officials`, `raw.game_info`
 
@@ -269,11 +283,11 @@ Three loaders, no key, no credits. Each keeps a fetch log, so a stopped run pick
 | 2024-25 | 1,398 | 1,398 | 8,917 | 5,597 | 5 (3 referees) |
 | 2025-26 | 1,394 | 1,394 | 9,435 | 5,574 | 1 (1 referee) |
 | 2026-27 (to 2026-10-05) | 39 | 39 | 205 | 156 | 0 |
-| **Total** | **9,384** | **9,384** | **54,441** | **31,937** | **13** |
+| **Total** | **7,984** | **7,984** | **54,441** | **31,937** | **13** |
 
 About 6.5 to 7 scratches per game (both teams together); 2020-21 runs higher (8.3), probably because teams carried taxi squads that season (→ extra players kept with the team during COVID; a guess, not checked). Across the six seasons there are 55 different referees and 58 different linesmen.
 
-- **Checks:** G1 at least 99% of each season's games "ok": **pass** (100%). G2 at least 98% of "ok" games list exactly 2 referees: **pass** (13 of 9,384 do not, 0.14%; probably a referee hurt and replaced, or one who could not work the game: not checked). G3 no scratched player appears in that game's box score: **pass** (0).
+- **Checks:** G1 at least 99% of each season's games "ok": **pass** (100%). G2 at least 98% of "ok" games list exactly 2 referees: **pass** (13 of 7,984 do not, 0.16%; probably a referee hurt and replaced, or one who could not work the game: not checked). G3 no scratched player appears in that game's box score: **pass** (0).
 
 #### Kalshi → `raw.kalshi_markets`, `raw.kalshi_candles`
 
@@ -289,8 +303,8 @@ About 6.5 to 7 scratches per game (both teams together); 2020-21 runs higher (8.
 | Not matched to a game | 122 | 244 | 244 | 16,267 | 0 | — |
 
 - **Checks:** K1 every event has exactly two markets: **pass** (0 exceptions). K2 at least 95% of 2025-26 and 2026-27 games played have an event: **pass** (2025-26: 1,392 of 1,394, 99.9%; 2026-27: 39 of 39). K3 the settled result agrees with `raw.games`: **pass** (3,028 of 3,028 markets). K4 at least 90% of matched settled games have a two-sided close (bid above 0 and ask below 1 on both sides): **pass** (100% in each season).
-- **Close against DraftKings:** on the 1,012 games of 2025-26 with a DraftKings closing moneyline in `raw.historical_odds`, Kalshi's close (mid-price, both sides scaled to sum to 1) and DraftKings' no-vig close differ by 0.55 points of probability at the median, 1.6 points at the 95th percentile, and never by more than 8 points; the mean difference is −0.04 points. So the close is a pre-game price, not an in-play one. The median bid-ask spread at the close is 1 cent, and buying both sides at the ask costs about 1-2 cents over $1 (the exchange's equivalent of the vig) before the fee.
-- **Odd:** two 2025-26 playoff games are missing from Kalshi's game series (2026-05-03 MTL at TBL and 2026-05-18 MTL at BUF, both game 7s). The 122 unmatched events are preseason games (September and early October, not in `raw.games`) and LA at CBJ on 2026-01-26, which has no game on that date in `raw.games` (Kalshi's rule: a game not started within 48 hours settles both sides at a "fair price"); Kalshi settled it (0.48 / 0.52, result `scalar`). Kalshi's history moved to a `/historical/` path for markets settled before its cutoff (2026-08-05 when checked); `--backfill` lists both.
+- **Close against DraftKings:** on the 1,012 games of 2025-26 with a DraftKings closing moneyline in `raw.historical_odds`, Kalshi's close (mid-price, both sides scaled to sum to 1) and DraftKings' no-vig close differ by 0.55 points of probability at the median, 1.6 points at the 95th percentile, and never by more than 4.8 points; the mean difference is −0.04 points. So the close is a pre-game price, not an in-play one. The median bid-ask spread at the close is 1 cent, and buying both sides at the ask costs about 1-2 cents over $1 (the exchange's equivalent of the vig) before the fee.
+- **Odd:** two 2025-26 playoff games are missing from Kalshi's game series (2026-05-03 MTL at TBL and 2026-05-18 MTL at BUF, both game 7s). The 122 unmatched events are preseason games (September and early October, not in `raw.games`) and LA at CBJ on 2026-01-26, which has no game on that date in `raw.games` (Kalshi's rule: a game not started within 48 hours settles both sides at a "fair price"); Kalshi settled it (0.48 / 0.52, result `scalar`). A market fetched before its game is in `raw.games` gets hourly candles only (`candles_problem` says so); it is fetched again once its game is matched, so its 1-minute close is never missing (none were, when checked). Kalshi's history moved to a `/historical/` path for markets settled before its cutoff (2026-08-05 when checked); `--backfill` lists both.
 
 ---
 
