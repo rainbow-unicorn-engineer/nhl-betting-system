@@ -238,6 +238,7 @@ import pandas as pd
 from betting.engine import (DEFAULT_MAX_DAILY_PCT, DEFAULT_MAX_GAME_STAKE_PCT,
                             DEFAULT_MAX_STAKE_PCT, EDGE_MIN_ML,
                             effective_decimal, evaluate_market, settle)
+from features.market_prices import clear_market
 
 logger = logging.getLogger("nhl.models.moneyline_v3")
 
@@ -581,7 +582,7 @@ def load_inputs() -> dict:
 
     from config.settings import engine
     from features.goalie_role import defending_role_frame, load_appearances
-    from features.market_prices import load_market_prices
+    from features.market_prices import load_inplay_game_ids, load_market_prices
     from features.power_play import compute_pp_rolling, load_pp_base, pp_diffs
     from models.baseline import load_dataset
 
@@ -596,19 +597,12 @@ def load_inputs() -> dict:
         """), conn, params={"ids": [int(i) for i in meta["game_id"]]})
         pp_base = load_pp_base(conn)
         app = load_appearances(conn)
-        unibet = pd.read_sql(text("""
-            SELECT h.game_id, g.season, g.date, h.home_ml, h.away_ml,
-                   h.over_under
-            FROM raw.historical_odds h JOIN raw.games g USING (game_id)
-            WHERE h.provider = 'Unibet'
-              AND h.home_ml IS NOT NULL AND h.away_ml IS NOT NULL
-        """), conn)
+        inplay = load_inplay_game_ids(conn)
     games = meta[["game_id"]].merge(games, on="game_id", how="left")
     games["date"] = pd.to_datetime(games["date"])
     pp = pp_diffs(games, compute_pp_rolling(pp_base)).reset_index(drop=True)
     home_def, away_def = defending_role_frame(games, app)
     roles = role_diffs(home_def, away_def)
-    inplay = unibet.loc[unibet_inplay_mask(unibet), "game_id"].tolist()
     return {"X": X, "y": y, "meta": meta, "names": names, "market": market,
             "pp": pp, "roles": roles, "unibet_inplay_ids": inplay}
 
@@ -670,37 +664,8 @@ def walk_forward(X, y, meta, names, seed: int = SEED,
 #    adoptable, see STATUS) ──────────────────────────────────────────
 
 UNIBET_LAST_SEASON = 20232024
-UNIBET_MAX_ABS_ML = 1000          # |moneyline| at or above: captured in play
-UNIBET_MIN_IMPLIED_SUM = 0.75     # both sides long: a tied game in play
-UNIBET_TOTAL_RANGE = (5.0, 7.0)   # pre-game NHL totals; NULL is kept
-UNIBET_INPLAY_FROM = {20232024: pd.Timestamp("2024-04-08")}
-
-
-def unibet_inplay_mask(df: pd.DataFrame) -> pd.Series:
-    """True for an ESPN Unibet row captured during the game, or inside the
-    late-2023-24 stretch where about half the rows were. df: season, date,
-    home_ml, away_ml, over_under."""
-    from features.util import american_implied_prob
-    h, a = df["home_ml"].astype(float), df["away_ml"].astype(float)
-    big = (h.abs() >= UNIBET_MAX_ABS_ML) | (a.abs() >= UNIBET_MAX_ABS_ML)
-    s = h.map(american_implied_prob) + a.map(american_implied_prob)
-    ou = df["over_under"].astype(float)
-    lo, hi = UNIBET_TOTAL_RANGE
-    bad_total = ou.notna() & ((ou < lo) | (ou > hi))
-    window = pd.Series(False, index=df.index)
-    d = pd.to_datetime(df["date"])
-    for season, start in UNIBET_INPLAY_FROM.items():
-        window |= (df["season"] == season) & (d >= start)
-    return big | (s < UNIBET_MIN_IMPLIED_SUM) | bad_total | window
-
-
-def drop_market(X: np.ndarray, names: list, game_ids, drop_ids) -> np.ndarray:
-    """Copy of X with the listed games set to 'no market' (0.5, 0)."""
-    X = X.copy()
-    rows = pd.Series(np.asarray(game_ids)).isin(set(drop_ids)).to_numpy()
-    X[rows, names.index("market_home_prob")] = 0.5
-    X[rows, names.index("market_available")] = 0.0
-    return X
+# The in-play rule (features.market_prices.inplay_mask, shared with the
+# production market feature) flags 106 Unibet 2023-24 games.
 
 
 def unibet_mapper(y: np.ndarray, names: list, unibet_rows: np.ndarray,
@@ -736,7 +701,7 @@ def diagnostic_runs(X1, names, y, meta, unibet_inplay_ids) -> dict:
     ids = meta["game_id"].to_numpy()
     avail = X1[:, names.index("market_available")] == 1.0
     uni = avail & (season <= UNIBET_LAST_SEASON)
-    X1c = drop_market(X1, names, ids, unibet_inplay_ids)
+    X1c = clear_market(X1, names, ids, unibet_inplay_ids)
     uni_c = (X1c[:, names.index("market_available")] == 1.0) & (season <= UNIBET_LAST_SEASON)
     return {"V1m": (X1, names, unibet_mapper(y, names, uni)),
             "V1mc": (X1c, names, unibet_mapper(y, names, uni_c))}
@@ -804,6 +769,14 @@ def score_variants(y, meta, oofs: dict, market: pd.DataFrame,
     return out
 
 
+def subset(y, meta, oofs: dict, v0_avail, rows: np.ndarray) -> tuple:
+    """(y, meta, oofs, v0_avail) restricted to a boolean row mask, for
+    re-scoring on a subset of games (the clean games: every game except
+    the in-play ones)."""
+    return (y[rows], meta[rows].reset_index(drop=True),
+            {k: v[rows] for k, v in oofs.items()}, v0_avail[rows])
+
+
 def priced_frame(meta, market, prob: np.ndarray) -> pd.DataFrame:
     p = meta[["game_id"]].assign(prob_home=prob)
     df = market.merge(p, on="game_id", how="inner")
@@ -865,7 +838,7 @@ def timing_study(fm: dict, X, names, meta, market, oof_close: np.ndarray) -> dic
     mk, mend, mdd = simulate_kelly(mb)
     ck, cend, cdd = simulate_kelly(cb)
     return {"games": int(len(df)),
-            "close_model_matches_oof": float(np.nanmax(np.abs(df["p_close"] - df["oof"]))),
+            "close_model_max_abs_diff_vs_oof": float(np.nanmax(np.abs(df["p_close"] - df["oof"]))),
             "H1": h1, "H2": h2,
             "H3": arm_difference(df["game_id"], mb, cb),
             "morning_arm": summarize_bets(mb, mk, mend, mdd),
@@ -902,6 +875,18 @@ def run_all(seeds: Iterable[int] = ROBUST_SEEDS, save: bool = True) -> dict:
                    - per_game_log_loss(y, np.nan_to_num(oofs["V1"], nan=0.5)))
                   [~np.isnan(oofs["V0"])]) for k in doofs}
 
+    # The same scores on the clean games only: every game except the 106
+    # whose stored Unibet line was captured in play (it leaks the result
+    # into the market input of V0-V3). Reported next to the pre-registered
+    # numbers, which used every game as stored.
+    clean = ~meta["game_id"].isin(set(inp["unibet_inplay_ids"])).to_numpy()
+    cy, cmeta, coofs, cv0 = subset(y, meta, {**oofs, **doofs}, v0_avail, clean)
+    res["scores_clean"] = score_variants(cy, cmeta, coofs, market, cv0)
+    res["diagnostics_pairwise_vs_V1_clean"] = {
+        k: paired((per_game_log_loss(cy, np.nan_to_num(coofs[k], nan=0.5))
+                   - per_game_log_loss(cy, np.nan_to_num(coofs["V1"], nan=0.5)))
+                  [~np.isnan(coofs["V0"])]) for k in doofs}
+
     res["robustness"] = {}
     for s in seeds:
         so = {}
@@ -915,6 +900,9 @@ def run_all(seeds: Iterable[int] = ROBUST_SEEDS, save: bool = True) -> dict:
             k: {"log_loss": v["log_loss"], "vs_v0": v["vs_v0"],
                 "vs_market": v["vs_market"]} for k, v in sc["variants"].items()}
         res["robustness"][str(s)]["decision"] = sc["decision"]
+        res["robustness"][str(s)]["decision_clean"] = score_variants(
+            *subset(y, meta, so, v0_avail, clean)[:3], market,
+            v0_avail[clean])["decision"]
 
     res["backtests"] = {k: run_backtests(priced_frame(meta, market, o))
                         for k, o in {**oofs, **doofs}.items()}
@@ -953,6 +941,20 @@ def report(res: dict) -> str:
             f"(SE {b['se']:.5f}, n {b['n']}) | priced LL {v['log_loss_priced']:.5f}")
     lines.append(f"Decision: {sc['decision']['chosen']} — "
                  + "; ".join(sc["decision"]["steps"]))
+    if "scores_clean" in res:
+        cs = res["scores_clean"]
+        lines.append(f"Clean games (in-play rows left out): {cs['n_scored']} "
+                     f"scored, {cs['n_priced']} priced")
+        for k, v in cs["variants"].items():
+            a, b = v["vs_v0"], v["vs_market"]
+            lines.append(
+                f"{k:4s} clean LL {v['log_loss']:.5f} | vs V0 {a['mean']:+.5f} "
+                f"(SE {a['se']:.5f}) | vs market {b['mean']:+.5f} "
+                f"(SE {b['se']:.5f}) | by season "
+                + str({s: round(x, 4) for s, x in v['by_season'].items()}))
+        for k, d in res.get("diagnostics_pairwise_vs_V1_clean", {}).items():
+            lines.append(f"{k} - V1 clean {d['mean']:+.5f} (SE {d['se']:.5f})")
+        lines.append(f"Clean decision: {cs['decision']['chosen']}")
     for k, v in res.get("diagnostics", {}).items():
         a, b = v["vs_v0"], v["vs_market"]
         lines.append(
@@ -963,8 +965,10 @@ def report(res: dict) -> str:
     for s, r in res.get("robustness", {}).items():
         lines.append(f"seed {s}: " + ", ".join(
             f"{k} {v['vs_v0']['mean']:+.5f}/{v['vs_v0']['se']:.5f}"
-            for k, v in r.items() if k != "decision")
-            + f" -> {r['decision']['chosen']}")
+            for k, v in r.items() if k not in ("decision", "decision_clean"))
+            + f" -> {r['decision']['chosen']}"
+            + (f" (clean {r['decision_clean']['chosen']})"
+               if "decision_clean" in r else ""))
     for k, views in res["backtests"].items():
         for view, r in views.items():
             if r.get("bets"):

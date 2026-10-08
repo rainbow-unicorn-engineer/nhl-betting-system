@@ -233,28 +233,30 @@ def test_walk_forward_matches_lgbm_fold_api():
 
 # ── Post-hoc diagnostics (V1m, V1mc) ────────────────────────────────
 
-def test_unibet_inplay_mask_flags_each_contamination_sign():
-    df = pd.DataFrame({
-        "season": [20222023, 20222023, 20222023, 20222023, 20222023,
-                   20232024, 20232024],
-        "date": ["2023-01-05"] * 5 + ["2024-03-01", "2024-04-10"],
-        "home_ml": [-150, -1200, 400, -150, -150, -150, -150],
-        "away_ml": [130, 700, 350, 130, 130, 130, 130],
-        "over_under": [6.0, 6.0, 6.0, 8.5, None, 6.0, 6.0],
-    })
-    got = V.unibet_inplay_mask(df).tolist()
-    # clean, |ML| >= 1000, both sides long (implied sum < 0.75),
-    # total outside 5-7, NULL total kept, clean 2023-24, late-2023-24 window
-    assert got == [False, True, True, True, False, False, True]
-
-
-def test_drop_market_only_touches_listed_games():
+def test_diagnostics_use_the_shared_inplay_rule():
+    """V1mc clears the in-play games with the same function the production
+    market feature uses (features.market_prices.clear_market)."""
+    import features.market_prices as MP
+    assert V.clear_market is MP.clear_market
     names = ["f", "market_home_prob", "market_available"]
-    X = np.array([[1.0, 0.6, 1.0], [2.0, 0.4, 1.0], [3.0, 0.7, 1.0]])
-    out = V.drop_market(X, names, [10, 11, 12], [11])
-    assert out[1].tolist() == [2.0, 0.5, 0.0]
-    assert out[[0, 2]].tolist() == X[[0, 2]].tolist()
-    assert X[1, 1] == 0.4                     # the input is not changed
+    X = np.array([[1.0, 0.9, 1.0], [2.0, 0.6, 1.0]])
+    y = np.array([1, 0])
+    meta = pd.DataFrame({"game_id": [5, 6], "season": [20232024, 20232024]})
+    d = V.diagnostic_runs(X, names, y, meta, [5])
+    assert d["V1m"][0].tolist() == X.tolist()
+    assert d["V1mc"][0][0].tolist() == [1.0, 0.5, 0.0]
+    assert d["V1mc"][0][1].tolist() == X[1].tolist()
+
+
+def test_subset_keeps_rows_aligned():
+    y = np.array([1, 0, 1])
+    meta = pd.DataFrame({"game_id": [7, 8, 9], "season": 1})
+    oofs = {"V0": np.array([0.6, 0.4, 0.7]), "V1": np.array([0.5, 0.5, 0.5])}
+    rows = np.array([True, False, True])
+    cy, cmeta, coofs, cav = V.subset(y, meta, oofs, np.array([1, 1, 0]) == 1, rows)
+    assert cy.tolist() == [1, 1] and cmeta["game_id"].tolist() == [7, 9]
+    assert list(cmeta.index) == [0, 1]
+    assert coofs["V0"].tolist() == [0.6, 0.7] and cav.tolist() == [True, False]
 
 
 def test_unibet_mapper_fits_on_training_rows_only():
