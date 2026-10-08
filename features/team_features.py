@@ -71,7 +71,7 @@ skater_toi AS (
     FROM raw.skater_games
     GROUP BY game_id, team
 )
-SELECT s.game_id, s.season, s.date, s.team, s.is_home, s.gf, s.ga,
+SELECT s.game_id, s.season, s.date, s.team, s.opp, s.is_home, s.gf, s.ga,
        tg.sog            AS sog_for,
        tgo.sog           AS sog_against,
        tg.faceoff_wins   AS fow,
@@ -100,12 +100,20 @@ ORDER BY s.team, s.season, s.date, s.game_id
 """
 
 
-def load_base(season: Optional[int] = None) -> pd.DataFrame:
-    """Load the per-(game, team) base frame of raw counting stats."""
+def load_base(season: Optional[int] = None,
+              xg_sums: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Load the per-(game, team) base frame of raw counting stats.
+
+    xg_sums (optional; models/xg.py's downstream test): per (game_id, team)
+    `xg` and `pp_xg` from another per-shot xG column
+    (features.xg.team_xg_sums). They replace MoneyPuck's xgf, xga, pp_xgf
+    and pk_xga before the masking below; nothing else changes."""
     season_filter = "AND season = :season" if season else ""
     sql = BASE_SQL.format(season_filter=season_filter)
     with engine.connect() as conn:
         df = pd.read_sql(text(sql), conn, params={"season": season} if season else {})
+    if xg_sums is not None:
+        df = replace_xg(df, xg_sums)
 
     # Derived per-game quantities
     df["cf"] = df["ff"] + df["blocks_opp"]        # attempts = fenwick + blocked
@@ -121,6 +129,20 @@ def load_base(season: Optional[int] = None) -> pd.DataFrame:
         either_nan = df[a].isna() | df[b].isna()
         df.loc[either_nan, [a, b]] = np.nan
     return df
+
+
+def replace_xg(df: pd.DataFrame, xg_sums: pd.DataFrame) -> pd.DataFrame:
+    """Pure: swap the base frame's xG columns for xg_sums' (game_id, team,
+    xg, pp_xg). A team-game with no row in xg_sums gets NaN, as the SQL's
+    LEFT JOIN gives NULL."""
+    own = xg_sums[["game_id", "team", "xg", "pp_xg"]].rename(
+        columns={"xg": "xgf", "pp_xg": "pp_xgf"})
+    opp = xg_sums[["game_id", "team", "xg", "pp_xg"]].rename(
+        columns={"team": "opp", "xg": "xga", "pp_xg": "pk_xga"})
+    out = df.drop(columns=["xgf", "xga", "pp_xgf", "pk_xga"])
+    out = out.merge(own, on=["game_id", "team"], how="left")
+    out = out.merge(opp, on=["game_id", "opp"], how="left")
+    return out
 
 
 # Columns summed over each rolling window

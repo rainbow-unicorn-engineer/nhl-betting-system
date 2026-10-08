@@ -738,7 +738,8 @@ def drift_decision(pooled: dict, folds: list) -> dict:
 
 def run_props(register: bool = False, frame: pd.DataFrame = None,
               params=None, drift_correct_m: bool | None = None,
-              variant: str | None = None) -> dict:
+              variant: str | None = None,
+              features: list | None = None) -> dict:
     """Walk-forward evaluation of M, B1, B0 and B3 (module docstring).
     variant (default DEFAULT_VARIANT): one of VARIANTS, i.e. the booster's
     features and its offset (B1 or B3); the gate is always against B1.
@@ -746,7 +747,9 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
     no correction) and M2 (in-season drift correction, relative to the
     variant's offset); "M" — the model the gate and the output speak for —
     is M2 when drift_correct_m (default DRIFT_CORRECT), else M1.
-    register=True raises: there is no registry entry for this model."""
+    register=True raises: there is no registry entry for this model.
+    features: override the variant's input columns (models/xg.py's props
+    test adds its player xG columns to variant P0's)."""
     if register:
         raise RuntimeError(
             "props_sog registration is disabled: the model has not passed "
@@ -757,8 +760,7 @@ def run_props(register: bool = False, frame: pd.DataFrame = None,
     if variant not in VARIANTS:
         raise ValueError(f"unknown variant {variant!r} (have {sorted(VARIANTS)})")
     spec = VARIANTS[variant]
-    feats = spec["features"]
-
+    feats = list(spec["features"] if features is None else features)
     df = load_props_dataset(frame)
     X = df[feats].to_numpy(dtype=float)
     y = df["sog"].to_numpy(dtype=float)

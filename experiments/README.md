@@ -24,6 +24,7 @@ Terms used below:
 | 2026-10-05 | Props model v3: power-play (PP → his team has an extra skater after an opponent's penalty) features (P1), usage proxies (P2), a fixed exposure baseline B3 (P3) | `models/props_sog.py` (`VARIANTS`, `--v3`), `features/player_shots.py`, `models/props_market_check.py` | P3 adopted by its rule: beats v2 by 0.0018 log loss a player-game (~13 SE, 5/5 seasons). P1 helped narrowly (−2.4 SE); P2 added nothing. B3 is a better baseline but did not remove the +0.05 shots-a-game over-prediction. Market check re-run on every shots price row (incl. late playoffs): still does NOT beat the market (pooled +0.0021 log loss, SE 0.0012; v2 was +0.0053). The gap is in per-player means, not level or spread. Registration stays off. |
 | 2026-10-04 | Same-game parlay joint pricer: win x over/under (variants A-F) | `betting/sgp.py` | Fails: no variant beats multiplying the two chances (A +0.00005 ± 0.00046 log loss over 2,408 games; best z +0.10). Underpowered by nature: an exactly right model would need ~30,000 games to pass. The checker keeps withholding same-game verdicts. |
 | 2026-10-04 | TabPFN (pretrained table model from Hugging Face) for the moneyline: A feature, B market residual, C average with lgbm v2 | `experiments/tabpfn/` (separate `tabpfn` dependency group) | No variant passes: 0/5 seasons beat lgbm v2 by 2 SE. Best was C, a tie (+0.0001 ± 0.0005). All lose to the no-vig market. lgbm v2 stays. |
+| 2026-10-04 | Our own expected-goals (xG) model, Layer A (variants X1 core, X2 + prior attempt) | `features/xg.py`, `models/xg.py` (opt-in) | Fails its gate vs MoneyPuck's xG on 605k held-out shots: AUC 0.761 vs 0.787, log loss +0.0086 (SE 0.0002); better calibrated (ECE 0.005 vs 0.011). Downstream: moneyline log loss +0.0018 (SE 0.0008) worse with our xG; props unchanged, and player xG features don't help props at all. Not adopted; MoneyPuck's xG stays. |
 
 ## Re-running
 
@@ -35,6 +36,7 @@ Terms used below:
 .venv\Scripts\python -m models.totals --v3           # totals v3 experiment vs the market (read-only, ~20 s)
 .venv\Scripts\python -m betting.sgp --evaluate          # same-game parlay pricer vs independence (read-only)
 .venv\Scripts\python -m experiments.tabpfn.run         # TabPFN trial (read-only; needs the tabpfn group and its weights, see experiments/tabpfn/README.md)
+.venv\Scripts\python -m models.xg --downstream          # our xG vs MoneyPuck, then the moneyline and props test (read-only)
 ```
 
 The goalie variants run from Python: `models.totals.run_totals(register=False, variant="C", with_roles=True)`.

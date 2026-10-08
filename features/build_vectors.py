@@ -104,6 +104,11 @@ def _load_team_wide(season: Optional[int]) -> pd.DataFrame:
             JOIN raw.games g USING (game_id)
             WHERE TRUE {season_filter}
         """), conn, params={"season": season} if season else {})
+    return team_wide(tr)
+
+
+def team_wide(tr: pd.DataFrame) -> pd.DataFrame:
+    """Pure: team_rolling rows pivoted to one row per (game_id, team)."""
     tr = tr.astype({c: float for c in TEAM_STATS + ["games_played"]})
     wide = tr.pivot(index=["game_id", "team"], columns="window_size",
                     values=TEAM_STATS + ["games_played"])
@@ -138,6 +143,11 @@ def _load_goalie_wide(season: Optional[int]) -> pd.DataFrame:
             JOIN raw.games g USING (game_id)
             WHERE TRUE {season_filter}
         """), conn, params={"season": season} if season else {})
+    return goalie_wide(gr)
+
+
+def goalie_wide(gr: pd.DataFrame) -> pd.DataFrame:
+    """Pure: goalie_rolling rows pivoted to one row per (game_id, goalie_id)."""
     gr = gr.astype({c: float for c in GOALIE_STATS})
     wide = gr.pivot(index=["game_id", "goalie_id"], columns="window_size",
                     values=GOALIE_STATS)

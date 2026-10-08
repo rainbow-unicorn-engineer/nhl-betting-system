@@ -104,7 +104,7 @@ Terms used throughout (each is explained once, here):
 - **Code → tables:** `ingestion/moneypuck.py` → `raw.shots`.
 - **Used for:** xG for and against (chance quality) and goalie goals saved above expected (GSAx → goals a goalie stopped beyond what an average goalie would have, given the shots he faced). These feed `features/team_features.py` and `features/goalie_features.py`. MoneyPuck is **not** a betting model; it is an input.
 - **Pros:** the best free shot-level data; updated nightly in season.
-- **Cons:** one person's project (if it stops, our xG stops). Its xG model is theirs, so we can't change it. The non-commercial terms matter if this ever becomes a business.
+- **Cons:** one person's project (if it stops, our xG stops; `models/xg.py` is our own fallback model, trained on MoneyPuck's shot locations, but it is less sharp: AUC 0.761 vs 0.787, see `experiments/README.md`). Its xG model is theirs, so we can't change it. The non-commercial terms matter if this ever becomes a business.
 - **History:** 2007-08 onward. We load 2020-21 onward.
 
 **Available but unused** (all on [moneypuck.com/data.htm](https://moneypuck.com/data.htm)):
