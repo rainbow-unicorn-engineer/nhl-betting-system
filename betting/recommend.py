@@ -26,9 +26,10 @@ snapshot of each book (raw.odds_snapshots, at most MAX_ODDS_AGE_HOURS old);
 each side is then priced at the best available price across the books you
 can bet (BETTABLE_BOOKS; unset = every book) — line shopping. When no
 snapshot exists (e.g. simulation against history) the single reference
-line in raw.historical_odds is used for both. Games with no line anywhere
-are scored by the market-blind fallback model and never bet (an edge
-claimed against no market is untestable).
+line in raw.historical_odds is used for both, unless that line looks
+captured in play (features.market_prices.inplay_mask). Games with no
+line anywhere are scored by the market-blind fallback model and never
+bet (an edge claimed against no market is untestable).
 
 Frozen picks: a pick is issued ONCE per game, at the price of the
 snapshot it came from (priced_at). Later runs never re-price or delete it;
@@ -270,15 +271,30 @@ def load_market(game_ids: list, asof: Optional[datetime] = None,
         """), conn, params={"ids": list(map(int, game_ids)),
                             "cutoff": cutoff, "asof": asof})
         hist = pd.read_sql(text("""
-            SELECT game_id, provider AS book_name, home_ml AS home_price,
-                   away_ml AS away_price
-            FROM raw.historical_odds
-            WHERE game_id = ANY(:ids)
-              AND home_ml IS NOT NULL AND away_ml IS NOT NULL
+            SELECT h.game_id, h.provider AS book_name, h.home_ml AS home_price,
+                   h.away_ml AS away_price, h.provider, g.season, g.date,
+                   h.home_ml, h.away_ml, h.over_under
+            FROM raw.historical_odds h JOIN raw.games g USING (game_id)
+            WHERE h.game_id = ANY(:ids)
+              AND h.home_ml IS NOT NULL AND h.away_ml IS NOT NULL
         """), conn, params={"ids": list(map(int, game_ids))})
 
+    hist = pregame_lines(hist)
     hist = hist[~hist["game_id"].isin(snaps["game_id"])]
     return summarize_market(snaps, hist, books)
+
+
+def pregame_lines(hist: pd.DataFrame) -> pd.DataFrame:
+    """The raw.historical_odds fallback lines without any line that looks
+    captured during the game (features.market_prices.inplay_mask): such a
+    line already knows the score, so it is no market. hist: game_id,
+    book_name, home_price, away_price plus the mask's columns (provider,
+    season, date, home_ml, away_ml, over_under); returns the first four."""
+    from features.market_prices import inplay_mask
+    cols = ["game_id", "book_name", "home_price", "away_price"]
+    if hist.empty:
+        return hist.reindex(columns=cols)
+    return hist.loc[~inplay_mask(hist), cols]
 
 
 def summarize_market(snaps: pd.DataFrame, hist: pd.DataFrame,

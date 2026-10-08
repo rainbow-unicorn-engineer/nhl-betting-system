@@ -24,6 +24,19 @@ tails its step function overfits and *worsened* pooled OOF log loss by
 OOF predictions (thousands of games), not per fold. The validation season
 never touches booster, early stopping, or calibrator.
 
+In-play lines: 106 stored Unibet lines from late 2023-24 were captured
+during the game (→ in play: the price already reflects the score), which
+leaks the result into the market offset. load_training_set treats those
+games as having no market (features.market_prices.inplay_mask), for
+training and for scoring, so the evaluation and the production fit never
+learn from them, even before the stored vectors are rebuilt (the
+rebuilt vectors drop them too, features/build_vectors.py). Walk-forward
+pooled log loss over the same 6,993 games (re-run read-only 2026-10-07):
+0.6616 with the leak, 0.6648 without (2023-24 0.6453 -> 0.6593; the
+other seasons move by at most 0.002). The gate still passes. The 0.6616
+was too good: on the 106 in-play games the old model scored 0.453
+because it was reading the result off the price.
+
 Benchmarks reported per fold: naive (train home-win rate) and the market
 itself (scored on market_available games). The Phase 2 baseline is the
 registry row `baseline_logreg v1` (0.6829); the gate is beating it.
@@ -60,6 +73,23 @@ LGBM_PARAMS = {
     "random_state": 42,
     "verbosity": -1,
 }
+
+
+def load_training_set(drop_inplay_market: bool = True):
+    """models.baseline.load_dataset with every game whose stored historical
+    line looks captured in play set to 'no market' (market_home_prob 0.5,
+    market_available 0). drop_inplay_market=False returns the stored
+    vectors unchanged (the old, leaky inputs; for comparison only)."""
+    X, y, meta, names = load_dataset()
+    if drop_inplay_market and "market_available" in names:
+        from config.settings import engine
+        from features.market_prices import clear_market, load_inplay_game_ids
+        with engine.connect() as conn:
+            ids = load_inplay_game_ids(conn)
+        X = clear_market(X, names, meta["game_id"].to_numpy(), ids)
+        logger.info(f"{len(ids)} games with an in-play historical line "
+                    f"treated as having no market")
+    return X, y, meta, names
 
 
 def market_offset(X: np.ndarray, names: list) -> np.ndarray:
@@ -140,7 +170,7 @@ def predict_fold(fm: dict, X, base, available) -> np.ndarray:
     return np.where(available, p_m, p_f)
 
 
-def fit_production(cutoff_date=None) -> dict:
+def fit_production(cutoff_date=None, drop_inplay_market: bool = True) -> dict:
     """Train the two-regime scorer (market-offset M + market-blind F) on
     every labeled game strictly before cutoff_date, with the same time-tail
     early stopping + temperature scaling as a walk-forward fold.
@@ -151,7 +181,7 @@ def fit_production(cutoff_date=None) -> dict:
     """
     import pandas as pd
 
-    X, y, meta, names = load_dataset()
+    X, y, meta, names = load_training_set(drop_inplay_market)
     if cutoff_date is not None:
         mask = meta["date"] < pd.Timestamp(cutoff_date)
     else:
@@ -182,15 +212,17 @@ def score_production(prod: dict, X_new: np.ndarray, names_new: list) -> np.ndarr
     return predict_fold(prod["fm"], X_new, base, avail)
 
 
-def run_lgbm(register: bool = True, plot: bool = True) -> dict:
+def run_lgbm(register: bool = True, plot: bool = True,
+             drop_inplay_market: bool = True) -> dict:
     """Full walk-forward run of LightGBM + isotonic. Returns metrics.
     register=False writes nothing to the database; plot=False also leaves
     the committed calibration plot alone (betting/montecarlo.py uses both,
-    so its run changes nothing)."""
+    so its run changes nothing). drop_inplay_market=False reproduces the
+    old run on the leaky stored lines (load_training_set)."""
     from sklearn.metrics import (accuracy_score, brier_score_loss, log_loss,
                                  roc_auc_score)
 
-    X, y, meta, names = load_dataset()
+    X, y, meta, names = load_training_set(drop_inplay_market)
     folds = walk_forward_folds(meta)
     base = market_offset(X, names)
     mkt_prob_i = names.index("market_home_prob")

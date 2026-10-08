@@ -33,8 +33,11 @@ from raw.historical_odds (normalizing home/(home+away) — valid for both the
 2-way DraftKings era and the 3-way Unibet era, see docs/historical_odds.md).
 Games without a two-sided line (2024-25, where only a junk one-sided mirror
 survives) get 0.5 plus market_available = 0 so the model knows the market
-is silent rather than neutral. Live/opening lines from raw.odds_snapshots
-join in with the betting engine phase.
+is silent rather than neutral. A line that looks captured during the
+game (→ in play: the price already knows the score; 106 Unibet games in
+late 2023-24, features.market_prices.inplay_mask) is dropped the same
+way, so it never leaks a result into training. Live/opening lines from
+raw.odds_snapshots join in with the betting engine phase.
 
 Labels: home_win = home_score > away_score for FINAL games. Only FINAL
 games are materialized for now (scheduled-game vectors need confirmed
@@ -145,24 +148,37 @@ def _load_goalie_wide(season: Optional[int]) -> pd.DataFrame:
     return wide.reset_index()
 
 
+def market_from_odds(odds: pd.DataFrame) -> pd.DataFrame:
+    """Pure half of _load_market: no-vig home probability per game from
+    two-sided raw.historical_odds rows, leaving out every row that looks
+    captured in play (features.market_prices.inplay_mask), so that game
+    gets market_available = 0. odds: game_id, provider, season, date,
+    home_ml, away_ml, over_under."""
+    from features.market_prices import inplay_mask
+    if odds.empty:
+        return pd.DataFrame(columns=["game_id", "market_home_prob"])
+    odds = odds[~inplay_mask(odds)].copy()
+    ph = odds["home_ml"].map(american_implied_prob)
+    pa = odds["away_ml"].map(american_implied_prob)
+    odds["market_home_prob"] = ph / (ph + pa)
+    return odds[["game_id", "market_home_prob"]].reset_index(drop=True)
+
+
 def _load_market(season: Optional[int]) -> pd.DataFrame:
     """No-vig home implied probability per game from raw.historical_odds.
-    Only two-sided lines qualify; one-sided mirror rows are excluded."""
+    Only two-sided lines qualify; one-sided mirror rows and in-play rows
+    are excluded."""
     season_filter = "AND g.season = :season" if season else ""
     with engine.connect() as conn:
         odds = pd.read_sql(text(f"""
-            SELECT h.game_id, h.home_ml, h.away_ml
+            SELECT h.game_id, h.provider, g.season, g.date,
+                   h.home_ml, h.away_ml, h.over_under
             FROM raw.historical_odds h
             JOIN raw.games g USING (game_id)
             WHERE h.home_ml IS NOT NULL AND h.away_ml IS NOT NULL
               {season_filter}
         """), conn, params={"season": season} if season else {})
-    if odds.empty:
-        return pd.DataFrame(columns=["game_id", "market_home_prob"])
-    ph = odds["home_ml"].map(american_implied_prob)
-    pa = odds["away_ml"].map(american_implied_prob)
-    odds["market_home_prob"] = ph / (ph + pa)
-    return odds[["game_id", "market_home_prob"]]
+    return market_from_odds(odds)
 
 
 def _diff(home: pd.Series, away: pd.Series) -> pd.Series:

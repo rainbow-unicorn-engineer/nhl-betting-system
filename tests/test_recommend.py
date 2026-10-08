@@ -67,6 +67,21 @@ T1 = pd.Timestamp("2026-01-15 15:00")
 T2 = pd.Timestamp("2026-01-15 16:00")
 
 
+def test_pregame_lines_drop_inplay_fallback_lines():
+    """The raw.historical_odds fallback must not price a game off a line
+    captured during it (features.market_prices.inplay_mask)."""
+    from betting.recommend import pregame_lines
+    hist = pd.DataFrame({
+        "game_id": [1, 2], "book_name": "Unibet", "home_price": [-10000, -150],
+        "away_price": [9000, 130], "provider": "Unibet", "season": 20232024,
+        "date": ["2024-03-01", "2024-03-01"], "home_ml": [-10000, -150],
+        "away_ml": [9000, 130], "over_under": [5.5, 6.0]})
+    out = pregame_lines(hist)
+    assert out["game_id"].tolist() == [2]
+    assert list(out.columns) == ["game_id", "book_name", "home_price", "away_price"]
+    assert list(pregame_lines(hist.iloc[:0]).columns) == list(out.columns)
+
+
 class TestBettableBooks:
     """summarize_market is load_market's pure half: fair odds from every
     book, best price only from BETTABLE_BOOKS, priced_at carried."""

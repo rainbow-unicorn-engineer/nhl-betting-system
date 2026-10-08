@@ -34,6 +34,41 @@ class TestMarketOffset:
         assert np.isfinite(base).all()
 
 
+class TestLoadTrainingSet:
+    """In-play historical lines leave training and evaluation as 'no
+    market', whatever the stored vectors say."""
+
+    @staticmethod
+    def _patch(monkeypatch, inplay):
+        import contextlib
+
+        import config.settings
+        import features.market_prices as MP
+        import models.lgbm as L
+        names = ["f", "market_home_prob", "market_available"]
+        X = np.array([[1.0, 0.95, 1.0], [2.0, 0.55, 1.0], [3.0, 0.5, 0.0]])
+        meta = pd.DataFrame({"game_id": [10, 11, 12], "season": 20232024,
+                             "date": pd.to_datetime(["2024-04-09"] * 3)})
+        monkeypatch.setattr(L, "load_dataset",
+                            lambda: (X.copy(), np.array([1, 0, 1]), meta, names))
+        monkeypatch.setattr(MP, "load_inplay_game_ids", lambda conn: inplay)
+        monkeypatch.setattr(config.settings, "engine", type(
+            "E", (), {"connect": lambda self: contextlib.nullcontext()})())
+        return L, X
+
+    def test_inplay_games_lose_their_market(self, monkeypatch):
+        L, X = self._patch(monkeypatch, [10])
+        Xc, y, meta, names = L.load_training_set()
+        assert Xc[0].tolist() == [1.0, 0.5, 0.0]
+        assert Xc[1:].tolist() == X[1:].tolist()
+        assert market_offset(Xc, names)[0] == 0.0
+
+    def test_switch_off_returns_stored_vectors(self, monkeypatch):
+        L, X = self._patch(monkeypatch, [10])
+        Xs, *_ = L.load_training_set(drop_inplay_market=False)
+        assert Xs.tolist() == X.tolist()
+
+
 class TestTimeSplit:
     def test_cal_tail_is_strictly_later(self):
         dates = pd.Series(pd.date_range("2021-01-01", periods=100))
