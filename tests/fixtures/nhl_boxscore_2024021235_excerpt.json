@@ -1,0 +1,38 @@
+{
+ "homeTeam": {
+  "abbrev": "BUF"
+ },
+ "awayTeam": {
+  "abbrev": "CAR"
+ },
+ "playerByGameStats": {
+  "homeTeam": {
+   "forwards": [
+    {
+     "playerId": 8484145,
+     "sweaterNumber": 9,
+     "toi": "14:10"
+    }
+   ],
+   "defense": [
+    {
+     "playerId": 8481524,
+     "sweaterNumber": 4,
+     "toi": "21:25"
+    }
+   ],
+   "goalies": []
+  },
+  "awayTeam": {
+   "forwards": [
+    {
+     "playerId": 8473533,
+     "sweaterNumber": 11,
+     "toi": "15:22"
+    }
+   ],
+   "defense": [],
+   "goalies": []
+  }
+ }
+}

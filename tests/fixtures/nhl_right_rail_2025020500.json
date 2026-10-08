@@ -1,0 +1,103 @@
+{
+ "gameInfo": {
+  "referees": [
+   {
+    "fullName": {
+     "default": "Kyle Rehman"
+    },
+    "sweaterNumber": 10
+   },
+   {
+    "fullName": {
+     "default": "Corey Syvret"
+    },
+    "sweaterNumber": 23
+   }
+  ],
+  "linesmen": [
+   {
+    "fullName": {
+     "default": "Trent Knorr"
+    },
+    "sweaterNumber": 74
+   },
+   {
+    "fullName": {
+     "default": "Mark Shewchyk"
+    },
+    "sweaterNumber": 92
+   }
+  ],
+  "awayTeam": {
+   "headCoach": {
+    "default": "Martin St. Louis"
+   },
+   "scratches": [
+    {
+     "id": 8481593,
+     "firstName": {
+      "default": "Jayden"
+     },
+     "lastName": {
+      "default": "Struble"
+     }
+    },
+    {
+     "id": 8482487,
+     "firstName": {
+      "default": "Jakub"
+     },
+     "lastName": {
+      "default": "Dobes"
+     }
+    },
+    {
+     "id": 8483728,
+     "firstName": {
+      "default": "Jared"
+     },
+     "lastName": {
+      "default": "Davidson"
+     }
+    }
+   ]
+  },
+  "homeTeam": {
+   "headCoach": {
+    "default": "Mike Sullivan"
+   },
+   "scratches": [
+    {
+     "id": 8477380,
+     "firstName": {
+      "default": "Jonny"
+     },
+     "lastName": {
+      "default": "Brodzinski"
+     }
+    },
+    {
+     "id": 8482666,
+     "firstName": {
+      "default": "Scott"
+     },
+     "lastName": {
+      "default": "Morrow"
+     }
+    }
+   ]
+  }
+ },
+ "teamGameStats": [
+  {
+   "category": "sog",
+   "awayValue": 18,
+   "homeValue": 29
+  },
+  {
+   "category": "faceoffWinningPctg",
+   "awayValue": 0.469388,
+   "homeValue": 0.530612
+  }
+ ]
+}

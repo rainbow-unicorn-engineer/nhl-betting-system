@@ -365,15 +365,26 @@ def ingest_team_stats(game_id: int, home_team: str, away_team: str) -> bool:
     """
     Pull team-level game stats (PP conversions, faceoffs, hits, blocks...)
     from the gamecenter right-rail endpoint into raw.team_games.
-    Only meaningful for completed games.
+    Only meaningful for completed games. The same response's gameInfo block
+    (scratches, officials, head coaches) goes to ingestion/nhl_game_info,
+    so that costs no extra request; a failure there never fails this.
     """
     try:
         resp = requests.get(RIGHT_RAIL_URL.format(game_id=game_id), timeout=30)
         resp.raise_for_status()
-        tgs = resp.json().get("teamGameStats")
+        body = resp.json()
+        tgs = body.get("teamGameStats")
     except Exception as e:
         logger.warning(f"Right-rail fetch failed for game {game_id}: {e}")
         return False
+
+    try:
+        from ingestion.nhl_game_info import store_payload
+        store_payload(game_id, home_team, away_team, body)
+    except Exception as e:
+        logger.warning(f"Game info (scratches, officials) not stored for game "
+                       f"{game_id} (non-fatal; `python -m ingestion.nhl_game_info` "
+                       f"retries it): {e}")
 
     if not tgs:
         logger.warning(f"No teamGameStats for game {game_id}")
