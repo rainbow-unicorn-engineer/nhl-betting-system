@@ -36,19 +36,38 @@ Those rows name players by sweater number, so the game's boxscore
 Three requests per game; rows stored this way have no NHL row id, and the
 fetch log says source = 'html' (otherwise 'api').
 
+Bad source rows (found 2026-10-05, after the backfill; see clean_rows):
+the API sometimes returns the same shift twice (same player, period and
+start time under two NHL row ids), and for a few games it returns another
+game's shifts, all looking normal. So every game's rows are cleaned
+before they are stored: rows of a team that is not the game's home or
+away team are dropped, and one row is kept per (player, period, start
+time). Then the QA check (qa_problem) compares each skater's summed
+shift durations with his box-score ice time (raw.skater_games,
+toi_seconds): a full game where any skater is more than QA_TOLERANCE_S
+(60) seconds off, or that has no box score yet, is 'suspect'. A suspect
+game tries the HTML reports, which replace the API's shifts only when
+they pass the check.
+
 Writes, per game, in one transaction: the game's old raw.shifts rows are
 replaced by the new ones (so a re-fetch never duplicates), and the game's
 raw.shift_fetches row records the outcome:
-  ok       → a full game (at least MIN_SHIFTS shifts and MIN_PLAYERS players)
+  ok       → a full game (at least MIN_SHIFTS shifts and MIN_PLAYERS
+             players) that passes the QA check
+  suspect  → a full game that fails it; stored anyway (a feature should
+             read 'ok' games only), and re-fetched while the game is recent
   partial  → fewer than that; stored anyway, and re-fetched while the game
              is recent (the NHL sometimes posts shifts in pieces)
-  empty    → the endpoint had no shifts for the game; nothing is deleted
+  empty    → the endpoint had no shifts for the game (none of its own
+             teams'); nothing is deleted
   error    → the request failed after its retries; nothing is deleted
-A run fetches every finished game (game_state OFF, regular season and
-playoffs, puck drop at least SETTLE_HOURS ago) with no fetch-log row, every
-'error', and every 'empty' or 'partial' game from the last RECENT_DAYS days
-(all of them with --retry-empty). So a stopped run resumes where it left
-off, and the daily run fetches only last night's games.
+A run fetches every finished game (game_state OFF; regular season and
+playoffs; puck drop at least SETTLE_HOURS ago) with no fetch-log row, every 'error', and every 'empty',
+'partial' or 'suspect' game from the last RECENT_DAYS days (all of them
+with --retry-empty). So a stopped run resumes where it left off, and the
+daily run fetches only last night's games. `--recheck` cleans and
+re-checks the stored shifts without fetching anything (recheck_stored);
+`--game ID` fetches one game again whatever its status.
 
 Pace: at most one request every MIN_INTERVAL_S (0.34 s, about 3 a second;
 ingestion/polite.py), retried on timeouts, 429 and 5xx.
@@ -99,8 +118,10 @@ GOAL_TYPE = 505
 MIN_INTERVAL_S = 0.34     # at most ~3 requests a second
 MIN_SHIFTS = 400          # a full 60-minute game has 700-900
 MIN_PLAYERS = 30          # two dressed teams are 38-40 players
-RECENT_DAYS = 14          # empty/partial games this recent are re-fetched
+RECENT_DAYS = 14          # empty/partial/suspect games this recent are re-fetched
 SETTLE_HOURS = 6          # never fetch a game that started less than this ago
+QA_TOLERANCE_S = 60       # per-skater summed shifts vs box-score ice time
+FINISHED_SQL = "g.game_state = 'OFF'"   # a finished game
 
 # The same DDL is in config/migrate.py (COLUMNS, TABLES) and db/schema.sql.
 DDL = [
@@ -109,7 +130,7 @@ DDL = [
     """
         CREATE TABLE IF NOT EXISTS raw.shift_fetches (
             game_id         BIGINT PRIMARY KEY REFERENCES raw.games(game_id),
-            status          VARCHAR(10) NOT NULL,          -- ok, partial, empty, error
+            status          VARCHAR(10) NOT NULL,          -- ok, suspect, partial, empty, error
             n_shifts        INTEGER NOT NULL DEFAULT 0,
             n_players       SMALLINT NOT NULL DEFAULT 0,
             n_goal_events   SMALLINT NOT NULL DEFAULT 0,
@@ -171,10 +192,66 @@ def _int(value) -> Optional[int]:
         return None
 
 
-def parse_shifts(body: dict, game_id: int) -> Tuple[List[dict], int]:
-    """(shift rows, goal-marker count) from one shiftcharts response.
-    Rows for another game, rows missing a player, period or start time, and
-    repeated NHL row ids are dropped. A missing duration is end - start."""
+def clean_rows(rows: Sequence[dict], teams: Optional[Sequence[str]] = None
+               ) -> Tuple[List[dict], Dict[str, int]]:
+    """(kept rows, {"wrong_team": n, "duplicates": n}).
+
+    The shift-chart API sometimes returns bad rows, and they all look
+    normal (found 2026-10-05, after the backfill):
+    - another game's shifts: game 2021020513 (NYI-WSH) also held STL and
+      MIN shifts, and 2025020565 (NJD-BUF) held only VGK and SJS shifts.
+      With `teams` (the game's home and away codes) every row whose team
+      is not one of them is dropped.
+    - the same shift twice: same player, period and start time, under two
+      NHL row ids and shift numbers (19,203 extra rows in 1,537 games).
+      One row per (player, period, start time) is kept: the lowest NHL row
+      id (the first one posted), or the first seen when there is no id.
+      In 251 cases the two copies end at different times; neither choice
+      matches the box score better, and the QA check (qa_problem) flags a
+      game whose totals are still off.
+    Output is sorted by period, start time and player."""
+    allowed = {t for t in (teams or []) if t}
+    kept: Dict[tuple, dict] = {}
+    counts = {"wrong_team": 0, "duplicates": 0}
+    for r in rows:
+        if allowed and r.get("team") not in allowed:
+            counts["wrong_team"] += 1
+            continue
+        key = (r["player_id"], r["period"], r["start_time"])
+        old = kept.get(key)
+        if old is not None:
+            counts["duplicates"] += 1
+            new_id, old_id = r.get("nhl_shift_id"), old.get("nhl_shift_id")
+            if new_id is None or (old_id is not None and old_id <= new_id):
+                continue
+        kept[key] = r
+    out = sorted(kept.values(), key=lambda x: (x["period"], x["start_time"], x["player_id"]))
+    return out, counts
+
+
+def dropped_note(counts: Dict[str, int]) -> Optional[str]:
+    """'dropped 3 rows of another team, 2 repeated shifts' or None."""
+    parts = []
+    if counts.get("wrong_team"):
+        parts.append(f"{counts['wrong_team']} rows of another team")
+    if counts.get("duplicates"):
+        parts.append(f"{counts['duplicates']} repeated shifts")
+    return ("dropped " + ", ".join(parts)) if parts else None
+
+
+def join_problems(*parts: Optional[str]) -> Optional[str]:
+    """The non-empty parts joined with '; ', or None."""
+    kept = [p for p in parts if p]
+    return "; ".join(kept) if kept else None
+
+
+def parse_shifts(body: dict, game_id: int, teams: Optional[Sequence[str]] = None
+                 ) -> Tuple[List[dict], int, Dict[str, int]]:
+    """(shift rows, goal-marker count, dropped counts) from one shiftcharts
+    response. Rows for another game id, rows missing a player, period or
+    start time, and repeated NHL row ids are skipped; then clean_rows drops
+    rows of another team (when `teams` is given) and repeated shifts. A
+    missing duration is end - start."""
     rows: Dict[object, dict] = {}
     goals = 0
     for r in (body or {}).get("data") or []:
@@ -201,8 +278,8 @@ def parse_shifts(body: dict, game_id: int) -> Tuple[List[dict], int]:
             "team": (r.get("teamAbbrev") or None), "nhl_shift_id": nhl_id,
             "shift_number": _int(r.get("shiftNumber")),
         }
-    out = sorted(rows.values(), key=lambda x: (x["period"], x["start_time"], x["player_id"]))
-    return out, goals
+    out, dropped = clean_rows(list(rows.values()), teams)
+    return out, goals, dropped
 
 
 _BLOCK_RE = re.compile(r'class="playerHeading[^"]*"[^>]*>\s*(\d+)\s+([^<]*)<', re.I)
@@ -296,6 +373,31 @@ def classify(rows: Sequence[dict]) -> str:
     return "ok"
 
 
+def qa_problem(rows: Sequence[dict], box_toi: Dict[int, int],
+               tolerance_s: int = QA_TOLERANCE_S) -> Optional[str]:
+    """The per-game QA check: None when it passes, else why it failed.
+
+    box_toi is {player_id: box-score ice time in seconds} for the game's
+    skaters who played (raw.skater_games, toi_seconds > 0). Each of them
+    must have shifts whose durations add up to within tolerance_s of that
+    ice time; a skater with no shift at all is off by his whole ice time.
+    Goalies are not checked (raw.skater_games has none). With no box score
+    to compare against, the check fails: the game cannot be confirmed."""
+    if not box_toi:
+        return "no box-score ice time to check against"
+    summed: Dict[int, int] = {}
+    for r in rows:
+        summed[r["player_id"]] = summed.get(r["player_id"], 0) + (r.get("duration") or 0)
+    off = sorted(((abs(summed.get(pid, 0) - toi), pid, summed.get(pid, 0), toi)
+                  for pid, toi in box_toi.items()
+                  if abs(summed.get(pid, 0) - toi) > tolerance_s), reverse=True)
+    if not off:
+        return None
+    _, pid, secs, toi = off[0]
+    return (f"{len(off)} skater(s) more than {tolerance_s} s from box-score ice time "
+            f"(worst: player {pid}, shifts {secs} s against {toi} s)")
+
+
 # ── Database ──────────────────────────────────────────────────────
 
 INSERT_SHIFTS = text("""
@@ -316,26 +418,57 @@ UPSERT_FETCH = text("""
             (now() AT TIME ZONE 'UTC'), :source)
     ON CONFLICT (game_id) DO UPDATE SET
         status = EXCLUDED.status,
-        n_shifts = CASE WHEN EXCLUDED.status IN ('ok', 'partial')
+        n_shifts = CASE WHEN EXCLUDED.status IN ('ok', 'partial', 'suspect')
                         THEN EXCLUDED.n_shifts ELSE raw.shift_fetches.n_shifts END,
-        n_players = CASE WHEN EXCLUDED.status IN ('ok', 'partial')
+        n_players = CASE WHEN EXCLUDED.status IN ('ok', 'partial', 'suspect')
                          THEN EXCLUDED.n_players ELSE raw.shift_fetches.n_players END,
-        n_goal_events = CASE WHEN EXCLUDED.status IN ('ok', 'partial')
+        n_goal_events = CASE WHEN EXCLUDED.status IN ('ok', 'partial', 'suspect')
                              THEN EXCLUDED.n_goal_events
                              ELSE raw.shift_fetches.n_goal_events END,
         attempts = LEAST(raw.shift_fetches.attempts + 1, 32000),
         problem = EXCLUDED.problem,
         fetched_at = EXCLUDED.fetched_at,
-        source = CASE WHEN EXCLUDED.status IN ('ok', 'partial')
+        source = CASE WHEN EXCLUDED.status IN ('ok', 'partial', 'suspect')
                       THEN EXCLUDED.source ELSE raw.shift_fetches.source END
 """)
+
+
+GAME_TEAMS = text("SELECT home_team, away_team FROM raw.games WHERE game_id = :g")
+BOX_TOI = text("""
+    SELECT player_id, toi_seconds FROM raw.skater_games
+    WHERE game_id = :g AND toi_seconds > 0
+""")
+
+
+def _teams(conn, game_id: int) -> List[str]:
+    row = conn.execute(GAME_TEAMS, {"g": game_id}).first()
+    return [t for t in (row or ()) if t]
+
+
+def game_context(game_id: int, db=None) -> Tuple[List[str], Dict[int, int]]:
+    """(the game's home and away team codes, box-score ice time per skater
+    who played) from raw.games and raw.skater_games."""
+    with (db or engine).connect() as conn:
+        teams = _teams(conn, game_id)
+        box = {int(p): int(t) for p, t in conn.execute(BOX_TOI, {"g": game_id})}
+    return teams, box
 
 
 def store_game(game_id: int, rows: List[dict], goals: int, status: str,
                problem: Optional[str] = None, db=None, source: str = "api") -> None:
     """Replace the game's shifts (only when rows were parsed) and record
-    the fetch, in one transaction."""
+    the fetch, in one transaction. As a guard, the rows go through
+    clean_rows with the game's teams from raw.games first, so another
+    team's shifts or a repeated shift can never be stored. When the guard
+    drops rows, the status is checked again (classify), so a game it
+    empties is logged 'empty', not 'ok'."""
     with (db or engine).begin() as conn:
+        if rows:
+            n_in = len(rows)
+            rows, _ = clean_rows(rows, _teams(conn, game_id))
+            if len(rows) < n_in and status in ("ok", "partial", "suspect"):
+                new = classify(rows)
+                status = status if new == "ok" else new
         if rows:
             conn.execute(text("DELETE FROM raw.shifts WHERE game_id = :g"), {"g": game_id})
             cols = ["game_id", "player_id", "period", "start_time", "end_time",
@@ -353,14 +486,14 @@ def games_to_fetch(season: Optional[int] = None, retry_empty: bool = False,
     """Game ids due a fetch (see the module docstring), oldest first."""
     today = today or local_today()
     now_utc = now_utc or datetime.now(timezone.utc)
-    sql = """
+    sql = f"""
         SELECT g.game_id FROM raw.games g
         LEFT JOIN raw.shift_fetches f ON f.game_id = g.game_id
-        WHERE g.game_state = 'OFF' AND g.game_type IN (2, 3)
+        WHERE {FINISHED_SQL} AND g.game_type IN (2, 3)
           AND (g.start_time_utc IS NULL OR g.start_time_utc <= :settled)
           AND (:season IS NULL OR g.season = CAST(:season AS integer))
           AND (f.game_id IS NULL OR f.status = 'error'
-               OR (f.status IN ('empty', 'partial')
+               OR (f.status IN ('empty', 'partial', 'suspect')
                    AND (CAST(:retry_all AS boolean) OR g.date >= :recent)))
         ORDER BY g.date, g.game_id
     """
@@ -375,14 +508,17 @@ def games_to_fetch(season: Optional[int] = None, retry_empty: bool = False,
 
 # ── Fetching ──────────────────────────────────────────────────────
 
-def fetch_game(client: PoliteClient, game_id: int) -> Tuple[str, List[dict], int, Optional[str]]:
-    """(status, rows, goal markers, problem) for one game."""
+def fetch_game(client: PoliteClient, game_id: int, teams: Optional[Sequence[str]] = None
+               ) -> Tuple[str, List[dict], int, Optional[str]]:
+    """(status, rows, goal markers, problem) for one game. With `teams`
+    (the game's two team codes), rows of any other team are dropped; a
+    game left with none of its own shifts is 'empty'."""
     reply: Reply = client.get_json(URL, {"cayenneExp": f"gameId={int(game_id)}"})
     if reply.status != "ok":
         return "error", [], 0, reply.problem
     if not isinstance(reply.body, dict) or not isinstance(reply.body.get("data"), list):
         return "error", [], 0, "response has no data list"
-    rows, goals = parse_shifts(reply.body, game_id)
+    rows, goals, dropped = parse_shifts(reply.body, game_id, teams)
     status = classify(rows)
     problem = None
     if status == "partial":
@@ -390,10 +526,13 @@ def fetch_game(client: PoliteClient, game_id: int) -> Tuple[str, List[dict], int
     total = _int(reply.body.get("total"))
     if total is not None and total > len(reply.body["data"]):
         status, problem = "partial", f"response held {len(reply.body['data'])} of {total} rows"
-    return status, rows, goals, problem
+    return status, rows, goals, join_problems(problem, dropped_note(dropped))
 
 
-def fetch_game_html(client: PoliteClient, game_id: int) -> Tuple[str, List[dict], Optional[str]]:
+def fetch_game_html(client: PoliteClient, game_id: int,
+                    teams: Optional[Sequence[str]] = None,
+                    reason: str = "the shift-chart API had none"
+                    ) -> Tuple[str, List[dict], Optional[str]]:
     """(status, rows, problem) from the HTML time-on-ice reports; status is
     ok, partial or empty, or error when a page or the boxscore failed."""
     gid = str(int(game_id))
@@ -408,34 +547,58 @@ def fetch_game_html(client: PoliteClient, game_id: int) -> Tuple[str, List[dict]
             return "error", [], f"T{side} report: {page.problem or page.status}"
         pages[side] = page.body
     rows, unmatched = html_rows(game_id, pages, box.body)
+    rows, dropped = clean_rows(rows, teams)
     status = classify(rows)
-    problem = "from the HTML time-on-ice reports (the shift-chart API had none)"
+    problem = f"from the HTML time-on-ice reports ({reason})"
     if unmatched:
         problem += f"; {unmatched} shift rows had a sweater number not in the boxscore"
-    return status, rows, problem
+    return status, rows, join_problems(problem, dropped_note(dropped))
+
+
+def _empty_counts(n: int = 0) -> Dict[str, int]:
+    return {"games": n, "ok": 0, "partial": 0, "empty": 0, "error": 0, "suspect": 0,
+            "shifts": 0, "stopped_early": 0, "from_html": 0}
 
 
 def fetch_games(game_ids: Sequence[int], client: Optional[PoliteClient] = None,
                 db=None, max_consecutive_errors: int = 25,
                 html_fallback: bool = True) -> Dict[str, int]:
     """Fetch and store each game; returns counts by status. Stops early
-    after max_consecutive_errors failures in a row (the API is down)."""
+    after max_consecutive_errors failures in a row (the API is down).
+
+    Per game: the API's shifts, minus other teams' rows and repeats; a
+    full game then goes through the QA check (qa_problem) against the box
+    score and becomes 'suspect' when it fails. An empty API answer, or a
+    suspect one for a game that has a box score, tries the HTML reports;
+    the HTML shifts are used for an empty game, and replace suspect API
+    shifts only when they pass the QA check themselves."""
     ensure_tables(db)
     client = client or PoliteClient("NHL shift charts", min_interval_s=MIN_INTERVAL_S)
-    counts = {"games": len(game_ids), "ok": 0, "partial": 0, "empty": 0, "error": 0,
-              "shifts": 0, "stopped_early": 0, "from_html": 0}
+    counts = _empty_counts(len(game_ids))
     streak = 0
     started = time.monotonic()
     for i, gid in enumerate(game_ids, 1):
-        status, rows, goals, problem = fetch_game(client, gid)
+        teams, box = game_context(gid, db)
+        status, rows, goals, problem = fetch_game(client, gid, teams)
         source = "api"
-        if status == "empty" and html_fallback:
-            h_status, h_rows, h_problem = fetch_game_html(client, gid)
-            if h_rows:
+        qa = qa_problem(rows, box) if status == "ok" else None
+        if qa:
+            status, problem = "suspect", join_problems(problem, f"QA: {qa}")
+        if html_fallback and (status == "empty" or (status == "suspect" and box)):
+            reason = ("the shift-chart API had none" if status == "empty"
+                      else "the shift-chart API's shifts failed the QA check")
+            h_status, h_rows, h_problem = fetch_game_html(client, gid, teams, reason)
+            h_qa = qa_problem(h_rows, box) if h_status == "ok" else None
+            if h_qa:
+                h_status, h_problem = "suspect", join_problems(h_problem, f"QA: {h_qa}")
+            if (status == "empty" and h_rows) or (status == "suspect" and h_status == "ok"):
                 status, rows, problem, source = h_status, h_rows, h_problem, "html"
                 counts["from_html"] += 1
             elif h_status == "error":
-                problem = f"shift-chart API empty; {h_problem}"
+                problem = join_problems(
+                    problem if status == "suspect" else "shift-chart API empty", h_problem)
+            elif status == "suspect":
+                problem = join_problems(problem, "the HTML reports did not pass either")
         store_game(gid, rows, goals, status, problem, db=db, source=source)
         counts[status] += 1
         counts["shifts"] += len(rows)
@@ -443,9 +606,9 @@ def fetch_games(game_ids: Sequence[int], client: Optional[PoliteClient] = None,
         if i % 100 == 0 or i == len(game_ids):
             rate = i / max(time.monotonic() - started, 1e-9)
             logger.info(f"Shift charts {i}/{len(game_ids)} ({rate:.1f} games/s): "
-                        f"{counts['ok']} ok, {counts['partial']} partial, "
-                        f"{counts['empty']} empty, {counts['error']} error, "
-                        f"{counts['shifts']:,} shifts")
+                        f"{counts['ok']} ok, {counts['suspect']} suspect, "
+                        f"{counts['partial']} partial, {counts['empty']} empty, "
+                        f"{counts['error']} error, {counts['shifts']:,} shifts")
         if streak >= max_consecutive_errors:
             logger.error(f"Shift charts: {streak} failures in a row; stopping "
                          f"(a re-run resumes from here)")
@@ -461,11 +624,92 @@ def fetch_missing(season: Optional[int] = None, retry_empty: bool = False,
     ids = games_to_fetch(season=season, retry_empty=retry_empty, limit=limit)
     if not ids:
         logger.info("Shift charts: every finished game is already fetched")
-        return {"games": 0, "ok": 0, "partial": 0, "empty": 0, "error": 0,
-                "shifts": 0, "stopped_early": 0, "from_html": 0}
+        return _empty_counts()
     logger.info(f"Shift charts: {len(ids)} game(s) to fetch"
                 + (f" (season {season})" if season else ""))
     return fetch_games(ids)
+
+
+STORED_ROWS = text("""
+    SELECT shift_id, player_id, period, start_time, duration, team, nhl_shift_id
+    FROM raw.shifts WHERE game_id = :g
+""")
+
+UPDATE_FETCH_CHECKED = text("""
+    UPDATE raw.shift_fetches
+    SET status = :status, n_shifts = :n_shifts, n_players = :n_players, problem = :problem
+    WHERE game_id = :g
+""")
+
+
+def _base_problem(problem: Optional[str]) -> Optional[str]:
+    """A stored problem without its old QA verdict, which a recheck writes
+    afresh, so checking a game twice gives the same text. Notes of rows
+    dropped earlier stay: they record what was removed."""
+    parts = [p for p in (problem or "").split("; ") if p and not p.startswith("QA: ")]
+    return join_problems(*parts)
+
+
+def recheck_stored(season: Optional[int] = None, game_ids: Optional[Sequence[int]] = None,
+                   db=None) -> Dict[str, int]:
+    """Clean and QA-check the shifts already stored, fetching nothing: the
+    repair for games loaded before clean_rows and the QA check existed,
+    and for games whose box score arrived after their shifts.
+
+    For every game whose fetch is ok, partial or suspect, in one
+    transaction per game: deletes the rows clean_rows drops (another
+    team's, repeated shifts), then sets the status from the rows left:
+    classify(), and 'suspect' when an otherwise full game fails qa_problem
+    (or back to 'ok' when a suspect one now passes). A game left with no
+    rows becomes 'empty', so a `--retry-empty` run re-fetches it.
+    attempts, fetched_at and source are kept. Returns counts: games
+    checked, rows deleted, and games per new status."""
+    ensure_tables(db)
+    sql = """
+        SELECT f.game_id, f.status, f.problem FROM raw.shift_fetches f
+        JOIN raw.games g ON g.game_id = f.game_id
+        WHERE f.status IN ('ok', 'partial', 'suspect')
+          AND (:season IS NULL OR g.season = CAST(:season AS integer))
+    """
+    params: dict = {"season": season}
+    if game_ids is not None:
+        sql += " AND f.game_id = ANY(CAST(:ids AS bigint[]))"
+        params["ids"] = [int(g) for g in game_ids]
+    sql += " ORDER BY f.game_id"
+    with (db or engine).connect() as conn:
+        todo = [tuple(r) for r in conn.execute(text(sql), params)]
+    counts = {"games": len(todo), "wrong_team_deleted": 0, "duplicates_deleted": 0,
+              "ok": 0, "suspect": 0, "partial": 0, "empty": 0, "changed": 0}
+    for i, (gid, old_status, old_problem) in enumerate(todo, 1):
+        with (db or engine).begin() as conn:
+            teams = _teams(conn, gid)
+            stored = [dict(r) for r in conn.execute(STORED_ROWS, {"g": gid}).mappings()]
+            kept, dropped = clean_rows(stored, teams)
+            gone = {r["shift_id"] for r in stored} - {r["shift_id"] for r in kept}
+            if gone:
+                conn.execute(text("DELETE FROM raw.shifts WHERE shift_id = ANY(:ids)"),
+                             {"ids": sorted(gone)})
+            box = {int(p): int(t) for p, t in conn.execute(BOX_TOI, {"g": gid})}
+            status = classify(kept)
+            qa = qa_problem(kept, box) if status == "ok" else None
+            if qa:
+                status = "suspect"
+            problem = join_problems(_base_problem(old_problem), dropped_note(dropped),
+                                    f"QA: {qa}" if qa else None)
+            conn.execute(UPDATE_FETCH_CHECKED, {
+                "g": gid, "status": status, "n_shifts": len(kept),
+                "n_players": len({r["player_id"] for r in kept}), "problem": problem})
+        counts["wrong_team_deleted"] += dropped["wrong_team"]
+        counts["duplicates_deleted"] += dropped["duplicates"]
+        counts[status] += 1
+        counts["changed"] += int(status != old_status)
+        if i % 500 == 0 or i == len(todo):
+            logger.info(f"Shift recheck {i}/{len(todo)}: {counts['ok']} ok, "
+                        f"{counts['suspect']} suspect, {counts['partial']} partial, "
+                        f"{counts['empty']} empty; deleted "
+                        f"{counts['duplicates_deleted']:,} repeated and "
+                        f"{counts['wrong_team_deleted']:,} wrong-team rows")
+    return counts
 
 
 def coverage(db=None) -> List[dict]:
@@ -473,13 +717,19 @@ def coverage(db=None) -> List[dict]:
     box-score players who played (raw.skater_games + raw.goalie_games,
     toi_seconds > 0) in 'ok' games but have no shift (check S2), and the
     median absolute gap in seconds between a skater's summed shifts and his
-    box-score ice time in 'ok' games (check S3)."""
+    box-score ice time in 'ok' games (check S3).
+
+    Diagnostics added 2026-10-06 (the median in S3 cannot see a bad tail):
+    skater-games in 'ok' games more than 5 s and more than QA_TOLERANCE_S
+    off their box-score ice time, and, over every stored row, repeated
+    shifts (same player, period and start) and rows of a team not in the
+    game. After the repair the last two are 0."""
     ensure_tables(db)
     with (db or engine).connect() as conn:
-        rows = conn.execute(text("""
+        rows = conn.execute(text(f"""
             WITH g AS (
-                SELECT game_id, season FROM raw.games
-                WHERE game_state = 'OFF' AND game_type IN (2, 3)
+                SELECT g.game_id, g.season, g.home_team, g.away_team FROM raw.games g
+                WHERE {FINISHED_SQL} AND g.game_type IN (2, 3)
             ),
             box AS (
                 SELECT game_id, player_id FROM raw.skater_games WHERE toi_seconds > 0
@@ -504,27 +754,53 @@ def coverage(db=None) -> List[dict]:
                 JOIN raw.games g3 ON g3.game_id = st.game_id
                 WHERE sg.toi_seconds > 0
             ),
-            toi_med AS (
-                SELECT season, percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS med
+            toi_stats AS (
+                SELECT season, percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS med,
+                       COUNT(*) AS n,
+                       COUNT(*) FILTER (WHERE gap > 5) AS over_5,
+                       COUNT(*) FILTER (WHERE gap > :tol) AS over_tol
                 FROM toi_gap GROUP BY season
+            ),
+            repeats AS (
+                SELECT game_id, SUM(n - 1) AS n FROM (
+                    SELECT game_id, COUNT(*) AS n FROM raw.shifts
+                    GROUP BY game_id, player_id, period, start_time HAVING COUNT(*) > 1) x
+                GROUP BY game_id
+            ),
+            wrong_team AS (
+                SELECT s.game_id, COUNT(*) AS n FROM raw.shifts s
+                JOIN g ON g.game_id = s.game_id
+                WHERE s.team IS DISTINCT FROM g.home_team AND s.team IS DISTINCT FROM g.away_team
+                GROUP BY s.game_id
             )
             SELECT g.season,
                    COUNT(*) AS finished,
                    COUNT(*) FILTER (WHERE f.status = 'ok') AS ok,
                    COUNT(*) FILTER (WHERE f.status = 'ok' AND f.source = 'html') AS ok_from_html,
+                   COUNT(*) FILTER (WHERE f.status = 'suspect') AS suspect,
                    COUNT(*) FILTER (WHERE f.status = 'partial') AS partial,
                    COUNT(*) FILTER (WHERE f.status = 'empty') AS empty,
                    COUNT(*) FILTER (WHERE f.status = 'error') AS error,
                    COUNT(*) FILTER (WHERE f.game_id IS NULL) AS not_fetched,
                    COALESCE(SUM(f.n_shifts), 0) AS shifts,
                    COALESCE(SUM(m.n), 0) AS box_players_without_shifts,
-                   (SELECT med FROM toi_med t WHERE t.season = g.season)
-                       AS median_skater_toi_gap_s
+                   (SELECT med FROM toi_stats t WHERE t.season = g.season)
+                       AS median_skater_toi_gap_s,
+                   (SELECT n FROM toi_stats t WHERE t.season = g.season)
+                       AS skater_games_checked,
+                   (SELECT over_5 FROM toi_stats t WHERE t.season = g.season)
+                       AS skater_games_over_5s,
+                   (SELECT over_tol FROM toi_stats t WHERE t.season = g.season)
+                       AS skater_games_over_tolerance,
+                   COALESCE(SUM(r.n), 0) AS repeated_shift_rows,
+                   COALESCE(SUM(w.n), 0) AS wrong_team_rows
             FROM g
             LEFT JOIN raw.shift_fetches f ON f.game_id = g.game_id
             LEFT JOIN missing m ON m.game_id = g.game_id
+            LEFT JOIN repeats r ON r.game_id = g.game_id
+            LEFT JOIN wrong_team w ON w.game_id = g.game_id
             GROUP BY g.season ORDER BY g.season
-        """)).mappings().all()
+        """), {"tol": QA_TOLERANCE_S}).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -548,14 +824,29 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=None,
                         help="fetch at most this many games this run")
     parser.add_argument("--retry-empty", action="store_true",
-                        help="also re-fetch every 'empty' or 'partial' game, however old")
+                        help="also re-fetch every 'empty', 'partial' or 'suspect' game, "
+                             "however old")
     parser.add_argument("--report", action="store_true",
                         help="print coverage by season and fetch nothing")
+    parser.add_argument("--recheck", action="store_true",
+                        help="clean the stored shifts (drop repeated shifts and other "
+                             "teams' rows) and re-run the QA check against the box "
+                             "scores; fetches nothing")
+    parser.add_argument("--game", type=int, action="append", default=None, metavar="GAME_ID",
+                        help="fetch this game again whatever its status (repeatable), "
+                             "such as 2021020513")
     args = parser.parse_args(argv)
     if args.report:
         for r in coverage():
             print(r)
         return 0
+    if args.recheck:
+        print(recheck_stored(args.season))
+        return 0
+    if args.game:
+        counts = fetch_games(args.game)
+        print(counts)
+        return 1 if counts["stopped_early"] else 0
     counts = fetch_missing(args.season, args.retry_empty, args.limit)
     print(counts)
     return 1 if counts["stopped_early"] else 0
