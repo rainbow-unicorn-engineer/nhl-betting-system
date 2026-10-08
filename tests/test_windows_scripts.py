@@ -67,19 +67,23 @@ def _role_block() -> str:
     return text[text.index("rem -- role --"):text.index("rem -- end role --")]
 
 
-def _run_role_block(tmp_path, role=None):
-    """setup-all.bat's role lines on their own, in cmd.exe: the role it
-    would pass to register-tasks.ps1, or the exit code it fails with."""
+def _run_role_block(tmp_path, role=None, dotenv=None):
+    """setup-all.bat's role lines on their own, in cmd.exe, run in tmp_path
+    (so the repo's real .env never leaks in; dotenv writes a test .env
+    there): the role it would pass to register-tasks.ps1, or the exit code
+    it fails with."""
     import os
     bat = tmp_path / "role.bat"
     lines = ["@echo off", "setlocal", *_role_block().splitlines(), "echo ROLE=%NHL_ROLE%",
              "exit /b 0", ":failed", "exit /b %ERRORLEVEL%", ""]
     bat.write_bytes("\r\n".join(lines).encode())
+    if dotenv is not None:
+        (tmp_path / ".env").write_bytes(dotenv.replace("\n", "\r\n").encode())
     env = {k: v for k, v in os.environ.items() if k.upper() != "NHL_ROLE"}
     if role is not None:
         env["NHL_ROLE"] = role
     return subprocess.run(["cmd", "/d", "/c", str(bat)], capture_output=True, text=True,
-                          env=env, timeout=60)
+                          env=env, timeout=60, cwd=tmp_path)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="needs cmd.exe")
@@ -93,6 +97,18 @@ def test_setup_all_registers_the_free_key_role_unless_told_otherwise(tmp_path):
     out = _run_role_block(tmp_path, "props")      # -IncludeOdds would refuse it
     assert out.returncode == 2 and "use picks or all" in out.stdout
     assert not any(line.startswith("ROLE=") for line in out.stdout.splitlines())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs cmd.exe")
+def test_setup_all_reads_the_role_from_dotenv(tmp_path):
+    """A paid-key machine sets NHL_ROLE=all in .env; the shortcut honours it,
+    and a variable set in the window still wins over .env."""
+    out = _run_role_block(tmp_path, dotenv="POSTGRES_DB=x\nNHL_ROLE=all\nOTHER=1\n")
+    assert out.returncode == 0 and "ROLE=all" in out.stdout
+    out = _run_role_block(tmp_path, "picks", dotenv="NHL_ROLE=all\n")
+    assert out.returncode == 0 and "ROLE=picks" in out.stdout
+    out = _run_role_block(tmp_path, dotenv="POSTGRES_DB=x\n")
+    assert out.returncode == 0 and "ROLE=picks" in out.stdout
 
 
 def test_open_dashboard_waits_for_the_database_and_stays_local():

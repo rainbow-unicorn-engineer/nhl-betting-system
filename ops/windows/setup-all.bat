@@ -18,9 +18,10 @@ rem          news --due: about 321 Odds API credits a month, inside a free
 rem          500-credit key
 rem   all    picks plus the props jobs (props at 10:00 and props --due):
 rem          more than 500 credits a month, so only with a paid key
-rem Registering a role removes the jobs it leaves out. For every job, type
-rem   set NHL_ROLE=all
-rem in a Command Prompt window, then run this file from that same window.
+rem Registering a role removes the jobs it leaves out. For every job, put
+rem   NHL_ROLE=all
+rem in the repo's .env (a machine with a paid key), or type set NHL_ROLE=all
+rem in a Command Prompt window and run this file from that same window.
 title NHL Setup
 setlocal
 pushd "%~dp0..\.."
@@ -28,6 +29,7 @@ rem NHL_PYTHON overrides the project's Python (default: the repo's .venv)
 set "PY=%CD%\.venv\Scripts\python.exe"
 if defined NHL_PYTHON set "PY=%NHL_PYTHON%"
 rem -- role --
+if not defined NHL_ROLE if exist ".env" for /f "usebackq tokens=1,* delims==" %%a in (".env") do if /i "%%a"=="NHL_ROLE" set "NHL_ROLE=%%b"
 if not defined NHL_ROLE set "NHL_ROLE=picks"
 if /i "%NHL_ROLE%"=="picks" goto role_ok
 if /i "%NHL_ROLE%"=="all" goto role_ok
