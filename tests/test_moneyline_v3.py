@@ -302,3 +302,69 @@ def test_walk_forward_applies_the_fold_transform():
     assert len(seen) == 2
     plain, _ = V.walk_forward(X, y, meta, names)
     assert np.allclose(oof[~np.isnan(oof)], plain[~np.isnan(plain)])
+
+
+# ── The production check (added 2026-10-08, not pre-registered) ─────
+
+def _scoring_inputs():
+    rng = np.random.default_rng(6)
+    n = 40
+    meta = pd.DataFrame({"game_id": np.arange(n), "season": 20252026,
+                         "date": pd.date_range("2025-10-10", periods=n)})
+    y = (rng.uniform(size=n) < 0.55).astype(int)
+    market = pd.DataFrame({"game_id": np.arange(n), "nv_consensus": 0.55,
+                           "nv_pinnacle": np.nan})
+    return y, meta, market, rng.uniform(0.3, 0.7, n)
+
+
+def test_score_variants_scores_v0_alone_without_a_decision():
+    y, meta, market, p = _scoring_inputs()
+    sc = V.score_variants(y, meta, {"V0": p}, market, np.ones(len(y)) == 1)
+    assert "decision" not in sc and "pairwise" not in sc
+    v = sc["variants"]["V0"]
+    assert v["vs_market"]["n"] == len(y)
+    assert math.isclose(v["log_loss"], V.per_game_log_loss(y, p).mean())
+
+
+def test_score_variants_still_decides_with_every_variant():
+    y, meta, market, p = _scoring_inputs()
+    oofs = {k: p for k in ("V0",) + V.ADOPTABLE}
+    sc = V.score_variants(y, meta, oofs, market, np.ones(len(y)) == 1)
+    assert sc["decision"]["chosen"] in ("V0",) + V.ADOPTABLE
+    assert set(sc["pairwise"]) == {f"{a}-{b}" for a in V.ADOPTABLE
+                                   for b in V.ADOPTABLE if a != b}
+
+
+def test_production_check_trains_and_scores_with_inplay_games_cleared(monkeypatch):
+    """The production check must feed walk_forward and the timing study the
+    matrix with the in-play games set to 'no market', the same as
+    models.lgbm.load_training_set, and score the clean subset too."""
+    y, meta, market, p = _scoring_inputs()
+    names = ["f", "market_home_prob", "market_available"]
+    X = np.column_stack([np.zeros(len(y)), np.full(len(y), 0.9), np.ones(len(y))])
+    monkeypatch.setattr(V, "load_inputs", lambda: {
+        "X": X, "y": y, "meta": meta, "names": names, "market": market,
+        "unibet_inplay_ids": [3, 4]})
+    seen = {}
+
+    def fake_walk_forward(Xw, yw, metaw, namesw, seed, keep_season=None):
+        seen["wf"] = Xw
+        return p, "fold"
+
+    def fake_timing(fm, Xt, namest, metat, markett, oof):
+        seen["timing"] = (fm, Xt)
+        return {"games": 0}
+    monkeypatch.setattr(V, "walk_forward", fake_walk_forward)
+    monkeypatch.setattr(V, "timing_study", fake_timing)
+    monkeypatch.setattr(V, "run_backtests", lambda df: {"rows": len(df)})
+    res = V.production_check()
+    Xw = seen["wf"]
+    assert Xw[[3, 4], 1].tolist() == [0.5, 0.5]
+    assert Xw[[3, 4], 2].tolist() == [0.0, 0.0]
+    assert np.allclose(np.delete(Xw, [3, 4], axis=0), np.delete(X, [3, 4], axis=0))
+    assert seen["timing"][0] == "fold" and seen["timing"][1] is Xw
+    assert X[3, 2] == 1.0                       # the input is not modified
+    assert res["scores"]["vs_market"]["n"] == len(y)
+    assert res["scores_clean"]["vs_market"]["n"] == len(y) - 2
+    assert res["backtests"] == {"rows": len(y)}
+    assert res["n_unibet_inplay_games"] == 2

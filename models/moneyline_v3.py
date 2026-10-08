@@ -155,7 +155,10 @@ restricted to the same games.
 STATUS (run 2026-10-04, seed 42, robustness seeds 1 and 2; results in
 models/artifacts/moneyline_v3_results.json; re-run with
 `python -m models.moneyline_v3`, read-only. Updated 2026-10-07 after the
-independent review: clean-game scores added, V1mc re-read. The
+independent review: clean-game scores added, V1mc re-read. Updated
+2026-10-08 after a second review: the production check added, with the
+production model's own market test, backtests and timing (re-run with
+`python -m models.moneyline_v3 --production`, read-only). The
 pre-registered variants and the post-hoc diagnostics come from one run:
 the diagnostic code existed when the results file was written but was
 committed a day later, so git cannot show that they came after.
@@ -172,18 +175,50 @@ leading late). That leaks the result into the market input of V0-V3:
 those 106 games score a log loss of 0.45 (the 34 with a moneyline of
 1,000 or more: 0.14) against about 0.66 for the rest. The pre-registered
 run used features.game_vector as stored, so the leak is in every
-variant's numbers below. It flatters each pooled figure by about 0.003
-and changes no decision. The rule that finds the rows is
-features.market_prices.inplay_mask; the production model now treats
-those games as having no market (models/lgbm.py), for training and for
-scoring. Its own walk-forward evaluation, re-run read-only on
-2026-10-07: pooled log loss 0.6616 before, 0.6648 after (2023-24
-0.6453 -> 0.6593); the gate (beat the 0.6829 baseline) still passes.
+variant's numbers below, in two ways: the 106 games are SCORED with
+the leaked price, and every fold whose training seasons include 2023-24
+(the 2024-25 and 2025-26 folds) also TRAINED on those prices. It
+flatters each pooled figure by about 0.003 and changes no decision.
+The rule that finds the rows is features.market_prices.inplay_mask; the
+production model now treats those games as having no market
+(models/lgbm.py), for training and for scoring. Its own walk-forward
+evaluation, re-run read-only on 2026-10-07: pooled log loss 0.6616
+before, 0.6648 after (2023-24 0.6453 -> 0.6593, 2025-26 0.6887 ->
+0.6904); the gate (beat the 0.6829 baseline) still passes.
 
-Pooled log loss (lower is better), difference vs V0 with paired SE, and
-vs the consensus no-vig close on the 2,412 priced games. "All" = the
-6,993 games as pre-registered (leak included); "clean" = the 6,887
-games without an in-play line (the honest figure):
+The production model as it is now (production_check below, run
+read-only 2026-10-08, seed 42; written after the experiment and
+committed before this run, but not pre-registered). This is the fully honest V0: no leaked price in its
+training or in its scoring.
+  Log loss 0.66479 on all 6,993 games, 0.66520 on the 6,887 clean ones
+  (vs the experiment's V0 on clean games: +0.00035, SE 0.00026).
+  vs the consensus no-vig close on the 2,412 priced games: +0.0047
+  (SE 0.0025), equal to the market at best. 2024-25: +0.0064 (SE
+  0.0040), the same as the experiment's V0, because V0 has no 2024-25
+  market input and that season is scored by the market-blind fallback
+  model, which the masking does not touch. 2025-26 vs DraftKings:
+  +0.0024 (SE 0.0023), slightly worse than the experiment's +0.00004:
+  that fold trains on 2023-24, so it no longer learns from the leaked
+  prices and its probabilities move (by up to 0.08).
+  Backtests: 2024-25 identical to the experiment's V0 (every view). 2025-26
+  DraftKings: 487 bets, -3.5% flat [-12.0%, +5.1%], quarter-Kelly -6.0%,
+  max drawdown 35%, closing EV -4.2%. Edge buckets 2025-26: 2.5-4 225
+  bets +2.8% [-10.4%, +15.7%], 4-6 168 bets -11.5% [-24.9%, +1.8%], 6-9
+  75 bets -11.4% [-33.3%, +11.5%], 9+ 19 bets +25.1% [-19.1%, +67.1%].
+  Timing study (889 games): H1 slope 0.040, t 2.54, which would clear
+  the t >= 2 bar, but on a re-run after the fact, so a hint for 2026-27
+  and not a pre-registered finding; H2 closing EV -1.65% (SE 0.16%),
+  not supported; H3 neither slot better (flat ROI +0.3% [-1.5%, +2.2%],
+  closing EV +0.15% [-0.16%, +0.47%]). Morning arm 440 bets +5.7%
+  [-3.1%, +14.4%], close arm 445 bets +5.4% [-3.4%, +14.0%].
+
+The experiment's own numbers follow (V0 here is the old, leaky-trained
+V0). Pooled log loss (lower is better), difference vs V0 with paired
+SE, and vs the consensus no-vig close on the 2,412 priced games. "All"
+= the 6,993 games as pre-registered (leak included); "clean" = the
+6,887 games without an in-play line. "Clean" takes the 106 games out of
+the SCORING only: the models were still trained on them, so it is not
+the fully honest figure (that is the production check above):
         all      clean    clean vs V0           vs market (priced games)
   V0   0.66163  0.66484                         +0.0037 (SE 0.0025)
   V1   0.66223  0.66545  +0.00061 (SE 0.00101)  +0.0055 (SE 0.0020)
@@ -192,8 +227,10 @@ games without an in-play line (the honest figure):
   V3   0.66207  0.66525  +0.00040 (SE 0.00116)  +0.0074 (SE 0.0019)
   (All games, vs V0: V1 +0.00060 (SE 0.00100), V1p +0.00062 (0.00099),
   V2 +0.00066 (0.00110), V3 +0.00044 (0.00114).) The priced games are
-  2024-25 and 2025-26 only, which have no in-play rows, so the market
-  test is the same either way. V0 in 2023-24: 0.6453 all, 0.6611 clean.
+  2024-25 and 2025-26 only, so leaving the in-play games out of the
+  scoring does not change the market test; it still reflects models
+  trained on the leaked 2023-24 prices. V0 in 2023-24: 0.6453 all,
+  0.6611 clean.
   Market (consensus no-vig close) on the priced games: 0.6666
   (2024-25 0.6573, 2025-26 DraftKings 0.6794); Pinnacle no-vig 0.6576.
   None beats V0 (condition (a) fails for all), and V1, V2 and V3 are
@@ -202,8 +239,9 @@ games without an in-play line (the honest figure):
   2 SE, the rule picks V0 every time, on all games and on clean games.
   By season: V1 matches the market in 2024-25 (-0.0010, SE 0.0017; vs
   Pinnacle -0.0010, SE 0.0017) but is clearly worse than DraftKings in
-  2025-26 (+0.0144, SE 0.0042), while V0 matches DraftKings there
-  (+0.00004, SE 0.0020). Why V1 drifts away in 2025-26 is not known; a
+  2025-26 (+0.0144, SE 0.0042), while the experiment's V0 matches
+  DraftKings there (+0.00004, SE 0.0020; the production model re-trained
+  without the leaked prices: +0.0024, SE 0.0023). Why V1 drifts away in 2025-26 is not known; a
   guess, untested: the booster learns a correction from mostly Unibet
   three-way seasons that does not transfer to two-way prices.
   ECE (calibration miss): V0 0.017, V1 0.019, V2 0.018, V3 0.016.
@@ -230,17 +268,20 @@ candidate, which is why they were tried):
        [-15.3%, -2.1%], closing EV negative in both. One good season
        followed by a clearly bad one is not an edge.
 
-Priced backtests (descriptive). Flat ROI with 95% game-clustered CI:
+Priced backtests (descriptive; the experiment's leaky-trained models,
+for the production model's own see the production check above). Flat
+ROI with 95% game-clustered CI:
   V0 2024-25 best of 10 books: 1,049 bets, +0.6% [-6.0%, +6.9%]
      (quarter-Kelly +1.0%, bankroll 100 -> 116, max drawdown 29%).
      Single US books -0.5% to -2.0%; Pinnacle alone -0.4%.
-  V0 2025-26 DraftKings: 401 bets, -1.3% [-10.7%, +8.5%].
+  V0 2025-26 DraftKings: 401 bets, -1.3% [-10.7%, +8.5%] (production
+     model re-trained without the leaked prices: 487 bets, -3.5%).
   V1 2024-25 best of 10: 585 bets, +4.4% [-3.6%, +12.1%];
   V1 2025-26 DraftKings: 727 bets, -10.0% [-16.6%, -3.4%].
   V2 and V3 are no better (V3 2024-25 best of 10: -6.7%).
   Edge buckets: V0 2024-25 6-9 points +16.0% [+2.6%, +29.2%] on 256
   bets, but 2.5-4 -12.5% and 9+ +0.3%, and 2025-26 6-9 is +5.0%
-  [-20.5%, +30.8%]. With 4 buckets x 2 seasons x 4 variants looked at,
+  [-20.5%, +30.8%] (production model: -11.4% on 75 bets). With 4 buckets x 2 seasons x 4 variants looked at,
   one interval that excludes 0 is what chance alone would give; it is
   not evidence for a threshold.
   CLV: mean closing EV of the prices taken is negative everywhere
@@ -254,7 +295,9 @@ Priced backtests (descriptive). Flat ROI with 95% game-clustered CI:
   taker fee alone turning V0's 2024-25 +0.1% into -3.1% (Kalshi) and
   -3.1% (Polymarket).
 
-Bet-timing study (V0, 889 games with a morning snapshot). How the close
+Bet-timing study (the experiment's leaky-trained V0, 889 games with a
+morning snapshot; the production model's re-run is in the production
+check above). How the close
 arm was built: the pre-registration says "as the 2024-25 backtest,
 restricted to the same games", but V0's 2024-25 backtest is scored by
 the market-blind fallback F (V0 has no 2024-25 market input). The close
@@ -814,10 +857,11 @@ def score_variants(y, meta, oofs: dict, market: pd.DataFrame,
         v["beats_market"] = beats_market(v["vs_market"])
         out["variants"][k] = v
         vs_v0[k], vs_mkt[k] = v["vs_v0"], v["vs_market"]
-    pairwise = {(a, b): paired((ll[a] - ll[b])[scored])
-                for a in ADOPTABLE for b in ADOPTABLE if a != b}
-    out["pairwise"] = {f"{a}-{b}": d for (a, b), d in pairwise.items()}
-    out["decision"] = adopt(vs_v0, vs_mkt, pairwise)
+    if all(k in oofs for k in ADOPTABLE):
+        pairwise = {(a, b): paired((ll[a] - ll[b])[scored])
+                    for a in ADOPTABLE for b in ADOPTABLE if a != b}
+        out["pairwise"] = {f"{a}-{b}": d for (a, b), d in pairwise.items()}
+        out["decision"] = adopt(vs_v0, vs_mkt, pairwise)
     return out
 
 
@@ -969,6 +1013,63 @@ def run_all(seeds: Iterable[int] = ROBUST_SEEDS, save: bool = True) -> dict:
     return res
 
 
+def production_check(seed: int = SEED) -> dict:
+    """The production model as it is now (models/lgbm.py: every game with
+    an in-play stored line treated as having no market, for training and
+    for scoring) put through the experiment's V0 scoring, priced
+    backtests and timing study. Added 2026-10-08, after the experiment:
+    these numbers are NOT pre-registered and decide nothing. Read-only;
+    returns the result and writes nothing."""
+    inp = load_inputs()
+    X, y, meta, names, market = (inp["X"], inp["y"], inp["meta"],
+                                 inp["names"], inp["market"])
+    inplay = inp["unibet_inplay_ids"]
+    Xm = clear_market(X, names, meta["game_id"].to_numpy(), inplay)
+    oof, fm = walk_forward(Xm, y, meta, names, seed, TIMING_SEASON)
+    avail = Xm[:, names.index("market_available")] == 1.0
+    clean = ~meta["game_id"].isin(set(inplay)).to_numpy()
+    res = {"seed": seed, "n_unibet_inplay_games": len(inplay),
+           "scores": score_variants(y, meta, {"V0": oof}, market,
+                                    avail)["variants"]["V0"],
+           "scores_clean": score_variants(
+               *subset(y, meta, {"V0": oof}, avail, clean)[:3], market,
+               avail[clean])["variants"]["V0"],
+           "backtests": run_backtests(priced_frame(meta, market, oof))}
+    res["timing"] = timing_study(fm, Xm, names, meta, market, oof)
+    return res
+
+
+def report_production(res: dict) -> str:
+    """Plain-text summary of a production_check result."""
+    lines = []
+    for label, v in (("All games", res["scores"]),
+                     ("Clean games", res["scores_clean"])):
+        m = v["vs_market"]
+        lines.append(
+            f"{label}: LL {v['log_loss']:.5f} ECE {v['ece']:.4f} | vs market "
+            f"{m['mean']:+.5f} (SE {m['se']:.5f}, n {m['n']}) | by season "
+            + str({s: (round(d['mean'], 5), round(d['se'], 5))
+                   for s, d in v['vs_market_by_season'].items()}))
+    for view, r in res["backtests"].items():
+        if r.get("bets"):
+            lines.append(
+                f"{view:45s} bets {r['bets']:4d} flat {r['flat_roi']:+.2%} "
+                f"{['%+.1f%%' % (100 * c) for c in r['flat_roi_ci']]} "
+                f"kelly {r['kelly_roi']:+.2%} maxDD {r['max_drawdown']:.0%} "
+                f"closeEV {r['close_ev']:+.4f} buckets "
+                + str({b: (d['bets'], round(d.get('flat_roi', 0), 3))
+                       for b, d in r['buckets'].items()}))
+        else:
+            lines.append(f"{view:45s} no bets")
+    t = res["timing"]
+    lines.append(f"Timing ({t['games']} games): H1 slope {t['H1']['slope']:.3f} "
+                 f"t {t['H1']['t']:.2f}; H2 closeEV {t['H2']['close_ev']['mean']:+.4f} "
+                 f"(SE {t['H2']['close_ev']['se']:.4f}); H3 {t['H3']}; morning "
+                 f"{t['morning_arm']['bets']} bets {t['morning_arm']['flat_roi']:+.2%}, "
+                 f"close {t['close_arm']['bets']} bets {t['close_arm']['flat_roi']:+.2%}")
+    return "\n".join(lines)
+
+
 def _json(o):
     if isinstance(o, (np.integer,)):
         return int(o)
@@ -1043,4 +1144,8 @@ def report(res: dict) -> str:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    print(report(run_all()))
+    import sys
+    if "--production" in sys.argv[1:]:
+        print(report_production(production_check()))
+    else:
+        print(report(run_all()))
