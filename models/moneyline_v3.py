@@ -154,24 +154,52 @@ restricted to the same games.
 =====================================================================
 STATUS (run 2026-10-04, seed 42, robustness seeds 1 and 2; results in
 models/artifacts/moneyline_v3_results.json; re-run with
-`python -m models.moneyline_v3`, read-only)
+`python -m models.moneyline_v3`, read-only. Updated 2026-10-07 after the
+independent review: clean-game scores added, V1mc re-read. The
+pre-registered variants and the post-hoc diagnostics come from one run:
+the diagnostic code existed when the results file was written but was
+committed a day later, so git cannot show that they came after.
+Diagnostic code is committed before it runs from now on.)
 =====================================================================
 
-Decision: V0 stays. No variant is eligible, so models/lgbm.py is
+Decision: V0 stays. No variant is eligible, so models/lgbm.py's model is
 unchanged. 6,993 walk-forward games scored, 2,412 priced.
 
+The in-play leak (found by the review). For 106 Unibet games in late
+2023-24, the "closing" line ESPN stored was captured DURING the game
+(→ in play: the price already knows the score, e.g. -10000 on a team
+leading late). That leaks the result into the market input of V0-V3:
+those 106 games score a log loss of 0.45 (the 34 with a moneyline of
+1,000 or more: 0.14) against about 0.66 for the rest. The pre-registered
+run used features.game_vector as stored, so the leak is in every
+variant's numbers below. It flatters each pooled figure by about 0.003
+and changes no decision. The rule that finds the rows is
+features.market_prices.inplay_mask; the production model now treats
+those games as having no market (models/lgbm.py), for training and for
+scoring. Its own walk-forward evaluation, re-run read-only on
+2026-10-07: pooled log loss 0.6616 before, 0.6648 after (2023-24
+0.6453 -> 0.6593); the gate (beat the 0.6829 baseline) still passes.
+
 Pooled log loss (lower is better), difference vs V0 with paired SE, and
-vs the consensus no-vig close on the 2,412 priced games:
-  V0   0.66163                          vs market +0.0037 (SE 0.0025)
-  V1   0.66223  +0.00060 (SE 0.00100)   vs market +0.0055 (SE 0.0020)
-  V1p  0.66225  +0.00062 (SE 0.00099)   vs market +0.0055 (SE 0.0020)
-  V2   0.66228  +0.00066 (SE 0.00110)   vs market +0.0070 (SE 0.0019)
-  V3   0.66207  +0.00044 (SE 0.00114)   vs market +0.0074 (SE 0.0019)
+vs the consensus no-vig close on the 2,412 priced games. "All" = the
+6,993 games as pre-registered (leak included); "clean" = the 6,887
+games without an in-play line (the honest figure):
+        all      clean    clean vs V0           vs market (priced games)
+  V0   0.66163  0.66484                         +0.0037 (SE 0.0025)
+  V1   0.66223  0.66545  +0.00061 (SE 0.00101)  +0.0055 (SE 0.0020)
+  V1p  0.66225  0.66548  +0.00063 (SE 0.00101)  +0.0055 (SE 0.0020)
+  V2   0.66228  0.66547  +0.00062 (SE 0.00112)  +0.0070 (SE 0.0019)
+  V3   0.66207  0.66525  +0.00040 (SE 0.00116)  +0.0074 (SE 0.0019)
+  (All games, vs V0: V1 +0.00060 (SE 0.00100), V1p +0.00062 (0.00099),
+  V2 +0.00066 (0.00110), V3 +0.00044 (0.00114).) The priced games are
+  2024-25 and 2025-26 only, which have no in-play rows, so the market
+  test is the same either way. V0 in 2023-24: 0.6453 all, 0.6611 clean.
   Market (consensus no-vig close) on the priced games: 0.6666
   (2024-25 0.6573, 2025-26 DraftKings 0.6794); Pinnacle no-vig 0.6576.
   None beats V0 (condition (a) fails for all), and V1, V2 and V3 are
-  each worse than the market at 95% (condition (b) fails too). Seeds 1
-  and 2 agree: no variant reaches 2 SE, the rule picks V0 every time.
+  each worse than the market at 95% (condition (b) fails too), on all
+  games and on clean games. Seeds 1 and 2 agree: no variant reaches
+  2 SE, the rule picks V0 every time, on all games and on clean games.
   By season: V1 matches the market in 2024-25 (-0.0010, SE 0.0017; vs
   Pinnacle -0.0010, SE 0.0017) but is clearly worse than DraftKings in
   2025-26 (+0.0144, SE 0.0042), while V0 matches DraftKings there
@@ -180,15 +208,27 @@ vs the consensus no-vig close on the 2,412 priced games:
   three-way seasons that does not transfer to two-way prices.
   ECE (calibration miss): V0 0.017, V1 0.019, V2 0.018, V3 0.016.
 
-Post-hoc diagnostics (added after the run, never adoptable; the older,
-superseded pre-registration in another branch had listed a Unibet
-mapping as a candidate, which is why they were tried):
+Post-hoc diagnostics (never adoptable; the older, superseded
+pre-registration in another branch had listed a Unibet mapping as a
+candidate, which is why they were tried):
   V1m  V1 + a per-fold logistic mapping of Unibet-era market
        probabilities onto the two-way scale, fitted on training rows
-       only: 0.66224, +0.00001 (SE 0.00042) vs V1. No help.
-  V1mc V1m with the 106 Unibet rows that look captured in play treated
-       as having no market: 0.66440, +0.0022 (SE 0.0008) vs V1. Worse
-       (2023-24 loses its market on those games).
+       only: 0.66224, +0.00001 (SE 0.00042) vs V1 (clean games the
+       same: +0.00001, SE 0.00042). No help.
+  V1mc V1m with the 106 in-play rows treated as having no market.
+       On all games it looks worse than V1 (0.66440, +0.0022, SE
+       0.0008), but all of that gap is the leaked result being taken
+       away: the other variants are scored with the in-play prices on
+       those 106 games, V1mc without. On the 6,887 clean games V1mc is
+       a little BETTER than V1 (-0.00066, SE 0.00049; 0.66480, the
+       lowest clean loss of any model, -0.00005 vs V0, SE 0.00107) and
+       the closest to the market (+0.0042, SE 0.0019, against V1's
+       +0.0055; 2024-25 -0.003 against V1's -0.001). None of these gaps
+       reaches 2 SE, and it stays non-adoptable as pre-registered. Its
+       backtests follow V1's pattern: 2024-25 best of 10 books 356 bets
+       +9.5% [+1.6%, +17.4%], then 2025-26 DraftKings 741 bets -8.6%
+       [-15.3%, -2.1%], closing EV negative in both. One good season
+       followed by a clearly bad one is not an edge.
 
 Priced backtests (descriptive). Flat ROI with 95% game-clustered CI:
   V0 2024-25 best of 10 books: 1,049 bets, +0.6% [-6.0%, +6.9%]
@@ -214,7 +254,19 @@ Priced backtests (descriptive). Flat ROI with 95% game-clustered CI:
   taker fee alone turning V0's 2024-25 +0.1% into -3.1% (Kalshi) and
   -3.1% (Polymarket).
 
-Bet-timing study (V0, 889 games with a morning snapshot):
+Bet-timing study (V0, 889 games with a morning snapshot). How the close
+arm was built: the pre-registration says "as the 2024-25 backtest,
+restricted to the same games", but V0's 2024-25 backtest is scored by
+the market-blind fallback F (V0 has no 2024-25 market input). The close
+arm instead re-scores each game with the same fold's market-offset model
+M, given the CLOSE consensus as its market input, exactly as the morning
+arm gives M the morning consensus. That keeps the two arms the same
+model with a different market input, so H3 compares the timing and not
+two different models; it is also why the close arm (359 bets, +6.4%)
+does not look like V0's 2024-25 backtest (1,049 bets, +0.6%). The JSON
+key close_model_max_abs_diff_vs_oof (0.244) is the largest gap between
+the close arm's probabilities and V0's out-of-fold ones, not a check
+that they match.
   H1 not supported: slope of the line's move on the model's morning
      edge 0.039, t 1.90 (needed t >= 2). A hint, not evidence.
   H2 not supported: morning bets' mean closing EV -1.65% (SE 0.18%);

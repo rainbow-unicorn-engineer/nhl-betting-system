@@ -1,6 +1,6 @@
 # Moneyline backtest results (current, reproducible)
 
-**Run date:** 2026-10-04 · **Code:** `models/moneyline_v3.py` (pre-registration and full numbers in its docstring) · **Raw output:** `models/artifacts/moneyline_v3_results.json` · **Re-run:** `.venv\Scripts\python -m models.moneyline_v3` (read-only: it writes only the JSON file)
+**Run date:** 2026-10-04, updated 2026-10-07 after an independent review (clean-game log loss added, see "The in-play leak") · **Code:** `models/moneyline_v3.py` (pre-registration and full numbers in its docstring) · **Raw output:** `models/artifacts/moneyline_v3_results.json` · **Re-run:** `.venv\Scripts\python -m models.moneyline_v3` (read-only: it writes only the JSON file)
 
 This page replaces the betting half of [phase3_results.md](phase3_results.md). Its headline, "+26.6% flat ROI on bets with a 6-9% edge", came from 46 bets in one season and does not reproduce: the same bucket is +5.0% on 65 bets in 2025-26 today, with an interval from -20.5% to +30.8%.
 
@@ -16,6 +16,8 @@ This page replaces the betting half of [phase3_results.md](phase3_results.md). I
 - **95% interval** (game-clustered bootstrap) → resample whole games 10,000 times and keep the middle 95% of the results. If it contains 0, the result could be luck.
 - **CLV / closing EV** → whether the price we took was better than the market's final price. Closing EV = (closing no-vig probability of our side) x (decimal odds we took) - 1. Positive means we beat the close.
 - **Pinnacle** → a low-margin book that professional bettors use; its closing price is the usual "sharpest" benchmark.
+- **In play** → a price taken after the game has started, so it already reflects the score.
+- **Leak** → information the model could not have had before the game (here, the game's own result) getting into its inputs by mistake. It makes a model look better than it is.
 
 ## The data
 
@@ -27,22 +29,34 @@ This page replaces the betting half of [phase3_results.md](phase3_results.md). I
 
 There are **no Kalshi or Polymarket prices** in any of this: the history covers 10 sportsbooks. So there is no real exchange backtest; the exchange rows below are a labelled what-if.
 
+## The in-play leak (found 2026-10-07)
+
+The model's main input is the market's own price for each game. For the older seasons that price is the "closing" line ESPN stored. For **106 games in late 2023-24, ESPN's Unibet line was not taken before the game but during it**: prices like -10000 on a team already winning late, or over/under lines such as 2.0 or 13.0 that only make sense once goals have been scored. A model fed those prices is partly being told who won. On those 106 games the model's log loss was 0.45 (0.14 on the 34 priced at 1,000 or more), against about 0.66 everywhere else.
+
+What that did: the headline log loss of the experiment (0.66163 for the current model) was about 0.003 too good. On the 6,887 games without an in-play line it is **0.66484**. No decision changes: the market comparison below uses only 2024-25 and 2025-26, which have no in-play rows, and no variant comes near 2 SE either way.
+
+What was fixed:
+
+- A shared rule now finds those rows (`features/market_prices.py`, `inplay_mask`): a moneyline of 1,000 or more on either side; both sides priced as underdogs at once; an over/under line under 5 or at 8 and above; or any Unibet line from 2024-04-08 to the end of 2023-24, the stretch where 42 of 97 lines break the other rules. It flags those 106 Unibet games and no DraftKings line.
+- The production model (`models/lgbm.py`) and the stored-feature builder (`features/build_vectors.py`) treat those games as having **no market** (`market_available = 0`), for training and for scoring. The production model's own walk-forward log loss goes from 0.6616 to **0.6648** (2023-24: 0.6453 to 0.6593). It still passes its gate (beat the 0.6829 baseline).
+- The simulation fallback in `betting/recommend.py` never prices a game off such a line.
+
 ## 1. Does the model beat the market? No.
 
-Walk-forward (→ train on earlier seasons, score the next) over 6,993 games; market comparison on the 2,412 priced games.
+Walk-forward (→ train on earlier seasons, score the next) over 6,993 games; market comparison on the 2,412 priced games. "All games" is the pre-registered figure and includes the leak; "clean games" leaves out the 106 in-play games and is the honest one.
 
-| Model | What it adds | Log loss | vs V0 (SE) | vs market on priced games (SE) |
-|---|---|---:|---:|---:|
-| V0 | the current model | 0.66163 | — | +0.0037 (0.0025) |
-| V1 | real 2024-25 consensus market as its starting point | 0.66223 | +0.0006 (0.0010) | +0.0055 (0.0020) |
-| V2 | V1 + power-play form | 0.66228 | +0.0007 (0.0011) | +0.0070 (0.0019) |
-| V3 | V2 + goalie-role inputs | 0.66207 | +0.0004 (0.0011) | +0.0074 (0.0019) |
+| Model | What it adds | Log loss, all games | Log loss, clean games | vs V0, clean (SE) | vs market on priced games (SE) |
+|---|---|---:|---:|---:|---:|
+| V0 | the current model | 0.66163 | **0.66484** | — | +0.0037 (0.0025) |
+| V1 | real 2024-25 consensus market as its starting point | 0.66223 | 0.66545 | +0.0006 (0.0010) | +0.0055 (0.0020) |
+| V2 | V1 + power-play form | 0.66228 | 0.66547 | +0.0006 (0.0011) | +0.0070 (0.0019) |
+| V3 | V2 + goalie-role inputs | 0.66207 | 0.66525 | +0.0004 (0.0012) | +0.0074 (0.0019) |
 
 Positive = worse. The market's own log loss on those games is 0.6666 (Pinnacle alone 0.6576 in 2024-25).
 
 - **Rule fixed in advance:** a variant replaces V0 only if it beats V0 by 2 SE and is not worse than the market at 95%. None does, under any of three random seeds. **The production model is unchanged.**
 - **The model is at best equal to the market, never better.** In 2024-25 V1 ties the consensus close and Pinnacle (-0.0010, SE 0.0017). In 2025-26 V0 ties DraftKings (+0.00004), and V1 is clearly worse (+0.0144, SE 0.0042). Why V1 drifts in 2025-26 is not known (a guess: corrections learned on Unibet seasons do not carry over).
-- Two after-the-fact checks (mapping the Unibet lines onto a two-way scale; removing 106 Unibet rows that look captured during the game) did not help. They were never eligible for adoption.
+- Two after-the-fact checks were never eligible for adoption. Mapping the Unibet lines onto a two-way scale (V1m) changed nothing. Removing the 106 in-play lines from V1's input (V1mc) looks worse on all games (+0.0022 vs V1, SE 0.0008), but only because the other models are still reading the result off those 106 prices. On the clean games it is slightly **better** than V1 (-0.0007, SE 0.0005) and the closest of all to the market (+0.0042 vs the close, SE 0.0019; V1 +0.0055). None of these gaps reaches 2 SE. Its backtests repeat V1's pattern: +9.5% on 356 bets in 2024-25 (interval +1.6% to +17.4%), then -8.6% on 741 bets in 2025-26 (-15.3% to -2.1%), with negative closing EV in both. A good season followed by a clearly bad one is not an edge.
 
 ## 2. Priced backtests
 
@@ -97,7 +111,9 @@ Questions fixed in advance; all three come out "not shown".
 | H2: do morning bets beat the closing line? | closing EV -1.65% (SE 0.18%); the line moved toward our side by only 0.17 points (SE 0.09) | No: morning prices are worse than the no-vig close |
 | H3: which slot pays better? | morning minus close: flat ROI -1.1% (-3.4%, +1.1%); closing EV +0.16% (-0.21%, +0.52%) | Neither |
 
-Morning arm: 361 bets, +5.2% flat (-4.4%, +15.0%). Close arm: 359 bets, +6.4% (-3.5%, +16.3%). Caveat fixed in advance: both arms used the actual starting goalie, which is often not confirmed at 10:00, so the morning arm is slightly flattered.
+Morning arm: 361 bets, +5.2% flat (-4.4%, +15.0%). Close arm: 359 bets, +6.4% (-3.5%, +16.3%).
+
+How the close arm was built, which the first version of this page left out: the plan said "as the 2024-25 backtest, on the same games", but V0's 2024-25 backtest is scored by the market-blind fallback model (V0 has no 2024-25 market input). The close arm instead gives the same market-starting model the closing price as its input, just as the morning arm gives it the morning price. Both arms are then the same model with a different starting price, so H3 measures the timing and not two different models. That is why the close arm (359 bets, +6.4%) does not look like the V0 2024-25 backtest above (1,049 bets, +0.6%). Caveat fixed in advance: both arms used the actual starting goalie, which is often not confirmed at 10:00, so the morning arm is slightly flattered.
 
 ## Bottom line
 
