@@ -202,6 +202,8 @@ moneyline or props fold scores or trains on (each skips a season that
 small). Re-run read-only on 2026-10-06 with the 2026-27 shots present:
 every number above came out identical (shot level on 605,110 shots,
 moneyline 6,993 games, props 248,589 player-games, same decision).
+Re-run again read-only on 2026-10-07 with 4,266 shots of 2026-27 present:
+the same numbers again, to every reported digit.
 
 The other attempt at this track (branch model/xg-layer-a, file
 experiments/2026-10-04-xg-layer-a.md) pre-registered a different bar
