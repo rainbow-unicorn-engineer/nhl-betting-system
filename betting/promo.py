@@ -10,20 +10,23 @@ equal-profit hedge stakes and reports PER-BETTOR P&L per outcome; it
 never pools stakes and has no concept of one bettor placing for another.
 
 All hedge math is in decimal odds against the hedge side's EFFECTIVE
-decimal (venue fees folded in). Fee coefficients are parameters —
-Polymarket already moved its sports taker fee 0.03 -> 0.05 in July 2026.
+decimal (venue fees folded in). Fee coefficients are parameters, with
+defaults from betting/engine.EXCHANGE_TAKER_FEES (one source for every
+module): Kalshi 0.07; Polymarket US 0.0695 exchange-wide since
+2026-10-01 (docs.polymarket.us/fees; it was 0.03, then 0.05 for sports
+from July 2026).
 """
 import argparse
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from betting.engine import decimal_odds
+from betting.engine import EXCHANGE_TAKER_FEES, decimal_odds
 
 logger = logging.getLogger("nhl.betting.promo")
 
-KALSHI_TAKER = 0.07
-POLYMARKET_TAKER = 0.05
+KALSHI_TAKER = EXCHANGE_TAKER_FEES["kalshi"]            # 0.07
+POLYMARKET_TAKER = EXCHANGE_TAKER_FEES["polymarket"]    # 0.0695 since 2026-10-01
 
 
 # ── Venue cost models ──────────────────────────────────────────────

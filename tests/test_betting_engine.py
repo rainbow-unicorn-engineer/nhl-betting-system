@@ -72,6 +72,77 @@ class TestSettle:
         assert settle(a, home_won=True, stake=2.0) == -2.0
 
 
+class TestExchangeFees:
+    """Kalshi 0.07 and Polymarket US 0.0695 taker fees: per contract
+    c * p * (1 - p); one contract costs p + fee and pays 1."""
+
+    def test_fee_coefficients_and_source_values(self):
+        from betting.engine import EXCHANGE_TAKER_FEES
+        assert EXCHANGE_TAKER_FEES == {"kalshi": 0.07, "polymarket": 0.0695}
+
+    def test_exchange_fee_per_contract(self):
+        from betting.engine import exchange_fee
+        assert exchange_fee("kalshi", 0.5) == pytest.approx(0.0175)
+        assert exchange_fee("Polymarket", 0.5) == pytest.approx(0.017375)
+        assert exchange_fee("polymarket", 0.2) == pytest.approx(0.0695 * 0.16)
+        assert exchange_fee("draftkings", 0.5) == 0.0
+        assert exchange_fee(None, 0.5) == 0.0
+
+    def test_effective_decimal(self):
+        from betting.engine import effective_decimal
+        # +100 at Kalshi: contract 0.50, cost 0.5175 -> 1.9324
+        assert effective_decimal(100, "kalshi") == pytest.approx(1 / 0.5175)
+        # -150 at Polymarket: contract 0.60, fee .0695*.24 = .01668
+        assert effective_decimal(-150, "polymarket") == pytest.approx(1 / 0.61668)
+        # a sportsbook's price is already all-in
+        assert effective_decimal(-150, "fanduel") == pytest.approx(decimal_odds(-150))
+        assert effective_decimal(130) == pytest.approx(2.3)
+
+    def test_kelly_and_ev_use_the_fee(self):
+        from betting.engine import expected_value
+        # p=.55 at +100: no fee f*=.10; Kalshi b = 1/.5175 - 1 = .93237
+        b = 1 / 0.5175 - 1
+        assert kelly_fraction(0.55, 100, "kalshi") == pytest.approx((b * .55 - .45) / b)
+        assert kelly_fraction(0.55, 100, "kalshi") < kelly_fraction(0.55, 100)
+        assert expected_value(0.55, 100) == pytest.approx(0.10)
+        assert expected_value(0.55, 100, "kalshi") == pytest.approx(0.55 / 0.5175 - 1)
+
+    def test_fee_can_turn_a_bet_into_a_skip(self):
+        from betting.engine import evaluate_market
+        # fair .50, model .527 at +100: edge 2.7 pts >= 2.5. At a book
+        # Kelly > 0; at Kalshi p*1.932 - 1 = .0184 > 0 still bets...
+        d = evaluate_market(0.527, 0.5, 100, 100)
+        assert d is not None and d.book is None and d.ev == pytest.approx(0.054)
+        dk = evaluate_market(0.527, 0.5, 100, 100, home_book="kalshi")
+        assert dk is not None and dk.book == "kalshi"
+        assert dk.ev == pytest.approx(0.527 / 0.5175 - 1)
+        assert dk.stake_pct < d.stake_pct
+        # ...but at -105 the fee makes it negative: 1/(.5122+.0175)=1.888
+        assert evaluate_market(0.527, 0.5, -105, -105, home_book="kalshi") is None
+        assert evaluate_market(0.527, 0.5, -105, -105) is not None
+
+    def test_away_side_takes_its_own_book(self):
+        from betting.engine import evaluate_market
+        d = evaluate_market(0.40, 0.5, 100, 100, home_book="draftkings",
+                            away_book="polymarket")
+        assert d.side == "AWAY" and d.book == "polymarket"
+
+    def test_settle_pays_net_of_fee(self):
+        k = BetDecision("HOME", 100, 0.55, 0.5, 0.05, 0.07, 0.0175, book="kalshi")
+        assert settle(k, home_won=True, stake=10.0) == pytest.approx(10 * (1 / 0.5175 - 1))
+        assert settle(k, home_won=False, stake=10.0) == -10.0
+        # unchanged for sportsbooks and for decisions with no book
+        b = BetDecision("HOME", 100, 0.55, 0.5, 0.05, 0.07, 0.0175, book="betmgm")
+        assert settle(b, home_won=True, stake=10.0) == pytest.approx(10.0)
+
+    def test_promo_reads_the_engine_coefficients(self):
+        from betting import promo
+        assert promo.POLYMARKET_TAKER == 0.0695
+        assert promo.KALSHI_TAKER == 0.07
+        assert promo.effective_decimal("polymarket", contract_price=0.5) == \
+            pytest.approx(1 / (0.5 + 0.0695 * 0.25))
+
+
 class TestGameCaps:
     """Per-game limits (§7: max 3 correlated bets per game), any market.
     Bankroll 1000: 4% = 40 across every bet on one game."""

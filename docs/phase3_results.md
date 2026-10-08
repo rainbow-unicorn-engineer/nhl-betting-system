@@ -59,6 +59,11 @@ own fold there (0.6683).
 
 ## Betting half: engine + payout backtest
 
+> **Superseded (2026-10-04).** The backtest numbers below, including the
+> "+26.6%" 6-9% bucket, no longer reproduce. Current, reproducible numbers
+> for 2024-25 (10 books) and 2025-26 (DraftKings) are in
+> [backtest_results.md](backtest_results.md). Kept for the record.
+
 `betting/engine.py` implements the locked §7 rules as pure, hand-verified
 functions (no-vig fair probs, full/quarter Kelly, 2%-per-bet + 10%-per-day
 caps, edge threshold); `betting/backtest.py` runs walk-forward OOF

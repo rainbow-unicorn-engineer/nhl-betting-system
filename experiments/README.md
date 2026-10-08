@@ -26,6 +26,7 @@ Terms used below:
 | 2026-10-04 | TabPFN (pretrained table model from Hugging Face) for the moneyline: A feature, B market residual, C average with lgbm v2 | `experiments/tabpfn/` (separate `tabpfn` dependency group) | No variant passes: 0/5 seasons beat lgbm v2 by 2 SE. Best was C, a tie (+0.0001 ± 0.0005). All lose to the no-vig market. lgbm v2 stays. |
 | 2026-10-04 | Our own expected-goals (xG) model, Layer A (variants X1 core, X2 + prior attempt) | `features/xg.py`, `models/xg.py` (opt-in) | Fails its gate vs MoneyPuck's xG on 605k held-out shots: AUC 0.761 vs 0.787, log loss +0.0086 (SE 0.0002); better calibrated (ECE 0.005 vs 0.011). Downstream: moneyline log loss +0.0018 (SE 0.0008) worse with our xG; props unchanged, and player xG features don't help props at all. Not adopted; MoneyPuck's xG stays. |
 | 2026-10-05 | Free data loaders: shift charts, scratches and officials, Kalshi prices (acceptance checks S1-S3, G1-G3, K1-K4) | `ingestion/nhl_shifts.py`, `ingestion/nhl_game_info.py`, `ingestion/kalshi.py` | Data, not a model. Every check passes on the full backfill (7,984 games; 1,686 Kalshi events). A later check found repeated and wrong-game shift rows that the median in S3 could not see; the shift loader now cleans them and marks games that fail a per-game ice-time check 'suspect' (repair rehearsed on a copy: 7,981 ok, 3 suspect; the live run is pending). Kalshi's pre-game close sits within 0.55 points of DraftKings' no-vig close at the median. Details in `docs/data_sources.md` 2.13. |
+| 2026-10-04 | Moneyline v3: real 2024-25 market input (V1), + power-play form (V2), + goalie roles (V3); priced backtests; morning-vs-close timing | `models/moneyline_v3.py`, `features/market_prices.py`, `features/power_play.py` | No variant passes; V0 stays. The experiment's V0 scored 0.6616 on all 6,993 games, flattered by 106 2023-24 market prices taken during the game (a leak found by the review); leaving those games out of the scoring gives 0.66484, but the model was still trained on them. The production model, re-trained with them masked, scores 0.66479 on all games (0.66520 on the clean ones) and is 0.0047 worse than the no-vig close (SE 0.0025); its 2025-26 DraftKings backtest is 487 bets, -3.5%. Best is V3 at +0.0004 ± 0.0012 vs V0, and V1-V3 are each worse than the no-vig close at 95%. Backtests: every V0 ROI interval includes 0, closing EV negative. Timing: neither morning nor close is better. See `docs/backtest_results.md`. |
 
 ## Re-running
 
@@ -38,6 +39,7 @@ Terms used below:
 .venv\Scripts\python -m betting.sgp --evaluate          # same-game parlay pricer vs independence (read-only)
 .venv\Scripts\python -m experiments.tabpfn.run         # TabPFN trial (read-only; needs the tabpfn group and its weights, see experiments/tabpfn/README.md)
 .venv\Scripts\python -m models.xg --downstream          # our xG vs MoneyPuck, then the moneyline and props test (read-only)
+.venv\Scripts\python -m models.moneyline_v3           # moneyline v3, priced backtests, timing (read-only)
 ```
 
 The goalie variants run from Python: `models.totals.run_totals(register=False, variant="C", with_roles=True)`.

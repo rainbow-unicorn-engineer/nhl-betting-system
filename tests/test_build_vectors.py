@@ -15,7 +15,7 @@ from sqlalchemy import text
 
 from features.build_vectors import (
     FEATURE_NAMES, GOALIE_STATS, TEAM_STATS, assemble, build_game_vectors,
-    feature_names,
+    feature_names, market_from_odds,
 )
 from features.util import WINDOWS
 
@@ -134,6 +134,26 @@ class TestAssemble:
             v = vec_of(df)
             assert v["market_home_prob"] == 0.5
             assert v["market_available"] == 0.0
+
+    def test_inplay_line_gives_no_market(self):
+        """A stored line captured during the game (here -2000 / +2800, the
+        price of a game already decided) must not reach the vector: the
+        game gets market_available = 0, a pre-game line still counts."""
+        odds = pd.DataFrame({
+            "game_id": [1, 2], "provider": "Unibet", "season": 20232024,
+            "date": ["2024-03-01", "2024-03-01"],
+            "home_ml": [-2000, -150], "away_ml": [2800, 130],
+            "over_under": [5.5, 6.0]})
+        market = market_from_odds(odds)
+        assert market["game_id"].tolist() == [2]
+        assert market["market_home_prob"].iloc[0] == pytest.approx(
+            0.6 / (0.6 + 100 / 230))
+        df = assemble(synth_games(), synth_team_wide(),
+                      synth_starters(), synth_goalie_wide(), market=market)
+        v = vec_of(df)
+        assert v["market_home_prob"] == 0.5
+        assert v["market_available"] == 0.0
+        assert market_from_odds(odds.iloc[:0]).empty
 
 
 # ─────────────────────────────────────────────

@@ -42,23 +42,62 @@ Implications:
   `raw.odds_snapshots` going forward carry true bettable two-way prices.
   Do not simulate moneyline payouts against Unibet-era rows.
 
+## In-play rows
+
+Found by an independent review on 2026-10-07. For 106 Unibet games in
+2023-24 the stored "closing" line was captured during the game (→ in
+play: the price already reflects the score). Signs: moneylines such as
+-10000 / +5000, both sides priced long at once (a tied game late on),
+and totals (→ the over/under goals line) of 2.0, 3.5, 8.5, 10.5 or 13.0.
+Such a line leaks the result: the stored market's log loss on those
+106 games is 0.452 (0.126 on the 34 with a moneyline of 1,000 or more),
+against about 0.66 for the rest.
+
+The rule (`features.market_prices.inplay_mask`, shared by every reader
+that uses these rows as a pre-game market) flags a row when any of
+these holds:
+
+1. a moneyline of 1,000 or more on either side (91%+ implied): the
+   largest line among all other rows is 750;
+2. the two sides' implied probabilities sum to under 0.75 (pre-game
+   Unibet sums sit near 0.83, DraftKings near 1.04);
+3. a total under 5 or at 8 and above (pre-game totals sit from 5 to
+   7.5; DraftKings posts 7.5 a few times in 2025-26);
+4. any Unibet row from 2024-04-08 to the end of 2023-24: in that
+   stretch 42 of the 97 rows break rules 1-3 (0 to 3 a week before),
+   so the normal-looking ones cannot be trusted either.
+
+Rules 1-3 flag 51 rows and rule 4 adds 55 more: 106 Unibet 2023-24
+games, no DraftKings row and no Unibet row in any other season. Those
+games get `market_available = 0` in `features/build_vectors.py` and
+`models/lgbm.py`, and `betting/recommend.py` never prices a simulated
+game off one. 2023-24 market log loss: 0.6408 with them, 0.6574 without.
+
 ## Predictive quality audit
 
 No-vig home implied probability vs actual outcomes (log loss; lower is
-better; our Phase 2 model OOF = 0.6829, naive = 0.693):
+better; our Phase 2 model OOF = 0.6829, naive = 0.693; accuracy → the
+share of games where the favourite won). Every game with a two-sided
+line and a result, regular season and playoffs, recomputed from the
+database on 2026-10-08. The first pair of columns keeps every stored
+row; the second leaves out the 106 in-play rows (see above), which is
+what the models now see. Only 2023-24 and the pooled row differ. (The
+first version of this table, from an earlier load, differed by up to
+0.0014 per season; its pooled figure, 0.6529, included the in-play
+rows.)
 
-| Season   | Market LL | Market acc |
-|----------|----------:|-----------:|
-| 2020-21  | 0.6548 | .620 |
-| 2021-22  | 0.6409 | .644 |
-| 2022-23  | 0.6567 | .605 |
-| 2023-24  | 0.6399 | .625 |
-| 2025-26  | 0.6795 | .560 |
-| **Pooled** | **0.6529** | **.613** |
+| Season | Games | Market LL, all rows | Accuracy, all rows | Market LL, in-play rows left out | Accuracy, in-play rows left out |
+|---|---:|---:|---:|---:|---:|
+| 2020-21 | 929 | 0.6544 | .620 | 0.6544 | .620 |
+| 2021-22 | 1,381 | 0.6403 | .644 | 0.6403 | .644 |
+| 2022-23 | 1,359 | 0.6553 | .608 | 0.6553 | .608 |
+| 2023-24 | 1,307 all, 1,201 without | 0.6408 | .624 | 0.6574 | .611 |
+| 2025-26 | 1,014 | 0.6794 | .559 | 0.6794 | .559 |
+| **Pooled** | 5,990 all, 5,884 without | **0.6526** | **.613** | **0.6562** | **.611** |
 
 The market beats our current model by ~0.03 log loss everywhere —
 including fold 5 (2025-26), where our model regressed to near-naive but
-the market held 0.6795. This is the strongest single feature available
+the market held 0.6794. This is the strongest single feature available
 and the Phase 3 priority.
 
 ## The Odds API historical endpoint (bought 2026-10-04)

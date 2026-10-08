@@ -29,6 +29,19 @@ Rules (locked):
 - Edge is measured against the NO-VIG implied probability; payouts are
   settled at the actual (vig-inclusive) price. Both matter: edge vs the
   fair line, cash at the offered line.
+- Exchange fees. Kalshi and Polymarket are exchanges (→ venues where
+  bettors trade contracts with each other; a contract pays $1 if its side
+  wins and costs its price p, between 0 and 1). Their quoted price leaves
+  out a taker fee (→ the fee for buying at the price on offer):
+  fee per contract = coefficient x p x (1 - p), Kalshi 0.07 and
+  Polymarket US 0.0695 (EXCHANGE_TAKER_FEES). So one contract really
+  costs p + fee, and the EFFECTIVE decimal odds are 1 / (p + fee)
+  (effective_decimal). Kelly, EV (→ expected profit per unit staked) and
+  settlement all use the effective odds when the side's book is an
+  exchange; edge stays model minus fair (the fair price has no fee), so
+  a fee, like a sportsbook's vig, can turn an edge into a negative-Kelly
+  skip. Kalshi rounds each order's fee up to the cent; that rounding is
+  left out (it is under 1 cent per order).
 """
 import logging
 import math
@@ -125,6 +138,27 @@ for _w in cap_warnings():
     logger.warning(_w)
 
 
+# Taker fee coefficients: fee per contract = c x p x (1 - p).
+# Kalshi: 0.07 on general and sports contracts (kalshi.com fee schedule;
+#   rounded up to the cent per order, peak 1.75 cents at p = 0.50).
+# Polymarket US: 0.0695 exchange-wide from 10 AM ET, 2026-10-01
+#   (docs.polymarket.us/fees, read 2026-10-04: "Fee = Θ × C × p × (1 - p)",
+#   Θ = 0.0695, peak $1.74 per 100 contracts). Before that, sports were
+#   0.05 (July 2026) and 0.03 earlier.
+EXCHANGE_TAKER_FEES = {"kalshi": 0.07, "polymarket": 0.0695}
+
+
+def exchange_fee(book: Optional[str], contract_price: float) -> float:
+    """Taker fee per contract (dollars) at `book` for a contract priced
+    contract_price in (0, 1); 0 for a book that is not a fee-charging
+    exchange."""
+    c = EXCHANGE_TAKER_FEES.get((book or "").strip().lower())
+    if c is None:
+        return 0.0
+    q = float(contract_price)
+    return c * q * (1.0 - q)
+
+
 def no_vig_probs(home_ml: float, away_ml: float) -> tuple:
     """Fair (no-vig) win probabilities from a two-sided moneyline."""
     ph, pa = american_implied_prob(home_ml), american_implied_prob(away_ml)
@@ -137,12 +171,34 @@ def decimal_odds(american: float) -> float:
     return 1.0 + (100.0 / -a if a < 0 else a / 100.0)
 
 
-def kelly_fraction(p: float, american: float) -> float:
+def effective_decimal(american: float, book: Optional[str] = None) -> float:
+    """Decimal odds after the venue's taker fee. A sportsbook's price is
+    already all-in (its vig is in the price), so it is unchanged. At an
+    exchange the quoted price is the contract price p = 1 / decimal, and
+    one contract costs p + fee: effective decimal = 1 / (p + fee).
+    Example: Kalshi at +100 (p = 0.50): fee 0.0175, 1 / 0.5175 = 1.932."""
+    dec = decimal_odds(american)
+    if (book or "").strip().lower() not in EXCHANGE_TAKER_FEES:
+        return dec
+    q = 1.0 / dec
+    return 1.0 / (q + exchange_fee(book, q))
+
+
+def kelly_fraction(p: float, american: float,
+                   book: Optional[str] = None) -> float:
     """Full-Kelly optimal bankroll fraction for win prob p at a price.
-    f* = (b*p - q)/b with b = decimal - 1. Negative edge -> 0."""
-    b = decimal_odds(american) - 1.0
+    f* = (b*p - q)/b with b = decimal - 1 (the fee-inclusive effective
+    decimal at an exchange). Negative edge -> 0."""
+    b = effective_decimal(american, book) - 1.0
     f = (b * p - (1.0 - p)) / b
     return max(0.0, f)
+
+
+def expected_value(p: float, american: float,
+                   book: Optional[str] = None) -> float:
+    """Expected profit per unit staked at win probability p, after any
+    exchange fee: p x effective decimal - 1."""
+    return p * effective_decimal(american, book) - 1.0
 
 
 @dataclass
@@ -154,33 +210,42 @@ class BetDecision:
     edge: float               # model_prob - market_prob
     kelly: float              # full-Kelly fraction
     stake_pct: float          # of bankroll, after quarter-Kelly + cap
+    book: Optional[str] = None   # where the price is; an exchange adds its fee
+    ev: Optional[float] = None   # expected profit per unit, after fees
 
 
 def evaluate_market(model_home_prob: float, fair_home_prob: float,
                     home_price: Optional[float], away_price: Optional[float],
                     edge_min: float = EDGE_MIN_ML,
-                    max_stake_pct: Optional[float] = None) -> Optional[BetDecision]:
+                    max_stake_pct: Optional[float] = None,
+                    home_book: Optional[str] = None,
+                    away_book: Optional[str] = None) -> Optional[BetDecision]:
     """The one decision function, line-shopping form: edge is measured
     against a fair (no-vig) probability that may come from a consensus of
     books, while each side is priced at the best available price (possibly
     from different books). A side with no price is not bettable.
-    max_stake_pct: the per-bet cap; None = MAX_STAKE_PCT (the .env one)."""
+    max_stake_pct: the per-bet cap; None = MAX_STAKE_PCT (the .env one).
+    home_book / away_book: where each price is; at an exchange (Kalshi,
+    Polymarket) Kelly and EV use the price after its taker fee."""
     cap = MAX_STAKE_PCT if max_stake_pct is None else max_stake_pct
-    for side, p_model, p_fair, price in (
-            ("HOME", model_home_prob, fair_home_prob, home_price),
-            ("AWAY", 1.0 - model_home_prob, 1.0 - fair_home_prob, away_price)):
+    for side, p_model, p_fair, price, book in (
+            ("HOME", model_home_prob, fair_home_prob, home_price, home_book),
+            ("AWAY", 1.0 - model_home_prob, 1.0 - fair_home_prob, away_price,
+             away_book)):
         if price is None:
             continue
         edge = p_model - p_fair
         if edge < edge_min:
             continue
-        kelly = kelly_fraction(p_model, price)
-        if kelly <= 0.0:      # +edge vs no-vig can still be -EV vs the vig
+        kelly = kelly_fraction(p_model, price, book)
+        if kelly <= 0.0:      # +edge vs no-vig can still be -EV vs the vig/fee
             continue
         stake_pct = min(kelly * KELLY_FRACTION, cap)
         return BetDecision(side=side, price=int(price),
                            model_prob=p_model, market_prob=p_fair,
-                           edge=edge, kelly=kelly, stake_pct=stake_pct)
+                           edge=edge, kelly=kelly, stake_pct=stake_pct,
+                           book=book,
+                           ev=expected_value(p_model, price, book))
     return None
 
 
@@ -217,6 +282,9 @@ def game_cap_reason(stake: float, bets_on_game: int, staked_on_game: float,
 
 
 def settle(decision: BetDecision, home_won: bool, stake: float) -> float:
-    """PnL of a settled moneyline bet (OT/SO included, no pushes)."""
+    """PnL of a settled moneyline bet (OT/SO included, no pushes). At an
+    exchange the stake buys contracts at price + fee, so a win pays at
+    the effective (fee-inclusive) decimal odds."""
     won = home_won if decision.side == "HOME" else not home_won
-    return stake * (decimal_odds(decision.price) - 1.0) if won else -stake
+    dec = effective_decimal(decision.price, decision.book)
+    return stake * (dec - 1.0) if won else -stake

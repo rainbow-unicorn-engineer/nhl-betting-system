@@ -67,6 +67,21 @@ T1 = pd.Timestamp("2026-01-15 15:00")
 T2 = pd.Timestamp("2026-01-15 16:00")
 
 
+def test_pregame_lines_drop_inplay_fallback_lines():
+    """The raw.historical_odds fallback must not price a game off a line
+    captured during it (features.market_prices.inplay_mask)."""
+    from betting.recommend import pregame_lines
+    hist = pd.DataFrame({
+        "game_id": [1, 2], "book_name": "Unibet", "home_price": [-10000, -150],
+        "away_price": [9000, 130], "provider": "Unibet", "season": 20232024,
+        "date": ["2024-03-01", "2024-03-01"], "home_ml": [-10000, -150],
+        "away_ml": [9000, 130], "over_under": [5.5, 6.0]})
+    out = pregame_lines(hist)
+    assert out["game_id"].tolist() == [2]
+    assert list(out.columns) == ["game_id", "book_name", "home_price", "away_price"]
+    assert list(pregame_lines(hist.iloc[:0]).columns) == list(out.columns)
+
+
 class TestBettableBooks:
     """summarize_market is load_market's pure half: fair odds from every
     book, best price only from BETTABLE_BOOKS, priced_at carried."""
@@ -110,6 +125,19 @@ class TestBettableBooks:
         assert pd.notna(m.loc[2, "fair_home_prob"])
         # the engine treats an unpriced side as not bettable
         assert evaluate_market(0.90, m.loc[2, "fair_home_prob"], None, None) is None
+
+    def test_exchange_quote_is_ranked_after_its_fee(self):
+        # Kalshi +102 (contract 0.495) beats fanduel +100 on the quote, but
+        # after the 0.07 * p * (1 - p) fee it pays 1.932 < 2.0: fanduel wins
+        snaps = _snaps([(4, "kalshi", T1, -110, 102),
+                        (4, "fanduel", T1, -120, 100)])
+        m = summarize_market(snaps, NO_HIST).set_index("game_id")
+        assert m.loc[4, "away_book"] == "fanduel" and m.loc[4, "away_price"] == 100
+        # a big enough price gap still goes to the exchange
+        snaps = _snaps([(5, "kalshi", T1, -110, 110),
+                        (5, "fanduel", T1, -120, 100)])
+        m = summarize_market(snaps, NO_HIST).set_index("game_id")
+        assert m.loc[5, "away_book"] == "kalshi"
 
     def test_historical_reference_line_is_not_filtered(self):
         hist = pd.DataFrame([(3, "ESPN BET", -140, 120)], columns=NO_HIST.columns)
