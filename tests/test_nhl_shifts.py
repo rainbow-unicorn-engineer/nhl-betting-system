@@ -515,9 +515,12 @@ def test_recheck_empties_a_game_holding_only_another_games_shifts(games, box_cle
 
 
 @requires_db
-def test_games_to_fetch_retries_recent_suspect_games(games):
+def test_games_to_fetch_takes_final_games_and_recent_suspect_ones(games):
     ns.ensure_tables(engine)
-    assert ns.games_to_fetch(season=SEASON) == [G1]
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE raw.games SET game_state = 'FINAL' WHERE game_id = :g"),
+                     {"g": G1})
+    assert ns.games_to_fetch(season=SEASON) == [G1]          # FINAL counts as finished
     ns.store_game(G1, [], 0, "suspect")
     assert ns.games_to_fetch(season=SEASON) == []            # 30 days old: left alone
     assert ns.games_to_fetch(season=SEASON, retry_empty=True) == [G1]

@@ -61,8 +61,9 @@ raw.shift_fetches row records the outcome:
   empty    → the endpoint had no shifts for the game (none of its own
              teams'); nothing is deleted
   error    → the request failed after its retries; nothing is deleted
-A run fetches every finished game (game_state OFF; regular season and
-playoffs; puck drop at least SETTLE_HOURS ago) with no fetch-log row, every 'error', and every 'empty',
+A run fetches every finished game (game_state FINAL or OFF, as everywhere
+else in the repo; regular season and playoffs; puck drop at least
+SETTLE_HOURS ago) with no fetch-log row, every 'error', and every 'empty',
 'partial' or 'suspect' game from the last RECENT_DAYS days (all of them
 with --retry-empty). So a stopped run resumes where it left off, and the
 daily run fetches only last night's games. `--recheck` cleans and
@@ -121,7 +122,10 @@ MIN_PLAYERS = 30          # two dressed teams are 38-40 players
 RECENT_DAYS = 14          # empty/partial/suspect games this recent are re-fetched
 SETTLE_HOURS = 6          # never fetch a game that started less than this ago
 QA_TOLERANCE_S = 60       # per-skater summed shifts vs box-score ice time
-FINISHED_SQL = "g.game_state = 'OFF'"   # a finished game
+# A finished game is game_state FINAL or OFF, the definition the rest of
+# the repo uses (nhl_game_info, settle, features); OFF alone missed a game
+# the NHL had not closed yet.
+FINISHED_SQL = "g.game_state IN ('FINAL', 'OFF')"
 
 # The same DDL is in config/migrate.py (COLUMNS, TABLES) and db/schema.sql.
 DDL = [
