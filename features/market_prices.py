@@ -40,6 +40,17 @@ Sources:
   Polymarket have no history anywhere in the database (raw.odds_history
   was bought with 10 sportsbooks, none of them exchanges).
 
+In-play rows (the shared contamination rule, inplay_mask below). ESPN's
+stored line for a game is meant to be its closing line, but for 106
+Unibet games in 2023-24 it was captured DURING the game (→ in play: the
+price already reflects the score), so it leaks the result into any model
+that uses it: those 106 games score a log loss of 0.45 instead of about
+0.66, and the 34 with a moneyline of 1,000 or more score 0.14. Every
+reader of raw.historical_odds as a pre-game market (the production
+market feature in features/build_vectors.py, models/lgbm.py, the
+simulation fallback in betting/recommend.py and the moneyline v3
+diagnostics) treats such a row as no market at all.
+
 Point-in-time: every quote used for a game was captured before that
 game's start (tests/test_market_prices.py deletes and rewrites rows at or
 after puck drop and checks nothing changes).
@@ -84,6 +95,65 @@ def _naive_utc(s: pd.Series) -> pd.Series:
     if getattr(s.dt, "tz", None) is not None:
         s = s.dt.tz_convert("UTC").dt.tz_localize(None)
     return s
+
+
+# ── Pure: in-play rows in raw.historical_odds ──────────────────────
+#
+# A row is treated as captured in play when ANY of these holds. Each rule
+# comes from what the 2023-24 Unibet rows show (docs/historical_odds.md,
+# "In-play rows"):
+#  1. a moneyline of 1,000 or more on either side (an implied probability
+#     of 91% or more): no NHL game is priced like that before puck drop,
+#     and the largest pre-game line in every other season is far smaller
+#     (DraftKings 2025-26 tops out at -470);
+#  2. both sides' implied probabilities summing to under 0.75: both teams
+#     long at once, a tied game late on (pre-game three-way Unibet sums
+#     sit near 0.83, two-way DraftKings near 1.04);
+#  3. a total (→ the over/under goals line) under 5 or at 8 and above:
+#     pre-game NHL totals sit between 5 and 7.5; 2, 3.5, 8.5, 10.5 or 13
+#     only happen once goals have been scored or time has run;
+#  4. a known stretch: Unibet from 2024-04-08 to the end of 2023-24,
+#     where 42 of the 97 rows break rules 1-3 (from 0 to 3 a week before),
+#     so the rows that look normal there cannot be trusted either.
+# Applied to every provider; rules 1-3 flag no DraftKings row and no
+# Unibet row before 2023-24. Together they flag 106 Unibet 2023-24 games.
+
+INPLAY_MAX_ABS_ML = 1000          # rule 1: |moneyline| at or above
+INPLAY_MIN_IMPLIED_SUM = 0.75     # rule 2: both sides long
+INPLAY_TOTAL_RANGE = (5.0, 8.0)   # rule 3: pre-game totals in [5, 8); NULL kept
+INPLAY_STRETCHES = {("Unibet", 20232024): pd.Timestamp("2024-04-08")}  # rule 4
+
+
+def inplay_mask(df: pd.DataFrame) -> pd.Series:
+    """True for a raw.historical_odds row that looks captured in play.
+    df: home_ml, away_ml, over_under, season, date and (optional)
+    provider; without a provider column rule 4 applies to every row of
+    the listed season."""
+    h, a = df["home_ml"].astype(float), df["away_ml"].astype(float)
+    big = (h.abs() >= INPLAY_MAX_ABS_ML) | (a.abs() >= INPLAY_MAX_ABS_ML)
+    s = h.map(american_implied_prob) + a.map(american_implied_prob)
+    ou = df["over_under"].astype(float)
+    lo, hi = INPLAY_TOTAL_RANGE
+    bad_total = ou.notna() & ((ou < lo) | (ou >= hi))
+    stretch = pd.Series(False, index=df.index)
+    d = pd.to_datetime(df["date"])
+    for (provider, season), start in INPLAY_STRETCHES.items():
+        hit = (df["season"] == season) & (d >= start)
+        if "provider" in df.columns:
+            hit &= df["provider"] == provider
+        stretch |= hit
+    return (big | (s < INPLAY_MIN_IMPLIED_SUM) | bad_total | stretch).astype(bool)
+
+
+def clear_market(X: np.ndarray, names: list, game_ids, drop_ids) -> np.ndarray:
+    """Copy of a feature matrix with the listed games set to 'no market'
+    (market_home_prob 0.5, market_available 0), the same values
+    features/build_vectors.py writes for a game without a line."""
+    X = X.copy()
+    rows = pd.Series(np.asarray(game_ids)).isin(set(drop_ids)).to_numpy()
+    X[rows, names.index("market_home_prob")] = 0.5
+    X[rows, names.index("market_available")] = 0.0
+    return X
 
 
 # ── Pure: quotes ────────────────────────────────────────────────────
@@ -221,6 +291,20 @@ def assemble_market(close_q: pd.DataFrame, morning_q: Optional[pd.DataFrame],
 
 
 # ── Loaders (read-only) ─────────────────────────────────────────────
+
+def load_inplay_game_ids(conn) -> list:
+    """game_ids whose raw.historical_odds moneyline looks captured in
+    play (inplay_mask), sorted."""
+    df = pd.read_sql(text("""
+        SELECT h.game_id, h.provider, g.season, g.date, h.home_ml,
+               h.away_ml, h.over_under
+        FROM raw.historical_odds h JOIN raw.games g USING (game_id)
+        WHERE h.home_ml IS NOT NULL AND h.away_ml IS NOT NULL
+    """), conn)
+    if df.empty:
+        return []
+    return sorted(int(g) for g in df.loc[inplay_mask(df), "game_id"].unique())
+
 
 def load_history_quotes(conn, seasons: Optional[Iterable[int]] = None) -> tuple:
     """(two-sided quotes with novig, starts, game dates, meta) from

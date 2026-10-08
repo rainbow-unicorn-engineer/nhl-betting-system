@@ -160,3 +160,101 @@ def test_wide_book_prices_and_assemble():
 def test_decimal_from_american():
     assert M.decimal_from_american(-150) == pytest.approx(1 + 100 / 150)
     assert M.decimal_from_american(130) == pytest.approx(2.3)
+
+
+# ── In-play rows in raw.historical_odds ─────────────────────────────
+
+def _lines(**cols):
+    base = {"provider": "Unibet", "season": 20222023, "date": "2023-01-05",
+            "home_ml": -150, "away_ml": 130, "over_under": 6.0}
+    n = max(len(v) for v in cols.values())
+    return pd.DataFrame({k: cols.get(k, [v] * n) for k, v in base.items()})
+
+
+def test_inplay_mask_flags_each_rule():
+    df = _lines(
+        home_ml=[-150, -1200, -150, 400, -150, -150, -150, -150, -150, -150],
+        away_ml=[130, 700, 1000, 350, 130, 130, 130, 130, 130, 130],
+        over_under=[6.0, 6.0, 6.0, 6.0, 4.5, 8.0, 7.5, None, 6.0, 6.0],
+        season=[20222023] * 8 + [20232024, 20232024],
+        date=["2023-01-05"] * 8 + ["2024-04-07", "2024-04-08"])
+    got = M.inplay_mask(df).tolist()
+    # clean; |ML| >= 1000 (home); |ML| >= 1000 (away); both sides long;
+    # total under 5; total at 8; total 7.5 kept; NULL total kept;
+    # the day before the late-2023-24 stretch; its first day
+    assert got == [False, True, True, True, True, True, False, False,
+                   False, True]
+
+
+def test_inplay_mask_leaves_two_way_lines_alone():
+    """Ordinary two-way prices (implied sum about 1.04) are never flagged,
+    and the late-2023-24 stretch belongs to Unibet only."""
+    df = _lines(provider=["DraftKings"] * 3, home_ml=[-470, 120, -325],
+                away_ml=[360, -142, 260], over_under=[6.5, 5.5, 7.5],
+                season=[20232024] * 3, date=["2024-04-10"] * 3)
+    assert not M.inplay_mask(df).any()
+    no_provider = df.drop(columns="provider")
+    assert M.inplay_mask(no_provider).all()   # rule 4 then applies by season
+
+
+def test_clear_market_only_touches_listed_games():
+    names = ["f", "market_home_prob", "market_available"]
+    X = np.array([[1.0, 0.6, 1.0], [2.0, 0.4, 1.0], [3.0, 0.7, 1.0]])
+    out = M.clear_market(X, names, [10, 11, 12], [11, 99])
+    assert out[1].tolist() == [2.0, 0.5, 0.0]
+    assert out[[0, 2]].tolist() == X[[0, 2]].tolist()
+    assert X[1, 1] == 0.4                     # the input is not changed
+
+
+# ── The loaders' SQL, on an in-memory SQLite copy of the raw tables ──
+
+@pytest.fixture
+def sqlite_raw():
+    """A SQLite database with the columns the loaders read from raw.games,
+    raw.odds_history, raw.odds_history_fetches and raw.historical_odds
+    (attached as schema 'raw'). Never the live database."""
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.pool import StaticPool
+
+    eng = create_engine("sqlite://", poolclass=StaticPool)
+
+    @event.listens_for(eng, "connect")
+    def _attach(dbapi_conn, _):
+        dbapi_conn.execute("ATTACH DATABASE ':memory:' AS raw")
+
+    with eng.begin() as c:
+        for ddl in (
+            "CREATE TABLE raw.games (game_id INT, season INT, date TEXT, "
+            "start_time_utc TEXT, home_score INT, away_score INT)",
+            "CREATE TABLE raw.odds_history (snapshot_ts TEXT, requested_ts TEXT, "
+            "game_id INT, book TEXT, market TEXT, side TEXT, price INT)",
+            "CREATE TABLE raw.odds_history_fetches (requested_ts TEXT, purpose TEXT)",
+            "CREATE TABLE raw.historical_odds (game_id INT, provider TEXT, "
+            "home_ml INT, away_ml INT, over_under REAL)",
+        ):
+            c.exec_driver_sql(ddl)
+    yield eng
+    eng.dispose()
+
+
+def _insert(conn, table, rows):
+    from sqlalchemy import text
+    cols = list(rows[0])
+    conn.execute(text(f"INSERT INTO raw.{table} ({', '.join(cols)}) VALUES "
+                      f"({', '.join(':' + c for c in cols)})"), rows)
+
+
+def test_load_inplay_game_ids(sqlite_raw):
+    with sqlite_raw.begin() as c:
+        _insert(c, "games", [
+            {"game_id": g, "season": s, "date": d, "start_time_utc": None,
+             "home_score": 1, "away_score": 0}
+            for g, s, d in ((1, 20232024, "2024-03-01"), (2, 20232024, "2024-03-02"),
+                            (3, 20232024, "2024-04-12"), (4, 20252026, "2026-01-02"))])
+        _insert(c, "historical_odds", [
+            {"game_id": 1, "provider": "Unibet", "home_ml": -150, "away_ml": 130, "over_under": 6.0},
+            {"game_id": 2, "provider": "Unibet", "home_ml": -2000, "away_ml": 2800, "over_under": 5.5},
+            {"game_id": 3, "provider": "Unibet", "home_ml": -110, "away_ml": 200, "over_under": 5.5},
+            {"game_id": 4, "provider": "DraftKings", "home_ml": -150, "away_ml": 125, "over_under": 6.5}])
+    with sqlite_raw.connect() as conn:
+        assert M.load_inplay_game_ids(conn) == [2, 3]
