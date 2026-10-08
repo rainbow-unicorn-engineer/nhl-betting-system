@@ -38,7 +38,8 @@ missing ~0.17 is the regulation-draw outcome). DraftKings rows average
 Implications:
 - **Market feature**: normalize home/(home+away) implied probability —
   valid in both eras (audit below confirms).
-- **Payout backtests**: only the DraftKings era (2025-26) plus our own
+- **Payout backtests**: only the DraftKings era (2025-26), the 2024-25
+  prices bought from The Odds API (below), and our own
   `raw.odds_snapshots` going forward carry true bettable two-way prices.
   Do not simulate moneyline payouts against Unibet-era rows.
 
@@ -95,10 +96,29 @@ rows.)
 | 2025-26 | 1,014 | 0.6794 | .559 | 0.6794 | .559 |
 | **Pooled** | 5,990 all, 5,884 without | **0.6526** | **.613** | **0.6562** | **.611** |
 
-The market beats our current model by ~0.03 log loss everywhere —
-including fold 5 (2025-26), where our model regressed to near-naive but
-the market held 0.6794. This is the strongest single feature available
-and the Phase 3 priority.
+The table runs from 2020-21 to 2025-26. 2024-25 has no row: its free
+line is the one-sided Kaggle fill (favourite's price only), so no fair
+two-way probability can be scored; that season's two-way prices come
+from the paid history below.
+
+When this audit was first run, the market beat the Phase 2 baseline
+model (0.6829) by about 0.03 log loss, including fold 5 (2025-26), where
+the baseline fell to near-naive but the market held 0.6794. That made
+the market the strongest single feature, and the Phase 3 model starts
+from it. Current figures (2026-10-08): the production model
+(`lgbm_market` v2, re-trained with the in-play rows above treated as no
+market) scores 0.6648 walk-forward (→ each season predicted by a model
+trained only on earlier seasons) over 6,993 games, against the
+market's pooled 0.6526 (0.6562 without the in-play rows). Those pools are
+not the same games, so the fair comparison is head to head: on the same
+2,412 games with real two-way closing prices (2024-25 at 10 books,
+2025-26 DraftKings) the model is 0.0047 worse than the no-vig close
+(→ the closing price with the book's margin taken out), SE 0.0025
+(→ the random wobble of that gap; under about 2 SE could be luck). By
+season it is 0.0064 worse in 2024-25 (SE 0.0040) and 0.0024 worse than
+DraftKings in 2025-26 (SE 0.0023). Starting from the market closed most
+of the old 0.03 gap, but the market still wins
+([backtest_results.md](backtest_results.md)).
 
 ## The Odds API historical endpoint (bought 2026-10-04)
 

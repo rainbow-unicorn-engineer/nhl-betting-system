@@ -2,7 +2,7 @@
 
 Templates for the Mac's scheduled runs. launchd is the job scheduler built into macOS; each job is a small XML file (a plist) in `~/Library/LaunchAgents`. These files are templates. Nothing installs them, and the live Mac's existing `com.nhlbetting.daily` and `com.nhlbetting.odds` plists are not replaced automatically. On Windows, use [ops/windows/](../windows/) instead.
 
-**The Mac runs every job (2026-10-01).** Each machine has its own `.env`, its own Odds API key and its own database, and the owner runs every job on both the Mac and the Windows PC (`register-tasks.ps1 -Role all`, see [ops/windows/](../windows/)). On the Mac that means all six templates below: the picks jobs (`daily`, the optional `odds`, `close`, `news`) and the props jobs (`props`, `props-due`). The free steps (an NHL-feed snapshot after each odds snapshot, power-play stats and the ESPN injury list) run inside `daily`, `odds` and `close`, so there is no separate `refresh` job. A Mac that only makes picks can skip the two props files.
+**The Mac is a backup (2026-10-08).** Each machine has its own `.env`, its own Odds API key and its own database. The Windows PC is the record machine → *the one computer whose picks and paper ledger count*: it runs every job on a paid key (`register-tasks.ps1 -Role all -IncludeOdds`, see [ops/windows/](../windows/)), and bets are taken only from its dashboard. The Mac may run the same jobs as a backup, on its own key, with its own picks and paper ledger, but never bet from the Mac's dashboard, and never add its stakes to the PC's. Running every job on the Mac means all six templates below: the picks jobs (`daily`, the optional `odds`, `close`, `news`) and the props jobs (`props`, `props-due`). The free steps (an NHL-feed snapshot after each odds snapshot, power-play stats and the ESPN injury list) run inside `daily`, `odds` and `close`, so there is no separate `refresh` job. A Mac that only makes picks can skip the two props files.
 
 | File | Runs | When | Credits a run |
 |---|---|---|---|
@@ -82,4 +82,4 @@ launchctl load "$HOME/Library/LaunchAgents/com.nhlbetting.daily.plist"
 
 ## Two machines
 
-Each machine reads its own `.env`, so the Windows PC uses its own Odds API key for props, with its own 500 free credits a month. Sharing one key would split those 500 credits between the Mac's moneyline snapshots and the PC's props.
+Each machine reads its own `.env`, so each uses its own Odds API key. The Windows PC, the record machine, is on the paid 20K plan (20,000 credits a month) and runs every job. A backup Mac needs its own key: a free 500-credit key covers the picks jobs only, so leave out the two props files on a free key. Sharing one key between the machines would split its credits.

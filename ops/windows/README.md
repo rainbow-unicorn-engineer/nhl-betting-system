@@ -25,7 +25,7 @@ Docker Desktop → the app that runs the database's container (a small self-cont
 2. `python pipeline.py setup`: checks the database, nhlpy and the Odds API key, and seeds the arena locations on a new database.
 3. `python -m config.migrate`: adds any tables and columns the database is missing.
 4. `python pipeline.py daily`: catches up every game since the last run, settles finished bets, and makes today's picks. It can take several minutes and spends about 3 Odds API credits.
-5. `register-tasks.ps1 -Role picks -IncludeOdds`: registers the scheduled jobs below, so from then on everything runs by itself while you are logged on. By default that is the picks jobs only (`daily`, the midday `odds` run, `close --due` and `news --due`: about 321 Odds API credits a month, inside a free 500-credit key → the plan The Odds API gives without payment). For the props jobs too (`-Role all`, more than 500 credits a month, so a paid key), open a Command Prompt, type `set NHL_ROLE=all`, and run `ops\windows\setup-all.bat` from that same window. Registering a role removes the jobs it leaves out.
+5. `register-tasks.ps1 -Role <NHL_ROLE> -IncludeOdds`: registers the scheduled jobs below, so from then on everything runs by itself while you are logged on. `NHL_ROLE` comes from the environment, or else from the repo's `.env`. This PC's `.env` has `NHL_ROLE=all` (it is on the paid 20K key), so NHL Setup registers every job. With no `NHL_ROLE` set, it falls back to the picks jobs only (`daily`, the midday `odds` run, `close --due` and `news --due`: about 321 Odds API credits a month, inside a free 500-credit key → the plan The Odds API gives without payment), because the props jobs on top need more than 500 credits a month. Registering a role removes the jobs it leaves out.
 
 Every step is safe to repeat, so after fixing a problem just run NHL Setup again. Nothing runs it automatically.
 
@@ -33,7 +33,7 @@ Every step is safe to repeat, so after fixing a problem just run NHL Setup again
 
 Task Scheduler is the job scheduler built into Windows. `register-tasks.ps1` registers the tasks for one **machine role** in a Task Scheduler folder named `\NHLBetting\`. `-Role` is required.
 
-Each machine has its own `.env`, its own Odds API key and its own database. **The owner's setup (2026-10-01): both the Mac and this Windows PC run every job, `-Role all`** (on the Mac, every template in [ops/launchd/](../launchd/)). `-Role picks` and `-Role props` split the jobs between two machines instead.
+Each machine has its own `.env`, its own Odds API key and its own database. **The owner's setup (2026-10-08): this Windows PC is the record machine** → *the one computer whose picks and paper ledger count, and the only dashboard bets are taken from*. It runs every job, `-Role all -IncludeOdds`, on the paid 20K key. The Mac may run the same jobs as a backup (every template in [ops/launchd/](../launchd/)) on its own key, but bets are never taken from it. `-Role picks` and `-Role props` remain for a machine that should run only one set of jobs.
 
 **`-Role all`** (the Windows PC): the `-Role picks` tasks below plus `props` and `props-due` from `-Role props`. It does not register `refresh`, because `daily` already does everything `refresh` does.
 
@@ -134,8 +134,8 @@ To pause for the off-season, `Get-ScheduledTask -TaskPath '\NHLBetting\' | Disab
 
 ## Two machines, two Odds API keys
 
-Each machine reads its own `.env`, so each uses its own Odds API key, and each key has its own 500 free credits a month. The Mac's key pays for moneyline snapshots and closes, and this PC's key pays for props. If the two machines shared one key, their snapshots would draw on the same 500 credits, and the props schedule alone uses most of that.
+Each machine reads its own `.env`, so each uses its own Odds API key. This PC's key is on the paid 20K plan (20,000 credits a month) and pays for every job: moneyline snapshots, closes and props. A free key has 500 credits a month, enough for the picks jobs or the props jobs, not both. If two machines shared one key, their snapshots would draw on the same credits.
 
-Each machine also has its own database. The props machine's database holds props lines, the schedule, box scores, power-play stats and injuries; picks, paper bets and the CLV ledger live on the picks machine. A pick can be graded only against closing snapshots taken on the machine that made it, which is why the picks machine takes its own closes.
+Each machine also has its own database, with its own picks, paper bets and CLV ledger. A pick can be graded only against closing snapshots taken on the machine that made it, which is why every machine that makes picks takes its own closes. Only this PC's picks count; a backup Mac's picks are never bet and never added to them.
 
 Put the PC's key in the PC's `.env` as `ODDS_API_KEY`. `PROPS_MARKETS`, `PROPS_BOOKMAKERS`, `PROPS_CLOSE_LEAD_MINUTES` and `PROPS_CLOSE_MIN_GAP_MINUTES` tune the props jobs; [.env.example](../../.env.example) lists them with their defaults.

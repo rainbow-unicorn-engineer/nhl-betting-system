@@ -5,10 +5,11 @@
 
 .DESCRIPTION
     Each machine has its own .env, its own Odds API key and its own
-    database. The owner runs every job on both machines (-Role all);
+    database. The Windows PC, the record machine, runs every job on a
+    paid key (-Role all -IncludeOdds); a backup Mac may run the same jobs.
     picks and props split the jobs between two machines instead:
 
-      -Role all     Everything (the owner's Mac and Windows PC). Registers
+      -Role all     Everything (the Windows PC; a backup Mac too). Registers
                     the picks tasks below plus props and props-due, and
                     not refresh, which daily already covers.
 

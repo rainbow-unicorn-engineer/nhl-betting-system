@@ -9,8 +9,9 @@
                    dashboard is already running).
     NHL Setup      runs ops\windows\setup-all.bat: the one-step setup (setup
                    check, database upgrade, catch-up and today's picks, and
-                   the scheduled picks jobs; set NHL_ROLE=all first for
-                   the props jobs too). Safe to run again.
+                   the scheduled jobs: every job when NHL_ROLE=all is set
+                   in the environment or the repo's .env, as on the PC,
+                   otherwise the picks jobs). Safe to run again.
 
     Run it once from the repo folder in PowerShell:
         .\ops\windows\create-shortcuts.ps1

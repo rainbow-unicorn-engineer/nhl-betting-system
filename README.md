@@ -99,7 +99,7 @@ INTERFACE   dashboard/                    Streamlit control room
 | NHL stats API (`api.nhle.com/stats/rest`) | Per game and player: power-play and penalty-kill ice time, power-play goals and assists, faceoffs won and lost. A month of games per request | Free, undocumented |
 | NHL odds feed (`api-web.nhle.com` partner-game and schedule endpoints) | DraftKings (US feed) and FanDuel Canada (Canadian feed) moneyline, puck line, over/under and 3-way prices, plus moneylines from several partner books on the schedule, for the next game date only | Free, undocumented, no history |
 | MoneyPuck | Every unblocked shot attempt since 2007-08, with expected goals (xG, the chance a given shot becomes a goal) | Free zipped CSVs for non-commercial use, from MoneyPuck's download link at peter-tanner.com; credit MoneyPuck.com wherever its data is shown |
-| The Odds API | Moneyline, puck line and totals prices from ten named books by default: Kalshi, Polymarket, Pinnacle, DraftKings, FanDuel, BetMGM, BetRivers, theScore Bet (`espnbet`), Hard Rock and Novig. Player props, one game per request | API key; the free plan is 500 credits a month per key |
+| The Odds API | Moneyline, puck line and totals prices from ten named books by default: Kalshi, Polymarket, Pinnacle, DraftKings, FanDuel, BetMGM, BetRivers, theScore Bet (`espnbet`), Hard Rock and Novig. Player props, one game per request | API key; the free plan is 500 credits a month per key, the paid 20K plan (the Windows PC's key) 20,000 |
 | ESPN summary API | One reference line per past game: the closing moneyline, puck line and total, and, where ESPN has them, the opening moneylines and total and the over/under and puck-line prices, opening and closing. The book varies by season | Free, no key, undocumented |
 | ESPN injury list | Every listed player's status (day-to-day, out, injured reserve, suspended), injury and expected return | Free, no key; the current list only, so it is saved daily |
 | ESPN core API | Past player-prop prices for 2025-26: DraftKings on some dates and in the playoffs, ESPN BET opening prices in October and November 2025 | Free, no key, undocumented |
@@ -112,14 +112,14 @@ Research notes behind the 2026-09-29 feeds work are in [docs/research/](docs/res
 
 ### Machine roles
 
-Each machine has its own `.env`, its own Odds API key, and its own database. **The owner runs every job on both machines** (decided 2026-10-01): the Mac installs all six [ops/launchd/](ops/launchd/) templates, and the Windows PC runs `.\ops\windows\register-tasks.ps1 -Role all`. The two roles below are what "every job" is made of, and either one can still be run alone on a machine that should do only that job.
+Each machine has its own `.env`, its own Odds API key, and its own database. **The Windows PC is the record machine** → *the one computer whose picks and paper ledger count, and the only dashboard bets are taken from*. It runs every job on a paid key (the 20K plan): `.\ops\windows\register-tasks.ps1 -Role all -IncludeOdds`, and its `.env` sets `NHL_ROLE=all`, so the NHL Setup shortcut keeps every job too. **The Mac may run the same jobs on its own key as a backup** (all six [ops/launchd/](ops/launchd/) templates), with its own picks and ledger, but bets are never taken from it. The two roles below are what "every job" is made of, and either one can still be run alone on a machine that should do only that job.
 
 | Role | Scheduled runs | What its key pays for |
 |---|---|---|
 | Picks | `daily`, `close --due` and `news --due` every 15 minutes, optional midday `odds` | Moneyline snapshots and closes: at most about 228 credits a month, about 321 with the midday run. `news` costs no credits |
 | Props | `props` at 10:00, `props --due` every 15 minutes, plus `refresh` at 9:00 when the machine doesn't run `daily` | Player-props lines: at most 308 to 464 credits a month for one market (February to January) |
 
-A machine running both roles therefore needs more than the free plan's 500 credits a month: on a free key, run the picks role only (`-Role picks`, about 228 credits a month, about 321 with the midday run) and leave props to a machine with a paid key. A pick can be graded only against closing snapshots taken on the machine that made it, which is why every picks machine takes its own closes. Each machine keeps its own picks and paper ledger, so the Mac and the PC each issue and grade their own picks. `refresh` loads the schedule (every props line is tied to a game), box scores, power-play stats and the injury list, all free; `daily` already does all of that, so a machine running every job skips `refresh`.
+A machine running both roles therefore needs more than the free plan's 500 credits a month, which is why the PC is on the paid key. A machine on a free key can run the picks role only (`-Role picks`, about 228 credits a month, about 321 with the midday run). A pick can be graded only against closing snapshots taken on the machine that made it, which is why every machine that makes picks takes its own closes. Each machine keeps its own picks and paper ledger, so the PC and a backup Mac each issue and grade their own picks; only the PC's count, and stakes from the two must never be added together. `refresh` loads the schedule (every props line is tied to a game), box scores, power-play stats and the injury list, all free; `daily` already does all of that, so a machine running every job skips `refresh`.
 
 ### The Odds API: ten named books
 
@@ -145,7 +145,7 @@ The NHL's own site API carries betting prices, free and with no key: the US part
 
 ### Power-play stats
 
-`python pipeline.py nhl-stats` fills each skater's power-play and penalty-kill ice time, power-play goals and assists, and faceoffs won and lost in `raw.skater_games`, from the NHL stats API. The box-score load always left those columns at zero. The daily run (and the props machine's `refresh`) fills newly finished games, usually 3 requests; `--season 20252026` fills a whole season in about 27 requests and a minute. It only updates rows the box-score load already stored, and `stats_filled_at` records which rows have real values. A week of December 2025 filled 1,980 of 1,980 player-games: 1,266 with power-play time, 1,168 with penalty-kill time, and no row with more power-play goals than goals or more special-teams time than total time.
+`python pipeline.py nhl-stats` fills each skater's power-play and penalty-kill ice time, power-play goals and assists, and faceoffs won and lost in `raw.skater_games`, from the NHL stats API. The box-score load always left those columns at zero. The daily run (and `refresh`, on a machine that runs only the props jobs) fills newly finished games, usually 3 requests; `--season 20252026` fills a whole season in about 27 requests and a minute. It only updates rows the box-score load already stored, and `stats_filled_at` records which rows have real values. A week of December 2025 filled 1,980 of 1,980 player-games: 1,266 with power-play time, 1,168 with penalty-kill time, and no row with more power-play goals than goals or more special-teams time than total time.
 
 ### Shift charts, scratches and Kalshi prices
 
@@ -157,9 +157,9 @@ Three free loaders, no key, each resumable (a stopped run picks up where it left
 
 `python pipeline.py free-data` runs all three for new games; `daily` runs it at the end. Coverage and what was odd: [docs/data_sources.md](docs/data_sources.md#213-free-loaders-shift-charts-scratches-and-officials-kalshi-built-2026-10-04).
 
-### Player props on the props machine
+### Player props
 
-`python pipeline.py props` takes one snapshot of every game starting in the next 24 hours into `raw.prop_snapshots`; `props --due`, every 15 minutes, takes one more just before each puck drop (games starting within 16 minutes with no prop snapshot in the last 16). Listing the games is free. Each game then costs 1 credit per market returned, and nothing when no book has posted props yet. The default market is shots on goal (`PROPS_MARKETS=player_shots_on_goal`); a morning and a pre-game snapshot of every game is at most 308 (February) to 464 (January) credits a month on the 2026-27 schedule, inside the free 500. Four markets need the paid 20K plan. Each line is matched to a game in `raw.games` (so the schedule must be current) and each player to `raw.players`; an unmatched name is stored with no player id and logged. No props are bet: there is no props model yet.
+`python pipeline.py props` takes one snapshot of every game starting in the next 24 hours into `raw.prop_snapshots`; `props --due`, every 15 minutes, takes one more just before each puck drop (games starting within 16 minutes with no prop snapshot in the last 16). Listing the games is free. Each game then costs 1 credit per market returned, and nothing when no book has posted props yet. The default market is shots on goal (`PROPS_MARKETS=player_shots_on_goal`); a morning and a pre-game snapshot of every game is at most 308 (February) to 464 (January) credits a month on the 2026-27 schedule. That fits a free 500-credit key on its own, but not next to the picks jobs, so the PC's paid 20K key pays for both; four markets would need the paid plan anyway. Each line is matched to a game in `raw.games` (so the schedule must be current) and each player to `raw.players`; an unmatched name is stored with no player id and logged. No props are bet: there is no props model yet.
 
 ### Models
 
@@ -170,7 +170,7 @@ Three free loaders, no key, each resumable (a stopped run picks up where it left
 
 ### The daily chain
 
-`python pipeline.py daily` runs these steps in order on the picks machine. Steps marked non-fatal log an error and let the chain continue. An exception in any other step ends the run, and that day gets no settlement, starters, or recommendations.
+`python pipeline.py daily` runs these steps in order on every machine that runs the picks jobs (the PC, and the Mac when it runs as a backup). Steps marked non-fatal log an error and let the chain continue. An exception in any other step ends the run, and that day gets no settlement, starters, or recommendations.
 
 1. Waits up to 3 minutes for the network, because scheduled jobs can fire the moment a laptop wakes. If the network is still down, the run stops here.
 2. Refreshes teams, the schedule from 3 days back to 7 days ahead of today, box-score game logs, and team game stats. The schedule refresh stores each game's start time and schedule state (on schedule, postponed, suspended, or cancelled) and moves a postponed game to its new date.
@@ -191,7 +191,7 @@ Three free loaders, no key, each resumable (a stopped run picks up where it left
 
 `python pipeline.py odds` is the midday run: a full odds snapshot, a free NHL-feed snapshot, starting goalies, recommendations for games that still have no pick, then an arbitrage and middle scan. `python pipeline.py close` takes a moneyline-only snapshot (1 credit) and a free NHL-feed snapshot, and does nothing else. It supplies the closing price that settlement grades each pick against. `python pipeline.py close --due`, the scheduled form, takes those snapshots only when a game starts within 16 minutes and no moneyline snapshot is less than 16 minutes old, and otherwise exits at no cost. Run every 15 minutes, that is one close per start time, in the last run before puck drop. [Snapshot schedule](#snapshot-schedule) says when to run each one.
 
-`python pipeline.py refresh` is the props machine's daily run: steps 1 and 2, then the power-play stats and the injury list. It makes no Odds API request and no picks.
+`python pipeline.py refresh` is the daily run for a machine that runs only the props jobs (`-Role props`); the PC and the Mac run `daily`, which covers it: steps 1 and 2, then the power-play stats and the injury list. It makes no Odds API request and no picks.
 
 ### The news monitor
 
@@ -231,16 +231,16 @@ The system's own picks are paper bets. The bets the bettors really place go in t
 
 ## What this deliberately does not do
 
-- **No real money yet.** Real stakes wait for 500+ paper bets with average CLV above 1 percentage point and a significance test on the claimed edge. A full backtest season produced 363 bets at a 2.5-point threshold and only 46 in the 6–9 point band, so at a higher threshold that gate is several seasons away.
+- **No real money yet.** Real stakes wait for 500+ paper bets with average CLV above 1 percentage point and a significance test on the claimed edge. The priced backtests (see [docs/backtest_results.md](docs/backtest_results.md)) produced 1,049 bets in 2024-25 and 487 in 2025-26 at a 2.5-point threshold, but only 75 to 256 a season in the 6–9 point band, so at a higher threshold that gate is two or more seasons away.
 - **No automatic bet placement.** Recommendations are for a person to act on. The bettors record the bets they really placed on the dashboard's **My bets** tab (see [The bet ledger](#the-bet-ledger)); recording one never changes the system's paper pick.
 - **No totals betting** until the totals model passes its gate. Each recommendation run logs that totals are predictions-only.
-- **No props betting.** Props lines are collected, live on the props machine and from ESPN for 2025-26, for a props model that doesn't exist yet.
+- **No props betting.** Props lines are collected, live by the props jobs on the PC and from ESPN for 2025-26, for a props model that doesn't exist yet.
 - **No random train/test splits and no look-ahead.** Validation is walk-forward with a 7-day purge gap, and every feature is built only from games that finished before puck drop.
 - **No proxy betting.** Each bettor places only their own bets with their own money. Execution research is in [docs/texas_execution_options.md](docs/texas_execution_options.md). The promo-hedging calculator keeps each bettor's stakes and P&L separate and never models one person betting for another.
 
 ## Quick start
 
-Requires Python 3.11+, Docker, and optionally a key from [the-odds-api.com](https://the-odds-api.com). The live copy runs on macOS; Windows equivalents are in the comments.
+Requires Python 3.11+, Docker, and optionally a key from [the-odds-api.com](https://the-odds-api.com). The commands below are written for macOS and Linux shells; Windows equivalents are in the comments. The record copy runs on the Windows PC (see [Machine roles](#machine-roles)).
 
 ```bash
 git clone https://github.com/rainbow-unicorn-engineer/nhl-betting-system.git
@@ -260,7 +260,7 @@ Also set `LOCAL_TIMEZONE` in `.env` if this machine's clock isn't on your time z
 
 Set the password before the first `docker compose up`. The committed default is baked into the database on first start. `docker-compose.yml` publishes port 5432 on this machine only (`127.0.0.1`), so other computers on the network can't reach the database. To change the password of a database that already exists, run `docker compose exec db psql -U nhl -d nhl_betting -c "ALTER USER nhl PASSWORD '<new>'"`, then update `.env`.
 
-Without a real Odds API key, no odds request is made: each snapshot logs an error saying the key is not set, and the rest of the pipeline still runs. The `your_key_here` placeholder from `.env.example` counts as not set. No picks are made, because a game with no price is never bet. Each machine has its own `.env`, so a Mac and a PC can each use their own key, with 500 free credits a month each.
+Without a real Odds API key, no odds request is made: each snapshot logs an error saying the key is not set, and the rest of the pipeline still runs. The `your_key_here` placeholder from `.env.example` counts as not set. No picks are made, because a game with no price is never bet. Each machine has its own `.env`, so the PC and the Mac each use their own key: the PC's is on the paid 20K plan (20,000 credits a month), and a free key gives 500.
 
 ### Load history (once)
 
@@ -287,10 +287,10 @@ python pipeline.py status
 
 ### Every day
 
-These runs are automatic on each machine (see [Scheduling](#scheduling)). **On the Windows PC, the NHL Setup desktop shortcut does the whole setup in one go** (`ops\windows\setup-all.bat`: the setup check, the database upgrade, a `daily` run that catches up and makes today's picks, and registering the scheduled picks jobs; `set NHL_ROLE=all` first for the props jobs too, which need a paid key), and **the NHL Dashboard shortcut opens the dashboard**, starting Docker Desktop and waiting for the database first. Run `.\ops\windows\create-shortcuts.ps1` once to put both on the desktop; [ops/windows/README.md](ops/windows/README.md#desktop-shortcuts) has the details. By hand, on a new machine or to catch up:
+These runs are automatic on each machine (see [Scheduling](#scheduling)). **On the Windows PC, the NHL Setup desktop shortcut does the whole setup in one go** (`ops\windows\setup-all.bat`: the setup check, the database upgrade, a `daily` run that catches up and makes today's picks, and registering the scheduled jobs: every job when the repo's `.env` has `NHL_ROLE=all`, as the PC's does, otherwise the picks jobs only), and **the NHL Dashboard shortcut opens the dashboard**, starting Docker Desktop and waiting for the database first. Run `.\ops\windows\create-shortcuts.ps1` once to put both on the desktop; [ops/windows/README.md](ops/windows/README.md#desktop-shortcuts) has the details. By hand, on a new machine or to catch up:
 
 ```bash
-# Picks machine (the Mac)
+# Picks jobs: on the Windows PC (the record machine), and on the Mac if it runs as a backup
 python pipeline.py daily                    # morning: picks are issued at this snapshot's prices
 python pipeline.py odds                     # optional, midday: confirmed starters and alerts
 python pipeline.py close --due              # every 15 minutes: a close only when a game is about to start
@@ -299,8 +299,8 @@ python pipeline.py news --due               # every 15 minutes: starters, lines 
 python pipeline.py compare-feeds            # the free NHL feed against The Odds API, today's games
 streamlit run dashboard/app.py              # the control room
 
-# Props machine (the Windows PC)
-python pipeline.py refresh                  # morning: schedule, box scores, power-play stats, injuries; no credits
+# Props jobs: on the same machines
+python pipeline.py refresh                  # only on a machine without `daily`: schedule, box scores, power-play stats, injuries; no credits
 python pipeline.py props                    # a props snapshot of every game in the next 24 hours
 python pipeline.py props --due              # every 15 minutes: one pre-game props snapshot per game
 ```
@@ -311,7 +311,7 @@ The season rolls over on July 1 without any change to the code.
 
 1. Run `python pipeline.py setup`. Check that it prints the new season, your time zone, and today's date, and that the Odds API key is OK. If `NHL_SEASON` is still set in `.env` from a playoff run that went past July 1, remove it.
 2. Build the new season's features now with `python pipeline.py features --season 20262027`, or let the next `daily` run do it.
-3. Check that each machine's scheduled jobs are loaded: `daily`, `close`, `news`, and `odds` if you use it, on the picks machine; `refresh`, `props` and `props-due` on the props machine (see [Scheduling](#scheduling)). Each machine's `.env` needs its own `ODDS_API_KEY`.
+3. Check that the PC's scheduled jobs are loaded: `daily`, `odds`, `close`, `news`, `props` and `props-due`, and the same on the Mac if it runs as a backup; `refresh` only on a machine that runs the props jobs alone (see [Scheduling](#scheduling)). Each machine's `.env` needs its own `ODDS_API_KEY`.
 4. Decide `EDGE_MIN_ML` for the season (see Status).
 5. Before using the promo calculator, re-check the Kalshi and Polymarket fees hard-coded in `betting/promo.py`.
 
@@ -339,7 +339,7 @@ After pulling the 2026-09-29 changes, on each machine:
 
    In PowerShell: `foreach ($S in 20202021,20212022,20222023,20232024,20242025,20252026,20262027) { python -m ingestion.nhl_stats --season $S }`.
 4. Fill the ESPN prices for the games already stored: `python -m ingestion.espn_odds --refresh --season 20252026` first (the DraftKings season a backtest can use), then the other seasons if wanted. About one request a game; resumable.
-5. On the picks machine, check `ODDS_BOOKMAKERS` and `BETTABLE_BOOKS` in `.env` (see [Configuration](#configuration)); without them the defaults apply. On the Windows PC, register every job: `.\ops\windows\register-tasks.ps1 -Role all`, which also removes a `refresh` task registered there before (`daily` covers it).
+5. On each machine that makes picks, check `ODDS_BOOKMAKERS` and `BETTABLE_BOOKS` in `.env` (see [Configuration](#configuration)); without them the defaults apply. On the Windows PC, register every job: `.\ops\windows\register-tasks.ps1 -Role all`, which also removes a `refresh` task registered there before (`daily` covers it).
 
 Games already stored have no start time or schedule state until their schedule is loaded again. The next `daily` run fills the window from 3 days back to 7 days ahead. To fill a whole season at once, run `python -m ingestion.nhl_api season 20262027` (the current season). Older seasons can stay blank. An odds snapshot matches a game with no start time by its Eastern date instead, and settlement logs a warning that the game's closing window has no puck-drop limit.
 
@@ -387,7 +387,7 @@ FROM raw.injuries
 WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM raw.injuries)
 ORDER BY team_abbrev, status;
 
--- Shots-on-goal props stored on the props machine, newest snapshot first
+-- Shots-on-goal props stored by the props jobs, newest snapshot first
 SELECT captured_at, game_id, book, player_name, line, over_price, under_price
 FROM raw.prop_snapshots
 WHERE market = 'player_shots_on_goal'
@@ -407,13 +407,13 @@ LIMIT 50;
 | `status` | Row counts for the main tables (the new feeds included), upcoming games (any not yet final), and games per season |
 | `backfill` | Loads every season from `BACKFILL_FIRST_SEASON` through the current one from the NHL API and MoneyPuck |
 | `features [--season YYYYYYYY]` | Builds the feature store for one season or all |
-| `daily` | The picks machine's daily chain described above |
+| `daily` | The daily chain described above (the picks jobs' morning run) |
 | `odds` | Full odds snapshot (3 credits), a free NHL-feed snapshot, starters, recommendations for games without a pick, and alerts |
 | `close [--due]` | Moneyline-only odds snapshot (1 credit) for the closing price, then a free NHL-feed snapshot. No picks, no alerts. With `--due`, only when a game starts within 16 minutes and no moneyline snapshot is under 16 minutes old; otherwise it logs why and exits at no cost |
 | `recommend` | Scores today's slate into `betting.recommendations` |
 | `starters` | Starting goalies from Daily Faceoff |
 | `settle` | Settles paper bets and rebuilds the bankroll and CLV ledger, then settles the bettors' recorded bets (the bet ledger) |
-| `refresh` | The props machine's daily run: schedule, box scores, power-play stats and the injury list. No Odds API request, no picks |
+| `refresh` | The daily run for a machine that runs only the props jobs: schedule, box scores, power-play stats and the injury list. No Odds API request, no picks |
 | `props [--due] [--markets M]` | A player-props snapshot from The Odds API: every game in the next 24 hours, or with `--due` only games starting within 16 minutes that have no prop snapshot in the last 16. 1 credit a game per market returned |
 | `nhl-odds` | A free snapshot of the NHL's odds feed, right now |
 | `compare-feeds [--date YYYY-MM-DD] [--detail]` | The NHL feed against The Odds API for one date's games: price gaps and how often prices changed. Reads only |
@@ -512,12 +512,12 @@ A full snapshot (`daily`, `odds`, or `python -m ingestion.odds_api`) requests th
 
 A request is free only when the API lists no NHL events at all, which in practice means the off-season. In season it also lists the coming days' games, so a request on a day without games still costs full price. So every snapshot command first checks `raw.games`: when no game starts in the next 24 hours, it logs why and makes no request. That keeps off-days free as long as the schedule is current, which the daily run takes care of.
 
-Each machine reads its own `.env`, so the Mac and the PC each use their own key, each with its own 500 free credits a month (see [Machine roles](#machine-roles)). Machines that share one key share its 500 credits.
+Each machine reads its own `.env`, so the PC and the Mac each use their own key and their own monthly credits (see [Machine roles](#machine-roles)). The PC's key is on the paid 20K plan. Machines that share one key share its credits.
 
 | Plan | Credits a month, per key | What that allows in season |
 |---|---|---|
-| Free | 500 | Picks machine: the daily run plus `close --due` at its defaults, at most about 228 in any month of the 2026-27 schedule, and the midday `odds` run (about 93 more in a full month) fits too. Props machine: one props market at a morning and a pre-game snapshot, 308 to 464 a month |
-| 20K ($30 a month) | 20,000 | The whole [snapshot schedule](#snapshot-schedule) with an `odds` run every 15 minutes through each game day, or four props markets |
+| Free | 500 | One role, not both. Picks jobs alone: the daily run plus `close --due` at its defaults, at most about 228 in any month of the 2026-27 schedule, and the midday `odds` run (about 93 more in a full month) fits too. Props jobs alone: one props market at a morning and a pre-game snapshot, 308 to 464 a month |
+| 20K ($30 a month) | 20,000 | Every job (`-Role all`, as on the PC), with plenty left over: the whole [snapshot schedule](#snapshot-schedule) with an `odds` run every 15 minutes through each game day, or four props markets, and bulk history purchases (see [docs/historical_odds.md](docs/historical_odds.md)) |
 
 After each request the log shows the credits remaining, the credits used, and what that call cost. The log never shows the API key.
 
@@ -551,7 +551,7 @@ These figures were replayed at the old cost of 6 credits a full snapshot and 2 a
 
 ## Scheduling
 
-The live copy runs on macOS under launchd. Don't add cron entries as well, because the crontab is intentionally empty.
+The record machine, the Windows PC, runs every job under Task Scheduler (see **On Windows** below). The Mac, when it runs as a backup, uses launchd. Don't add cron entries on the Mac as well, because the crontab is intentionally empty.
 
 Templates for six agents are in [ops/launchd/](ops/launchd/), with install steps in its README: `com.nhlbetting.daily`, `com.nhlbetting.close` (`close --due` every 15 minutes), `com.nhlbetting.news` (`news --due` every 15 minutes), the optional `com.nhlbetting.odds`, and the props agents `com.nhlbetting.props` (10:00) and `com.nhlbetting.props-due` (`props --due` every 15 minutes). Each job logs to the repo's `logs/` folder, which git ignores. The live Mac already has `com.nhlbetting.daily` and `com.nhlbetting.odds` in `~/Library/LaunchAgents`, with their own times and log paths. Nothing replaces those files automatically: add the `close` agent by hand (unloading any earlier fixed-time close first), and compare the other two with the templates before replacing them.
 
@@ -560,9 +560,9 @@ Templates for six agents are in [ops/launchd/](ops/launchd/), with install steps
 - **A Mac that was asleep** at the daily or midday time runs that job once when it wakes. The run waits up to 3 minutes for the network, and a late close skips the games already under way.
 - **Pause them for the off-season** with `launchctl unload ~/Library/LaunchAgents/com.nhlbetting.odds.plist`, and the same for `.daily`, `.close`, `.news`, `.props` and `.props-due`.
 
-The Mac runs every job, so it installs the two props agents too; the free steps (NHL feed, power-play stats, injuries) run inside `daily`, `odds` and `close`, so it needs no `refresh` job.
+A backup Mac runs every job, like the PC, so it installs the two props agents too; the free steps (NHL feed, power-play stats, injuries) run inside `daily`, `odds` and `close`, so it needs no `refresh` job.
 
-**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all` registers `daily` at 9:00, `close --due` and `news --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, `news`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details. `ops\windows\setup-all.bat` (the **NHL Setup** desktop shortcut) runs it as its last step with `-Role picks -IncludeOdds`, which fits the free key the Windows PC is on, or with `-Role all -IncludeOdds` when the environment variable `NHL_ROLE` is `all`.
+**On Windows**, [ops/windows/register-tasks.ps1](ops/windows/) registers the jobs in Task Scheduler, the scheduler built into Windows. `-Role` is required. `-Role all` registers `daily` at 9:00, `close --due` and `news --due` every 15 minutes, `props` at 10:00, `props --due` every 15 minutes, and `odds` at 13:00 with `-IncludeOdds`. `-Role picks` registers only the picks jobs (`daily`, `close`, `news`, optional `odds`), and `-Role props` only `refresh` at 9:00, `props` and `props --due`. Registering a role removes any task that role leaves out. Each task starts in the repo folder, appends to `logs\<task>.log`, and runs hidden through `conhost.exe --headless`, so no console window pops up (Windows 10 21H2 or later, or Windows 11; `-VisibleConsole` for older Windows). It also takes `-RepoPath`, `-PythonPath`, `-DailyTime`, `-PropsTime` and `-Unregister`; its README has the details. `ops\windows\setup-all.bat` (the **NHL Setup** desktop shortcut) runs it as its last step with `-Role <NHL_ROLE> -IncludeOdds`. It takes `NHL_ROLE` from the environment, or else from the repo's `.env`, and falls back to `picks` (the job set that fits a free key) when neither sets it. The PC is on a paid key and its `.env` has `NHL_ROLE=all`, so on the PC NHL Setup registers every job.
 
 ## Tests
 
@@ -575,7 +575,7 @@ pytest
 - **Its name ends in `_test`**, set as `POSTGRES_DB` in the environment or in `.env`.
 - **`NHL_ALLOW_DB_TESTS=1` together with `POSTGRES_HOST`, `POSTGRES_PORT` and `POSTGRES_DB`**, all three set in the environment for that run, pointing at the copy. The flag alone does nothing, and so do overrides that name the same database as `.env` (`localhost` and `127.0.0.1` count as the same server): the tests still skip, and the line at the top says why. So the flag on its own can never send the suite to the database `.env` names.
 
-The suite has 1,084 tests. Without a database, 966 pass and 118 skip, in about a minute and a half. Thirteen files need no database at all: `test_betting_engine`, `test_backtest`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, `test_db_guard`, `test_today`, `test_montecarlo`, and `test_windows_scripts` (its PowerShell checks run only on Windows); most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`, `test_nhl_shifts`, `test_nhl_game_info`, `test_kalshi`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network, and so do `test_dailyfaceoff_lines` and `test_news` (two saved Daily Faceoff line-combination pages).
+The suite has 1,294 tests. Without a database, 1,173 pass and 121 skip, in about two minutes. Thirteen files need no database at all: `test_betting_engine`, `test_backtest`, `test_promo`, `test_setup`, `test_feature_utils`, `test_odds_api`, `test_moneypuck`, `test_pipeline`, `test_migrate`, `test_db_guard`, `test_today`, `test_montecarlo`, and `test_windows_scripts` (its PowerShell checks run only on Windows); most other files have pure tests too. The new feed modules' tests (`test_nhl_odds`, `test_espn_odds`, `test_espn_injuries`, `test_espn_props`, `test_nhl_stats`, `test_props_odds`, `test_nhl_shifts`, `test_nhl_game_info`, `test_kalshi`) run on trimmed copies of real API responses in `tests/fixtures/` and never touch the network, and so do `test_dailyfaceoff_lines` and `test_news` (two saved Daily Faceoff line-combination pages).
 
 ### Running the database tests on a copy
 
