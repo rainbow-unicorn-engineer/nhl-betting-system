@@ -72,8 +72,6 @@ SHARP_BOOK = "pinnacle"
 # legal US state can use). lowvig, betonlineag and bovada are offshore.
 US_BOOKS = ("draftkings", "fanduel", "betmgm", "williamhill_us",
             "betrivers", "espnbet")
-OFFSHORE_BOOKS = ("lowvig", "betonlineag", "bovada")
-EXCHANGE_BOOKS = ("kalshi", "polymarket", "novig")
 CLOSE_MAX_LEAD = timedelta(minutes=90)
 MORNING_MAX_LEAD = timedelta(hours=18)
 
@@ -306,11 +304,27 @@ def load_inplay_game_ids(conn) -> list:
     return sorted(int(g) for g in df.loc[inplay_mask(df), "game_id"].unique())
 
 
+def check_fetch_purposes(fetches: pd.DataFrame) -> None:
+    """Each requested_ts of raw.odds_history_fetches must carry at most one
+    of the purposes 'close' and 'morning'; otherwise the loader's join
+    would count its rows twice. Other purposes (the 'probe' calls) are
+    left out of the join on purpose, so their rows are labelled 'close'
+    and pass the same pre-start, 90-minute window as any closing quote."""
+    f = fetches[fetches["purpose"].isin(["close", "morning"])]
+    n = f.groupby("requested_ts")["purpose"].nunique()
+    if (n > 1).any():
+        raise ValueError(f"{int((n > 1).sum())} requested_ts carry both the "
+                         f"'close' and 'morning' purposes")
+
+
 def load_history_quotes(conn, seasons: Optional[Iterable[int]] = None) -> tuple:
     """(two-sided quotes with novig, starts, game dates, meta) from
     raw.odds_history h2h rows, labelled with their fetch purpose."""
     season_filter = "AND g.season = ANY(:seasons)" if seasons else ""
     params = {"seasons": list(map(int, seasons))} if seasons else {}
+    check_fetch_purposes(pd.read_sql(text(
+        "SELECT DISTINCT requested_ts, purpose FROM raw.odds_history_fetches"),
+        conn))
     rows = pd.read_sql(text(f"""
         SELECT o.snapshot_ts, o.game_id, o.book, o.side, o.price,
                COALESCE(f.purpose, 'close') AS purpose

@@ -206,6 +206,15 @@ def test_clear_market_only_touches_listed_games():
     assert X[1, 1] == 0.4                     # the input is not changed
 
 
+def test_check_fetch_purposes():
+    ok = pd.DataFrame({"requested_ts": [1, 2, 3, 3],
+                       "purpose": ["close", "morning", "close", "probe"]})
+    M.check_fetch_purposes(ok)                # probe beside close is fine
+    bad = pd.DataFrame({"requested_ts": [1, 1], "purpose": ["close", "morning"]})
+    with pytest.raises(ValueError, match="both"):
+        M.check_fetch_purposes(bad)
+
+
 # ── The loaders' SQL, on an in-memory SQLite copy of the raw tables ──
 
 @pytest.fixture
@@ -242,6 +251,43 @@ def _insert(conn, table, rows):
     cols = list(rows[0])
     conn.execute(text(f"INSERT INTO raw.{table} ({', '.join(cols)}) VALUES "
                       f"({', '.join(':' + c for c in cols)})"), rows)
+
+
+def test_load_history_quotes_labels_each_fetch_purpose(sqlite_raw):
+    from sqlalchemy import text
+    with sqlite_raw.begin() as c:
+        _insert(c, "games", [{"game_id": 1, "season": 20242025,
+                              "date": "2025-01-09",
+                              "start_time_utc": "2025-01-10 00:00:00",
+                              "home_score": 3, "away_score": 2}])
+        _insert(c, "odds_history_fetches", [
+            {"requested_ts": "C", "purpose": "close"},
+            {"requested_ts": "C", "purpose": "close"},     # bought twice
+            {"requested_ts": "M", "purpose": "morning"},
+            {"requested_ts": "P", "purpose": "probe"}])
+        rows = []
+        for req, snap, book in (("C", "2025-01-09 23:50:00", "draftkings"),
+                                ("M", "2025-01-09 16:00:00", "fanduel"),
+                                ("P", "2025-01-09 23:40:00", "pinnacle")):
+            for side, price in (("home", -120), ("away", 105)):
+                rows.append({"snapshot_ts": snap, "requested_ts": req,
+                             "game_id": 1, "book": book, "market": "h2h",
+                             "side": side, "price": price})
+        rows.append({**rows[0], "market": "totals"})              # not h2h
+        _insert(c, "odds_history", rows)
+    with sqlite_raw.connect() as conn:
+        quotes, starts, dates, meta = M.load_history_quotes(conn)
+    purpose = quotes.set_index("book")["purpose"].to_dict()
+    # each quote once; the probe call's quote is labelled 'close' on purpose
+    assert purpose == {"draftkings": "close", "fanduel": "morning",
+                       "pinnacle": "close"}
+    assert starts.loc[1] == pd.Timestamp("2025-01-10")
+    assert meta["home_win"].astype(bool).tolist() == [True]
+
+    with sqlite_raw.begin() as c:
+        c.execute(text("INSERT INTO raw.odds_history_fetches VALUES ('C', 'morning')"))
+    with sqlite_raw.connect() as conn, pytest.raises(ValueError):
+        M.load_history_quotes(conn)
 
 
 def test_load_inplay_game_ids(sqlite_raw):
