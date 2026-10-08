@@ -76,21 +76,28 @@ game off one. 2023-24 market log loss: 0.6408 with them, 0.6574 without.
 ## Predictive quality audit
 
 No-vig home implied probability vs actual outcomes (log loss; lower is
-better; our Phase 2 model OOF = 0.6829, naive = 0.693):
+better; our Phase 2 model OOF = 0.6829, naive = 0.693; accuracy → the
+share of games where the favourite won). Every game with a two-sided
+line and a result, regular season and playoffs, recomputed from the
+database on 2026-10-08. The first pair of columns keeps every stored
+row; the second leaves out the 106 in-play rows (see above), which is
+what the models now see. Only 2023-24 and the pooled row differ. (The
+first version of this table, from an earlier load, differed by up to
+0.0014 per season; its pooled figure, 0.6529, included the in-play
+rows.)
 
-| Season   | Market LL | Market acc |
-|----------|----------:|-----------:|
-| 2020-21  | 0.6548 | .620 |
-| 2021-22  | 0.6409 | .644 |
-| 2022-23  | 0.6567 | .605 |
-| 2023-24  | 0.6399 | .625 |
-| 2023-24 without the 106 in-play rows (see above) | 0.6574 | .611 |
-| 2025-26  | 0.6795 | .560 |
-| **Pooled** | **0.6529** | **.613** |
+| Season | Games | Market LL, all rows | Accuracy, all rows | Market LL, in-play rows left out | Accuracy, in-play rows left out |
+|---|---:|---:|---:|---:|---:|
+| 2020-21 | 929 | 0.6544 | .620 | 0.6544 | .620 |
+| 2021-22 | 1,381 | 0.6403 | .644 | 0.6403 | .644 |
+| 2022-23 | 1,359 | 0.6553 | .608 | 0.6553 | .608 |
+| 2023-24 | 1,307 all, 1,201 without | 0.6408 | .624 | 0.6574 | .611 |
+| 2025-26 | 1,014 | 0.6794 | .559 | 0.6794 | .559 |
+| **Pooled** | 5,990 all, 5,884 without | **0.6526** | **.613** | **0.6562** | **.611** |
 
 The market beats our current model by ~0.03 log loss everywhere —
 including fold 5 (2025-26), where our model regressed to near-naive but
-the market held 0.6795. This is the strongest single feature available
+the market held 0.6794. This is the strongest single feature available
 and the Phase 3 priority.
 
 ## The Odds API historical endpoint (bought 2026-10-04)
