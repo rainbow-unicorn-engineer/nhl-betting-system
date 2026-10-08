@@ -62,6 +62,10 @@ What is stored:
   1-minute candle at or before puck drop: Kalshi's free closing price.
 Candles are fetched once per market, after it settles; the market row's
 candles_status logs it (ok, empty, error; error is retried every run).
+A market fetched before it was matched to a game (raw.games did not hold
+the game yet) gets hourly candles only, and its candles_problem says so
+(HOURLY_ONLY); it is fetched again once its game's start time is known,
+so closing_lines() never lacks the 1-minute close for it.
 
 Pace: at most one request every MIN_INTERVAL_S (0.2 s, 5 a second; Kalshi's
 basic tier allows 20 reads a second), retried on 429 and 5xx. A full
@@ -386,12 +390,17 @@ def candle_url(ticker: str, source: str) -> str:
     return f"{BASE_URL}/series/{SERIES}/markets/{ticker}/candlesticks"
 
 
+HOURLY_ONLY = "hourly candles only: no game start time yet"
+
+
 def fetch_candles(client: PoliteClient, row: dict,
                   start_time_utc: Optional[datetime]) -> Tuple[str, List[dict], Optional[str]]:
     """(status, candle rows, problem) for one market: 'ok' when every window
     answered (rows may come from either the live or the historical path;
     a 404 on one is retried on the other), 'empty' when all answered with
-    no candles, 'error' otherwise."""
+    no candles, 'error' otherwise. With no start time (no 1-minute window)
+    the problem is HOURLY_ONLY, which re-queues the market once its game
+    is matched (markets_needing_candles)."""
     rows: List[dict] = []
     windows = candle_windows(row, start_time_utc)
     if not windows:
@@ -405,7 +414,8 @@ def fetch_candles(client: PoliteClient, row: dict,
         if reply.status != "ok" or not isinstance(reply.body, dict):
             return "error", [], f"{period}-minute candles: {reply.problem}"
         rows.extend(parse_candles(reply.body, row["ticker"], period))
-    return ("ok" if rows else "empty"), rows, None
+    problem = None if any(p == MINUTE for p, _, _ in windows) else HOURLY_ONLY
+    return ("ok" if rows else "empty"), rows, problem
 
 
 # ── Database ──────────────────────────────────────────────────────
@@ -503,10 +513,12 @@ def markets_needing_candles(retry_empty: bool = False, limit: Optional[int] = No
         LEFT JOIN raw.games g ON g.game_id = m.game_id
         WHERE m.result IN ('yes', 'no', 'scalar')
           AND (m.candles_status IS NULL OR m.candles_status = 'error'
-               OR (CAST(:retry_empty AS boolean) AND m.candles_status = 'empty'))
+               OR (CAST(:retry_empty AS boolean) AND m.candles_status = 'empty')
+               OR (m.candles_status IN ('ok', 'empty') AND m.candles_problem = :hourly_only
+                   AND g.start_time_utc IS NOT NULL))
         ORDER BY m.event_date, m.ticker
     """
-    params = {"retry_empty": bool(retry_empty)}
+    params = {"retry_empty": bool(retry_empty), "hourly_only": HOURLY_ONLY}
     if limit:
         sql += " LIMIT :limit"
         params["limit"] = int(limit)

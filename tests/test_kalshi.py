@@ -165,6 +165,16 @@ def test_fetch_candles_error_and_empty():
     assert k.fetch_candles(StubClient([Reply("ok", {"candlesticks": []})]), row, None)[0] == "empty"
 
 
+def test_fetch_candles_without_a_start_time_says_hourly_only():
+    # Fetched before the market is matched to a game: no 1-minute window,
+    # and the problem marks it for a re-fetch once the game is known
+    row = {"ticker": "T", "source": "live", "open_time": dt.datetime(2026, 6, 10, tzinfo=UTC),
+           "settlement_ts": dt.datetime(2026, 6, 15, 3, tzinfo=UTC), "close_time": None}
+    status, rows, problem = k.fetch_candles(
+        StubClient([Reply("ok", FIXTURE["live_candles"])]), row, None)
+    assert status == "ok" and rows and problem == k.HOURLY_ONLY
+
+
 def test_list_markets_follows_the_cursor_and_fails_whole():
     c = StubClient([Reply("ok", {"markets": [{"ticker": "a"}], "cursor": "c1"}),
                     Reply("ok", {"markets": [{"ticker": "b"}], "cursor": ""})])
@@ -258,3 +268,29 @@ def test_closing_line_never_reads_an_in_play_candle(seeded):
     assert before == after == {f"{EVENT}-NYR": (0.45, 0.47), f"{EVENT}-MTL": (0.45, 0.47)}
     homes = {r["team"]: r["is_home"] for r in k.closing_lines(SEASON, engine)}
     assert homes == {"MTL": True, "NYR": False}
+
+
+@requires_db
+def test_market_fetched_before_its_game_is_matched_is_queued_again(seeded):
+    """A market whose candles were fetched while it had no game (hourly
+    only) is due again once matched, and not after the full re-fetch."""
+    start = seeded
+    k.ensure_tables(engine)
+    rows = [_market("NYR", "no", start), _market("MTL", "yes", start)]
+    k.attach_games(rows, [])                       # the game is not known yet
+    k.store_markets(rows, engine)
+    for r in rows:
+        k.store_candles(r["ticker"], "ok", [_candle(r["ticker"], start, 0.5, 0.52, period=60)],
+                        k.HOURLY_ONLY, db=engine)
+
+    def due():
+        return {r["ticker"] for r in k.markets_needing_candles(db=engine)
+                if r["ticker"].startswith("KXNHLGAME-30")}
+    assert due() == set()                          # unmatched: nothing to add yet
+    k.attach_games(rows, k.load_games(start.date(), start.date(), engine))
+    k.store_markets(rows, engine)
+    assert due() == {r["ticker"] for r in rows}    # matched: the 1-minute close is due
+    for r in rows:
+        k.store_candles(r["ticker"], "ok", [_candle(r["ticker"], start, 0.5, 0.52)], None,
+                        db=engine)
+    assert due() == set()
